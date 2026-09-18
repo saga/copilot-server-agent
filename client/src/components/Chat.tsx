@@ -610,7 +610,7 @@ export function Chat() {
         )}
         {messages.map((m, i) => (
           <div key={i} className={`msg ${m.role}`}>
-            <b>{m.role === 'user' ? '你' : 'Copilot'}</b>
+            {m.role !== 'user' && <b>Copilot</b>}
             <pre>{m.content || (busy ? '▍' : '')}</pre>
           </div>
         ))}

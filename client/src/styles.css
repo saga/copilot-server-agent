@@ -107,6 +107,10 @@ header h1 {
   background: #e3f0ff;
   max-width: 85%;
 }
+/* 用户消息不带角色标签，去掉 pre 的上边距 */
+.msg.user pre {
+  margin-top: 0;
+}
 .msg.assistant {
   align-self: flex-start;
   max-width: 95%;
