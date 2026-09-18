@@ -5,6 +5,9 @@ import { healthRouter } from './routes/health.js';
 import { apiRouter } from './routes/api.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { sessionService } from './services/session-service.js';
+import { humanTaskService } from './wiring.js';
+import { startTaskSweeper } from './services/task-sweeper.js';
+import { closeSql } from './db/pool.js';
 import { isShuttingDown, markShuttingDown } from './shutdown.js';
 
 const app = express();
@@ -17,6 +20,9 @@ app.use('/api/health', healthRouter);
 app.use('/api', apiRouter);
 
 app.use(errorHandler);
+
+// 过期扫描：OPEN human task → EXPIRED（进程内定时器，不用 cron/工作流引擎）
+const sweeper = startTaskSweeper(humanTaskService);
 
 const server = app.listen(config.port, () => {
   console.log(`[server] listening on http://localhost:${config.port}`);
@@ -37,10 +43,12 @@ async function shutdown(signal: string) {
   markShuttingDown();
   console.log(`[server] received ${signal}, draining...`);
   try {
+    clearInterval(sweeper);
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
     await sessionService.stop();
+    await closeSql();
   } finally {
     process.exit(0);
   }

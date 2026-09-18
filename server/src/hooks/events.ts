@@ -1,4 +1,4 @@
-import { executionStore } from '../execution/index.js';
+import { executionService } from '../execution/index.js';
 
 /**
  * Hook 事件环：内置 hook 处理器把关键事件记在这里，供 GET /api/hooks 查询与审计。
@@ -27,7 +27,7 @@ const MAX_EVENTS = 200;
 const ring: HookEvent[] = [];
 
 export function recordHookEvent(sessionId: string, kind: HookEventKind, detail: string): void {
-  const executionId = executionStore.activeFor(sessionId);
+  const executionId = executionService.activeFor(sessionId);
   ring.push({
     ts: new Date().toISOString(),
     sessionId,

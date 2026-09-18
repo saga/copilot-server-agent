@@ -25,12 +25,14 @@ import { HOOK_PRESETS } from '../hooks/builtin.js';
 import { workspaceService } from './workspace-service.js';
 import {
   SessionRegistry,
+  createRegistryStore,
+  type PersistedSessionConfig,
   type RegistryRecord,
   type SessionOwner,
 } from './session-registry.js';
 import { createPermissionHandler } from './tool-policy.js';
 import { createToolEvidenceHooks } from './tool-evidence.js';
-import { executionStore } from '../execution/index.js';
+import { executionService, stateBackend } from '../execution/index.js';
 
 export type { SessionOwner, RegistryRecord };
 
@@ -79,7 +81,8 @@ export interface SessionRecord {
   workspacePath: string;
 }
 
-export const DEFAULT_OWNER: SessionOwner = { tenantId: 'default', userId: 'default' };
+export { DEFAULT_OWNER } from './session-registry.js';
+import { DEFAULT_OWNER } from './session-registry.js';
 
 /** 身份头只有在网关会剥离客户端自带头时才可信；否则一律按单租户处理 */
 let identityWarned = false;
@@ -142,12 +145,33 @@ export interface CreateSessionOptions extends SessionConfigOptions {
   sessionId?: string;
 }
 
+/** 只持久化非敏感配置：凭证、内联 MCP server（含 header 密钥）一律不落库 */
+function toPersistedConfig(opts: SessionConfigOptions): PersistedSessionConfig {
+  return {
+    ...(opts.model ? { model: opts.model } : {}),
+    ...(opts.agent ? { agent: opts.agent } : {}),
+    ...(opts.agents ? { agents: opts.agents } : {}),
+    ...(opts.customAgents?.length ? { customAgents: opts.customAgents } : {}),
+    ...(opts.skillDirs ? { skillDirs: opts.skillDirs } : {}),
+    ...(opts.disabledSkills ? { disabledSkills: opts.disabledSkills } : {}),
+    ...(opts.noBuiltinSkills !== undefined ? { noBuiltinSkills: opts.noBuiltinSkills } : {}),
+    ...(opts.defaultAgentExcludedTools
+      ? { defaultAgentExcludedTools: opts.defaultAgentExcludedTools }
+      : {}),
+    ...(opts.mcp ? { mcp: opts.mcp } : {}),
+    ...(opts.disabledMcpServers ? { disabledMcpServers: opts.disabledMcpServers } : {}),
+    ...(opts.hooks ? { hooks: opts.hooks } : {}),
+  };
+}
+
 export interface DebugInfo {
   timestamp: string;
   node: string;
   platform: string;
   sdkVersion: string;
   provider: string;
+  /** durable state 后端（postgres=跨重启存活；memory=重启即丢） */
+  stateBackend: 'postgres' | 'memory';
   runtime: {
     state: 'connected' | 'idle' | 'error';
     lastError?: string;
@@ -201,8 +225,8 @@ class SessionService {
   private attachLocks = new Map<string, Promise<unknown>>();
   /** 正在跑 agent turn 的 session（客户端断开时按此决定是否 abort） */
   private activeTurns = new Set<string>();
-  /** 持久归属表（重启后不丢；生产应换 PostgreSQL，见 README） */
-  private readonly registry = new SessionRegistry(config.registryPath);
+  /** 持久归属表（重启后不丢；配了 DATABASE_URL 走 PostgreSQL，否则单文件 JSON） */
+  private readonly registry = new SessionRegistry(createRegistryStore(config.registryPath));
   private lastError: string | null = null;
 
   async getClient(): Promise<CopilotClient> {
@@ -304,6 +328,7 @@ class SessionService {
       platform: `${process.platform}-${process.arch}`,
       sdkVersion: sdkVersion(),
       provider: getActiveProvider().id,
+      stateBackend,
       runtime: { state: this.getStatus(), ...(this.lastError ? { lastError: this.lastError } : {}) },
     config: {
       logLevel: config.logLevel ?? '(sdk default)',
@@ -321,7 +346,7 @@ class SessionService {
     },
       sessions: { attached: this.sessions.size, attachedIds: [...this.sessions.keys()], onDisk: null },
       hooks: { presets: HOOK_PRESETS.length, recentEvents: hookEventCount() },
-      executions: executionStore.stats(),
+      executions: await executionService.stats(),
       mcp: {
         presets: listMcp().presets.length,
         allowInlineLocal: config.allowInlineMcpLocal,
@@ -457,9 +482,41 @@ class SessionService {
       userId: owner.userId,
       workspacePath: workspaceDir,
     });
-    // 归属落持久表：重启后不会退化成“谁先访问谁认领”
-    await this.registry.upsert({ sessionId: session.sessionId, owner, workspacePath: workspaceDir });
+    // 归属 + resume 用配置落持久表：重启后不会退化成“谁先访问谁认领”，
+    // 也不会因为 chat 路径的空配置把 model/tools/mcp 悄悄重置
+    await this.registry.upsert({
+      sessionId: session.sessionId,
+      owner,
+      workspacePath: workspaceDir,
+      config: toPersistedConfig(opts),
+    });
     return session;
+  }
+
+  /** 供 execution 路径使用：建会话并返回 workspace 路径 */
+  async createExecutionSession(
+    opts: CreateSessionOptions,
+    owner: SessionOwner = DEFAULT_OWNER,
+  ): Promise<{ session: CopilotSession; workspacePath: string }> {
+    const session = await this.createSession(opts, owner);
+    return { session, workspacePath: workspaceService.pathFor(session.sessionId) };
+  }
+
+  /**
+   * execution 恢复路径：用持久化的会话配置 resume（而不是空 {}）。
+   * BYOK 凭证仍由 provider 现算重传（从不落库）。
+   */
+  async resumeExecutionSession(
+    sessionId: string,
+    owner: SessionOwner = DEFAULT_OWNER,
+  ): Promise<CopilotSession> {
+    const stored = (await this.registry.getConfig(sessionId)) ?? {};
+    return this.getOrResumeSession(sessionId, stored, owner);
+  }
+
+  /** WAITING 状态下释放 session（审批几小时期间不占着 SDK session 与内存） */
+  async disconnectIdleSession(sessionId: string, owner?: SessionOwner): Promise<boolean> {
+    return this.disconnectSession(sessionId, owner);
   }
 
   /**
@@ -494,6 +551,10 @@ class SessionService {
         userId: owner.userId,
         workspacePath: workspaceDir,
       });
+      // 显式 resume 带配置时同步落盘（chat 路径的隐式 resume 不改配置）
+      if (Object.keys(opts).length) {
+        await this.registry.saveConfig(sessionId, toPersistedConfig(opts));
+      }
       return session;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -514,6 +575,9 @@ class SessionService {
     owner: SessionOwner = DEFAULT_OWNER,
   ): Promise<CopilotSession> {
     assertValidSessionId(sessionId);
+    // 空配置 resume 会把会话配置重置：从 registry 取回持久配置（chat 路径走这里）
+    const effective: SessionConfigOptions =
+      Object.keys(opts).length ? opts : ((await this.registry.getConfig(sessionId)) ?? {});
     const attached = this.sessions.get(sessionId);
     if (attached) {
       await this.assertOwnership(sessionId, owner);
@@ -527,7 +591,7 @@ class SessionService {
         await this.assertOwnership(sessionId, owner);
         return again;
       }
-      return this.resumeSession(sessionId, opts, owner);
+      return this.resumeSession(sessionId, effective, owner);
     });
   }
 

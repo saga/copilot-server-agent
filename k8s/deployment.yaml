@@ -67,6 +67,14 @@ spec:
                 secretKeyRef:
                   name: copilot-server-agent
                   key: github-token
+            # Durable state：配了才跨重启存活（execution / human task / approval / event / ownership）
+            # 不配则走内存实现，审批中的任务会在 Pod 重启后丢失
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: copilot-server-agent
+                  key: database-url
+                  optional: true
           volumeMounts:
             # workspace 独立卷（不用 subPath）
             - name: workspaces

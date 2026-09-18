@@ -17,7 +17,9 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 # 浏览器打开 http://localhost:5173
 ```
 
-单独启动：`npm run dev:server` / `npm run dev:client`；构建：`npm run build`；类型检查：`npm run typecheck`。
+单独启动：`npm run dev:server` / `npm run dev:client`；构建：`npm run build`；类型检查：`npm run typecheck`；测试：`npm run test`。
+
+架构设计（分层、execution 状态机、HITL 审批、审计分层、PostgreSQL schema）见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## API 契约（React → Express）
 
@@ -31,8 +33,20 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | POST | `/api/mcp/test` `{ name? , server? }`（二选一） | MCP 连通性自检（不建会话、不执行命令；local 查可执行文件，http 发 8s 超时 GET） |
 | GET | `/api/debug` | 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime） |
 | GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计；带 `executionId`） |
-| GET | `/api/executions` `?sessionId=&limit=` | 最近 execution 记录（usage + tool 证据）与统计 |
-| GET | `/api/executions/:id` | 单条 execution（含 `toolCalls` / `usage` / 终态） |
+| GET | `/api/executions` `?sessionId=&status=&limit=` | execution 记录（usage + tool 证据）与统计 |
+| GET | `/api/executions/:id` | 单条 execution（含 `toolCalls` / `usage` / `actionIntent` / 终态） |
+| GET | `/api/executions/:id/events` | **审计时间线**：谁批准、何时、依据什么 hash、后来为什么执行 |
+| GET | `/api/executions/:id/tasks` | 该 execution 挂起/已决的人工任务 |
+| POST | `/api/executions` `{ sessionId, kind?, input?, prompt? }` | 建后台执行单元 → `202 { executionId, status }`（HTTP 不等 agent） |
+| POST | `/api/executions/:id/run` `{ prompt }` | 后台跑一次 agent turn → `202`；等待审批时用 events 端点跟踪 |
+| POST | `/api/executions/:id/cancel` | 取消（running / waiting 都可） |
+| POST | `/api/executions/:id/actions` | **agent 提议业务动作**：服务端策略裁决 → 自动放行 / 建审批（202 + `taskId`）/ 拒绝（403）。执行权在 server |
+| GET | `/api/human-tasks` `?status=&type=` | 我的任务（审批 + 待补输入；资格服务端算） |
+| POST | `/api/human-tasks/:id/approve` `{ comment? }` | 批准（`approverId` 取认证身份，请求体传了也忽略） |
+| POST | `/api/human-tasks/:id/reject` `{ comment? }` | 否决 |
+| POST | `/api/human-tasks/:id/input` `{ values }` | 人工补数据（按 `inputSchema` 校验，不是自由文本） |
+| POST | `/api/human-tasks/:id/delegate` `{ toUserId, reason? }` | 委派（留痕 from/to/by/at + reason） |
+| POST | `/api/human-tasks/:id/cancel` | 取消任务 |
 | POST | `/api/sessions` `{ model?, sessionId?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers?, hooks?, sessionContext?, agentStopChecklist? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话） |
 | GET | `/api/sessions` | **当前调用方**的会话（按 Session Registry 归属过滤；刚建未对话的会话 runtime 尚未落盘，可能不在列表） |
 | GET | `/api/sessions/:id` | 单个会话元信息（越权 `403`） |
@@ -84,7 +98,8 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 | attach lock | `sessionAttachLocks` | 并发首访只 resume 一次，避免同一 runtime session 双附着 |
 | chat lock | `withSessionLock` 覆盖整个 `sendAndWait()` | `session.send()` 只是入队就返回，锁必须持续到 `session.idle`，否则同一 session 两个 turn 会同时写 workspace |
 | lifecycle lock | `disconnect` / `permanent delete` 走同一个 session lock | 不在 agent 正在写文件时删 workspace / 删 runtime session |
-| Session Registry | `server/src/services/session-registry.ts`（持久 JSON，生产换 PostgreSQL） | 重启后归属不丢，杜绝“谁先访问谁认领” |
+| Session Registry | `server/src/services/session-registry.ts`（`DATABASE_URL` 有值走 PostgreSQL，否则持久 JSON） | 重启后归属不丢，杜绝“谁先访问谁认领” |
+| 全局并发闸门 | `server/src/services/concurrency.ts` | `COPILOT_MAX_CONCURRENT_EXECUTIONS`：限制同时运行的 agent turn，避免 N 个用户烧满 runtime |
 | 工具授权 | `server/src/services/tool-policy.ts` | 取代 `approveAll`：write 限 workspace、bash 按策略、MCP 按会话启用名单、URL 过 SSRF + 域名 allowlist |
 | 执行前守卫 | `onPreToolUse`（强制 hook，请求关不掉） | 写类工具路径必须在 session workspace |
 | execution | `server/src/execution/` | session ≠ execution：每次 chat 一个 `executionId`，usage/工具证据/取消/终态全挂在它上面 |
@@ -96,23 +111,24 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 - **断开**：客户端断开 = `session.abort()` 当前 turn（不是断开 session），之后还能继续对话。
 - **workspace 是软隔离**：`workingDirectory` 只是默认 cwd，`bash` 仍能 `cd` 出去。策略层按 `possiblePaths` 拦截、写类工具按路径拦截；不可信代码场景仍需 per-request container。
 
-生产换 PostgreSQL 时表结构（字段与 Registry 一致）：
+### Durable state（PostgreSQL）
 
-```sql
-create table agent_sessions (
-  session_id    varchar(128) primary key,
-  tenant_id     varchar(128) not null,
-  user_id       varchar(128) not null,
-  workspace_id  varchar(64)  not null unique,
-  created_at    timestamptz  not null,
-  last_used_at  timestamptz  not null,
-  status        varchar(32)  not null
-);
+execution / human task / approval / event / session ownership 都是业务状态，必须跨 Pod 重启存活
+（否则“审批中的任务”会在重启后消失）。配 `DATABASE_URL` 即切到 PostgreSQL：
+
+```bash
+npm i pg                                                     # 可选依赖，未配 DATABASE_URL 时不需要
+psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
 ```
+
+五张表：`agent_session`、`agent_execution`、`human_task`、`human_task_decision`、`execution_event`
+（完整 DDL 见迁移文件）。未配 `DATABASE_URL` 时全部走内存实现，启动日志会打印
+`durable state = 内存` 警告。仓储接口在 `execution/repository.ts` 与 `human-tasks/repository.ts`，
+业务层只认接口，换存储不改代码。
 
 ## Execution Record（执行审计）
 
-一次 chat = 一个 execution。session 会有很多 turn，所以审计不能只挂 `sessionId`：
+一次 chat / 一个 job = 一个 execution。session 会有很多 turn，所以审计不能只挂 `sessionId`：
 
 ```text
 session ── execution #1 ── LLM ── tool ── tool
@@ -125,7 +141,8 @@ session ── execution #1 ── LLM ── tool ── tool
 {
   "executionId": "ex_…", "sessionId": "…", "tenantId": "…", "userId": "…",
   "startedAt": "…", "completedAt": "…", "durationMs": 4646,
-  "status": "completed",        // running | completed | failed | cancelled
+  "status": "completed",        // created|running|waiting_for_input|waiting_for_approval|resuming
+                                // |completed|failed|cancelled|rejected|expired
   "promptPreview": "\"只回复 OK\"",
   "usage": { "inputTokens": 4128, "outputTokens": 5, "cacheReadTokens": 0,
              "cacheWriteTokens": 0, "reasoningTokens": 0, "durationMs": 1473,
@@ -139,12 +156,43 @@ session ── execution #1 ── LLM ── tool ── tool
 
 | 组成 | 位置 | 说明 |
 |------|------|------|
-| ExecutionStore | `server/src/execution/store.ts` | 进程内 LRU 环（`COPILOT_MAX_TRACKED_EXECUTIONS`，重启清空；要长期审计把终态记录外发即可） |
+| ExecutionService + Repository | `server/src/execution/execution-service.ts`（仓储：memory / postgres） | 生命周期与状态机；配了 `DATABASE_URL` 就持久化，否则内存 LRU（`COPILOT_MAX_TRACKED_EXECUTIONS`） |
+| ExecutionEvent | `server/src/execution/events.ts` | 审计**时间线**（`GET /api/executions/:id/events`）：ExecutionRecord 只存当前状态，回答不了“谁批准 / 何时 / 依据什么” |
 | Usage | `server/src/execution/usage.ts` | **execution-local** 累加器：并发 turn 不串数据。监听 `assistant.usage`（token/耗时/模型）+ `session.usage_info`（上下文窗口） |
 | 工具证据 | `server/src/services/tool-evidence.ts` | `onPreToolUse` 开条（toolCallId/参数/守卫裁决）→ `onPostToolUse` / `onPostToolUseFailure` 收口（结果/错误/耗时） |
 | 脱敏截断 | `server/src/execution/redact.ts` | 参数与结果先 `redact`（token/api_key/authorization/password/secret… 按 key 与值形态）再 `truncate`（只报长度）。tool 结果可能极大（SQL/PDF/网页），不能直接进日志 |
 
 审计链：`request → execution → 策略裁决 → 工具执行 → 结果`，hook 事件环（`GET /api/hooks`）里的每条都带 `executionId`。
+LangSmith 之类的 trace 只承担 runtime observability，**不是**审计真相源。
+
+## Human-in-the-loop（审批）
+
+高风险 mutation（下单、代理投票、对外发消息、删数据）不作为普通模型工具暴露：
+agent 只能**提议**（`POST /api/executions/:id/actions` 或 governance MCP 的 `propose_action`），
+执行器在服务端（`server/src/actions/action-registry.ts`）。
+
+```text
+agent 提出 ActionIntent
+   ↓  ActionService.classify(actionType)   —— 策略裁决，不看 LLM 的建议
+   ├ 未登记策略 → 403 denied（默认拒绝）
+   ├ 自动放行   → server 直接执行
+   └ needs_approval → 建 HumanTask + execution 进入 WAITING_FOR_APPROVAL（HTTP 202 返回）
+   ↓
+人工审批（ANY / ALL / N_OF_M / SEQUENTIAL，一人一票，发起人默认不能自批）
+   ↓ 通过
+actionHash 复核 + resourceVersion 复核 + ToolPolicy
+   ↓
+server 侧 executor 执行 → COMPLETED
+```
+
+- `actionHash = sha256(canonicalJson(intent 去掉 createdAt))`：批准的是**动作内容**，
+  执行前重算，失配 → 回到待审批并开新任务（防“批准 10,000 股 / 执行 100,000 股”）
+- `resourceVersion`：批准时所依据的数据版本 vs 执行时的当前版本，不一致同样重新审批
+- 等待审批期间**不持有 session lock**：持久化状态后 `session.disconnect()`，审批完成再 resume
+- Delegation / 过期：`POST /:id/delegate` 留痕；过期扫描（默认 60s）`OPEN → EXPIRED`
+
+agent 侧入口（可选）：`scripts/governance-mcp.mjs` 是 stdio MCP server，只暴露
+`propose_action`，实现是回调本服务的 `/api/executions/:id/actions`。
 
 ## 环境变量（安全相关）
 
@@ -156,8 +204,15 @@ session ── execution #1 ── LLM ── tool ── tool
 | `COPILOT_WARMUP` | `true` | 启动时后台预热 runtime（首屏徽章与首个会话不必等 CLI 拉起）；`false`=纯懒加载 |
 | `COPILOT_URL_ALLOWLIST` | 空 | 允许访问的域名（逗号分隔；空=任意公网，仍过 SSRF 检查） |
 | `COPILOT_EVIDENCE_MAX_CHARS` | `2000` | 单条 tool 参数/结果预览的最大字符数（超出只记长度） |
-| `COPILOT_MAX_TRACKED_EXECUTIONS` | `200` | 内存保留的 execution 条数 |
+| `COPILOT_MAX_TRACKED_EXECUTIONS` | `200` | 内存模式下保留的 execution 条数 |
 | `COPILOT_MAX_TOOL_CALLS` | `100` | 单个 execution 最多记多少条 tool call |
+| `DATABASE_URL` | 空 | 留空=内存实现（重启即丢）；配置后 execution/human task/approval/event/ownership 全部落 PostgreSQL |
+| `COPILOT_MAX_CONCURRENT_EXECUTIONS` | `0` | 全进程同时运行的 agent turn 上限（`0`=不限） |
+| `COPILOT_HUMAN_TASK_TTL` | `86400` | Human Task 默认 TTL（秒，`0`=不过期）；到期 `OPEN → EXPIRED` |
+| `COPILOT_HUMAN_TASK_SWEEP` | `60` | 过期扫描间隔（秒） |
+| `COPILOT_ALLOW_INITIATOR_APPROVAL` | `false` | 是否允许发起人审批自己发起的 action（SoD） |
+| `COPILOT_DEFAULT_ROLES` | `approver` | 未开启身份头可信时的默认角色（审批资格判定用） |
+| `COPILOT_AUTO_APPROVE_ACTIONS` | 空 | 逗号分隔的动作类型：这些动作跳过人工审批、server 直接执行（慎用） |
 
 ## 版本锁定与自检
 
@@ -189,12 +244,18 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 ## 服务端结构
 
 - `server/src/services/session-service.ts` — `SessionService` 单例（Client 生命周期 + 会话管理 + attach/chat/lifecycle 三把锁 + 诊断包）
-- `server/src/services/session-registry.ts` — 持久归属表（重启不丢；生产换 PostgreSQL）
+- `server/src/services/session-registry.ts` — 持久归属表 + resume 用会话配置（凭证不落库）
 - `server/src/services/tool-policy.ts` — 工具授权 policy + `onPreToolUse` workspace 守卫
 - `server/src/services/tool-evidence.ts` — 工具证据 hook（toolCallId / 裁决 / 耗时 / 脱敏结果）
-- `server/src/execution/` — execution 记录（`store.ts`）、LLM usage 累加器（`usage.ts`）、脱敏截断（`redact.ts`）
+- `server/src/execution/` — `execution-service.ts`（生命周期 + 状态机 + HITL）、`repository.ts`（memory/postgres 仓储）、`events.ts`（审计时间线）、`hash.ts`（actionHash）、`usage.ts`、`redact.ts`
+- `server/src/human-tasks/` — HumanTask + Decision（审批与人工输入统一抽象）、`assignment.ts`（资格判定）
+- `server/src/approval/` — `approval-policy.ts`（ANY/ALL/N_OF_M/SEQUENTIAL）、`approval-service.ts`（谁能批、几票、顺序）
+- `server/src/actions/` — `action-registry.ts`（server-controlled executor）、`action-service.ts`（业务动作策略裁决 + hash/版本复核）
+- `server/src/agent/` — `agent-runner.ts`（Copilot SDK 事件收口）、`agent-context.ts`（turn 级 execution 上下文）
+- `server/src/db/` — `pool.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql`
+- `server/src/wiring.ts` — 依赖装配（唯一决定 PostgreSQL vs 内存的地方）
 - `server/src/services/workspace-service.ts` — session workspace（路径是 sessionId 的确定性哈希）
-- `server/src/routes/api.ts` — `apiRouter`（全部 `/api/*` 路由）
+- `server/src/routes/` — `api.ts`（挂载）+ `sessions.ts` / `executions.ts` / `human-tasks.ts` / `meta.ts` / `shared.ts`
 
 ## 前提
 

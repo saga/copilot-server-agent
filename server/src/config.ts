@@ -80,6 +80,17 @@ export const config = {
   maxToolCallsPerExecution: Number(env('COPILOT_MAX_TOOL_CALLS', '100')) || 100,
   // --- 管理接口令牌（留空=不设防本地开发；生产设置后 /api/debug、/api/hooks 需带 x-admin-token） ---
   adminToken: env('COPILOT_ADMIN_TOKEN', '') || undefined,
+  // --- Durable state：execution / human task / approval / event / session ownership 的持久真相源 ---
+  // 留空=内存实现（单副本、重启即丢，仅适合本地开发）；生产配 PostgreSQL 连接串
+  databaseUrl: env('DATABASE_URL', '') || undefined,
+  /** 全进程同时运行的 agent turn 上限（0=不限；防止 N 个用户同时烧满 runtime CPU） */
+  maxConcurrentExecutions: Number(env('COPILOT_MAX_CONCURRENT_EXECUTIONS', '0')) || 0,
+  /** Human Task 默认 TTL（秒；0=不过期）。到期 OPEN → EXPIRED，execution 随之 EXPIRED */
+  humanTaskTtlSeconds: Number(env('COPILOT_HUMAN_TASK_TTL', '86400')) || 0,
+  /** 过期扫描间隔（秒） */
+  humanTaskSweepSeconds: Number(env('COPILOT_HUMAN_TASK_SWEEP', '60')) || 60,
+  /** 是否允许发起人审批自己发起的 action（Separation of Duties；默认否） */
+  allowInitiatorApproval: env('COPILOT_ALLOW_INITIATOR_APPROVAL', 'false') === 'true',
   // --- MCP：filesystem 预设开关与授权目录（生产默认关；开则必须配 COPILOT_MCP_FS_DIR） ---
   mcpFilesystem: env('COPILOT_MCP_FILESYSTEM', 'false') === 'true',
   mcpFsDir: env('COPILOT_MCP_FS_DIR', '') || undefined,
