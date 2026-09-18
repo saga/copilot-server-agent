@@ -4,6 +4,7 @@ import type { MCPServerConfig } from '@github/copilot-sdk';
 import { copilotService, assertValidSessionId } from '../services/copilot.js';
 import { listProviderStatus } from '../providers/index.js';
 import { listMcp } from '../mcp/registry.js';
+import { listHooks } from '../hooks/registry.js';
 
 export const copilotRouter = Router();
 
@@ -57,6 +58,9 @@ const sessionConfigSchema = z.object({
   mcp: z.array(z.string()).optional(),
   mcpServers: z.record(z.string(), mcpServerSchema).optional(),
   disabledMcpServers: z.array(z.string()).optional(),
+  hooks: z.array(z.string()).optional(),
+  sessionContext: z.string().max(4000, 'sessionContext 最长 4000 字符').optional(),
+  agentStopChecklist: z.string().max(2000, 'agentStopChecklist 最长 2000 字符').optional(),
 });
 
 const createSessionSchema = sessionConfigSchema.extend({
@@ -112,6 +116,12 @@ copilotRouter.get('/agents', (_req, res) => {
 /** GET /api/mcp — MCP 预设与内联开关（只含元信息，密钥字段永不返回） */
 copilotRouter.get('/mcp', (_req, res) => {
   res.json(listMcp());
+});
+
+/** GET /api/hooks — hook 预设与最近 hook 事件（审计；事件环纯内存，重启清空） */
+copilotRouter.get('/hooks', (req, res) => {
+  const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 50) || 50));
+  res.json(listHooks(limit));
 });
 
 /** POST /api/sessions — 创建 Copilot 会话（可挂 agents/skills/mcp；传 sessionId 即为可恢复会话） */

@@ -53,6 +53,12 @@ export interface CreateSessionBody {
   mcpServers?: Record<string, McpServerBody>;
   /** 本次不启动的 MCP（精确匹配） */
   disabledMcpServers?: string[];
+  /** 启用的 hook 预设名（缺省=默认启用项；显式 []=全关） */
+  hooks?: string[];
+  /** 启动时注入的附加上下文（自动启用 session-context 预设） */
+  sessionContext?: string;
+  /** agent 自然停机前的检查项（自动启用 stop-guard，block 一次继续） */
+  agentStopChecklist?: string;
 }
 
 /** resume 与 create 共用全部配置项，只是 sessionId 来自路径 */

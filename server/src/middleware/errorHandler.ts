@@ -18,6 +18,6 @@ export function errorHandler(
   }
   const message = err instanceof Error ? err.message : 'Internal Server Error';
   // 已知的“缺配置/名字写错”类错误也给 400
-  const badRequest = /未知 agent|未知 MCP|不存在|缺少|必须|可选：|被拒绝|非法|解析失败/.test(message);
+  const badRequest = /未知 agent|未知 MCP|未知 hook|不存在|缺少|必须|可选：|被拒绝|非法|解析失败/.test(message);
   return res.status(badRequest ? 400 : 500).json({ error: message });
 }

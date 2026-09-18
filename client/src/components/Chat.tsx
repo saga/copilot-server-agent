@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react';
 import {
   api,
   type AgentInfo,
+  type HookEvent,
+  type HookPreset,
   type McpPreset,
   type SessionMeta,
   type SkillInfo,
@@ -60,6 +62,13 @@ export function Chat() {
   // MCP 预设开关
   const [mcpPresets, setMcpPresets] = useState<McpPreset[]>([]);
   const [enabledMcp, setEnabledMcp] = useState<string[]>([]);
+  // Hooks 预设开关 + 参数 + 事件查看
+  const [hookPresets, setHookPresets] = useState<HookPreset[]>([]);
+  const [enabledHooks, setEnabledHooks] = useState<string[]>([]);
+  const [sessionContext, setSessionContext] = useState('');
+  const [stopChecklist, setStopChecklist] = useState('');
+  const [hookEvents, setHookEvents] = useState<HookEvent[]>([]);
+  const [showHooks, setShowHooks] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
 
   // 后端当前 provider（copilot/deepseek）决定默认模型；用户手动改过则不覆盖
@@ -98,6 +107,14 @@ export function Chat() {
         setEnabledMcp(presets.filter((p) => p.enabledByDefault).map((p) => p.name));
       })
       .catch(() => {});
+    api
+      .hooks()
+      .then(({ presets }) => {
+        if (!alive) return;
+        setHookPresets(presets);
+        setEnabledHooks(presets.filter((p) => p.enabledByDefault).map((p) => p.name));
+      })
+      .catch(() => {});
     return () => {
       alive = false;
     };
@@ -120,7 +137,19 @@ export function Chat() {
       ...(preSelect ? { agent: preSelect } : {}),
       noBuiltinSkills: !useSkills,
       mcp: enabledMcp,
+      hooks: enabledHooks,
+      ...(sessionContext.trim() ? { sessionContext: sessionContext.trim() } : {}),
+      ...(stopChecklist.trim() ? { agentStopChecklist: stopChecklist.trim() } : {}),
     };
+  }
+
+  async function refreshHookEvents() {
+    try {
+      const { recentEvents } = await api.hooks(50);
+      setHookEvents(recentEvents);
+    } catch {
+      // 失败不打断主流程
+    }
   }
 
   const scrollBottom = () => {
@@ -319,7 +348,74 @@ export function Chat() {
       </div>
       {sessionStarted && (
         <div className="hint" style={{ padding: '4px 12px' }}>
-          会话已创建，agents/技能/预选/MCP 在下次「新会话」时生效（恢复会话则用当前表单重配）。
+          会话已创建，agents/技能/预选/MCP/hooks 在下次「新会话」时生效（恢复会话则用当前表单重配）。
+        </div>
+      )}
+
+      <div className="toolbar">
+        <span title="启用的 hook 预设（传上下文/检查项会自动启用对应预设）">
+          Hooks:{' '}
+          {hookPresets.length === 0 && <span className="hint">加载中…</span>}
+          {hookPresets.map((p) => (
+            <label key={p.name} style={{ marginRight: 8 }} title={p.description}>
+              <input
+                type="checkbox"
+                checked={enabledHooks.includes(p.name)}
+                disabled={sessionStarted || busy}
+                onChange={() =>
+                  setEnabledHooks((cur) =>
+                    cur.includes(p.name) ? cur.filter((n) => n !== p.name) : [...cur, p.name],
+                  )
+                }
+              />{' '}
+              {p.name}
+            </label>
+          ))}
+        </span>
+        <label title="onSessionStart 注入的附加上下文">
+          上下文{' '}
+          <input
+            value={sessionContext}
+            onChange={(e) => setSessionContext(e.target.value)}
+            placeholder="如：回答用中文、简洁"
+            disabled={sessionStarted || busy}
+            style={{ width: 200 }}
+          />
+        </label>
+        <label title="onAgentStop：agent 自然停机时 block 一次按此检查项继续">
+          停机检查{' '}
+          <input
+            value={stopChecklist}
+            onChange={(e) => setStopChecklist(e.target.value)}
+            placeholder="如：确认 tests 通过再结束"
+            disabled={sessionStarted || busy}
+            style={{ width: 200 }}
+          />
+        </label>
+        <button
+          disabled={busy}
+          onClick={() => {
+            setShowHooks((s) => !s);
+            if (!showHooks) void refreshHookEvents();
+          }}
+        >
+          {showHooks ? '收起事件' : 'hook 事件'}
+        </button>
+      </div>
+
+      {showHooks && (
+        <div className="sessions">
+          {hookEvents.length === 0 && <span className="hint">暂无 hook 事件（建会话并对话后产生）</span>}
+          {hookEvents.map((e, i) => (
+            <div key={i} className="session-row">
+              <span className="badge">{e.kind}</span>
+              <code className="sid" title={e.sessionId}>
+                {e.sessionId.length > 16 ? `${e.sessionId.slice(0, 16)}…` : e.sessionId}
+              </code>
+              <span className="hint">{new Date(e.ts).toLocaleTimeString()}</span>
+              <span>{e.detail}</span>
+            </div>
+          ))}
         </div>
       )}
 

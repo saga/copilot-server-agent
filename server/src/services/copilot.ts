@@ -15,6 +15,7 @@ import {
   type SkillMeta,
 } from '../skills/index.js';
 import { resolveMcp } from '../mcp/registry.js';
+import { resolveHooks } from '../hooks/registry.js';
 
 /** 自定义 sessionId 规则（对应文档“结构化 ID 便于审计/清理”：字母数字开头，允许 -_） */
 const SESSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9-_]{0,127}$/;
@@ -49,6 +50,12 @@ export interface SessionConfigOptions {
   mcpServers?: Record<string, MCPServerConfig>;
   /** 本次不启动的 MCP server 名（精确匹配） */
   disabledMcpServers?: string[];
+  /** 启用的 hook 预设名（缺省=默认启用项；显式 []=全关） */
+  hooks?: string[];
+  /** 启动时注入的附加上下文（自动启用 session-context 预设） */
+  sessionContext?: string;
+  /** agent 自然停机前的检查项（自动启用 stop-guard，block 一次继续） */
+  agentStopChecklist?: string;
 }
 
 export interface CreateSessionOptions extends SessionConfigOptions {
@@ -143,6 +150,12 @@ class CopilotService {
     });
     // MCP：预设按名启用 + 内联自定义（local 有安全门）
     const { mcpServers } = resolveMcp({ enable: opts.mcp, inline: opts.mcpServers });
+    // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设
+    const { hooks } = resolveHooks({
+      enable: opts.hooks,
+      sessionContext: opts.sessionContext,
+      agentStopChecklist: opts.agentStopChecklist,
+    });
     return {
       model: resolved.model,
       ...(resolved.provider ? { provider: resolved.provider } : {}),
@@ -159,6 +172,7 @@ class CopilotService {
       ...(mcpServers ? { mcpServers } : {}),
       // 精确禁用的 MCP servers（本次不启动、不鉴权；常驻 resume 无法撤销已启动的）
       ...(opts.disabledMcpServers?.length ? { disabledMcpServers: opts.disabledMcpServers } : {}),
+      ...(hooks ? { hooks } : {}),
     };
   }
 

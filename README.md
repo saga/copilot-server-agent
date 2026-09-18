@@ -28,7 +28,8 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | GET | `/api/models` | 当前通道可用模型列表 `{ provider, models }`（前端模型选择器用） |
 | GET | `/api/agents` | agent 预设 + 技能目录 + 可发现技能（建会话表单用） |
 | GET | `/api/mcp` | MCP 预设与内联开关（只含元信息，密钥不返回） |
-| POST | `/api/sessions` `{ model?, sessionId?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话） |
+| GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计） |
+| POST | `/api/sessions` `{ model?, sessionId?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers?, hooks?, sessionContext?, agentStopChecklist? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话） |
 | GET | `/api/sessions` | 磁盘全部会话（含 `attached` 标记；刚建未对话的会话 runtime 尚未落盘，可能不在列表） |
 | GET | `/api/sessions/:id` | 单个会话元信息 |
 | POST | `/api/sessions/:id/resume` `{ 与创建相同的重配项 }` | 恢复会话 → `{ sessionId, resumed }`（BYOK 凭证服务端自动重传） |
@@ -69,6 +70,15 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 
 - **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 列磁盘会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。
 - **MCP**（`server/src/mcp/registry.ts`）：内置 `filesystem` 预设（官方 server，授权目录限定仓库根，可用 `COPILOT_MCP_FS_DIR` 改、`COPILOT_MCP_FILESYSTEM=false` 关）；运维经 `COPILOT_MCP_SERVERS`（JSON）预置额外 servers；前端建会话用 `mcp: [...]` 按名启用、`disabledMcpServers` 精确禁用。安全门：内联 `local/stdio` MCP = 在服务器执行任意命令，默认 400 拒绝（`COPILOT_ALLOW_INLINE_MCP_LOCAL=true` 才放行）；内联 `http/sse` 默认允许。`GET /api/mcp` 只返回元信息，headers/env 密钥永不外泄。
+
+## Hooks（生命周期 + 错误处理）
+
+参考官方 hooks-overview / session-lifecycle / error-handling 三篇文档（`server/src/hooks/`）：
+
+- **预设**：`audit`（默认启用，只记录会话起止/错误到日志与事件环，不干预）、`session-context`（`onSessionStart` 注入 `sessionContext` 文本）、`error-policy`（`onErrorOccurred`：全记日志；可恢复 tool 错误降噪 suppress；model_call/system 给友好通知）、`stop-guard`（`onAgentStop`：传 `agentStopChecklist` 即 block 一次按检查项继续，用 `stopHookActive` 防重复）。
+- **用法**：建/恢复会话传 `hooks: [...]`（缺省=默认启用项，`[]` 全关，未知名 400）；传 `sessionContext`/`agentStopChecklist` 自动启用对应预设；多预设 start 上下文拼接、end 汇总、error 首个非空决策生效。
+- **审计**：`GET /api/hooks` 返回预设 + 最近 hook 事件（纯内存环，重启清空）。
+- 注意：以 SDK 实际类型为准——handler 返回 `void`（非文档示例的 `null`），start 输入字段为 `workingDirectory`（非 `cwd`）、`timestamp` 为 `Date`。
 
 ## 前提
 

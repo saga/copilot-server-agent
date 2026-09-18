@@ -46,6 +46,9 @@ export interface CreateSessionOpts {
   noBuiltinSkills?: boolean;
   mcp?: string[];
   disabledMcpServers?: string[];
+  hooks?: string[];
+  sessionContext?: string;
+  agentStopChecklist?: string;
 }
 
 export interface SessionMeta {
@@ -64,6 +67,20 @@ export interface McpPreset {
   enabledByDefault: boolean;
   scope?: string;
   source: 'builtin' | 'operator';
+}
+
+export interface HookPreset {
+  name: string;
+  displayName: string;
+  description: string;
+  enabledByDefault: boolean;
+}
+
+export interface HookEvent {
+  ts: string;
+  sessionId: string;
+  kind: 'session-start' | 'session-end' | 'agent-stop' | 'error';
+  detail: string;
 }
 
 export interface SubagentEvent {
@@ -133,6 +150,13 @@ export const api = {
   mcp(): Promise<{ presets: McpPreset[]; allowInlineLocal: boolean; allowInlineHttp: boolean }> {
     return fetch(`${API_BASE}/api/mcp`).then(
       json<{ presets: McpPreset[]; allowInlineLocal: boolean; allowInlineHttp: boolean }>,
+    );
+  },
+
+  /** Hook 预设与最近 hook 事件（审计） */
+  hooks(limit = 50): Promise<{ presets: HookPreset[]; recentEvents: HookEvent[] }> {
+    return fetch(`${API_BASE}/api/hooks?limit=${limit}`).then(
+      json<{ presets: HookPreset[]; recentEvents: HookEvent[] }>,
     );
   },
 
