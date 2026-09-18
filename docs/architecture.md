@@ -163,8 +163,8 @@ psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
 | 表 | 关键字段 |
 |----|---------|
 | `agent_session` | session_id, tenant_id, user_id, workspace_path, status, **config jsonb**（resume 用，不含凭证） |
-| `agent_execution` | execution_id, session_id, tenant/user, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls |
-| `human_task` | task_id, execution_id, type, status, payload, input_schema, policy_id, strategy, required_count, eligible_roles/users, initiated_by, expires_at, delegated_* |
+| `agent_execution` | execution_id, session_id, tenant/user, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars |
+| `human_task` | task_id, execution_id, type, status, payload, **input_values**（人工输入回填）, input_schema, policy_id, strategy, required_count, eligible_roles/users, initiated_by, expires_at, delegated_* |
 | `human_task_decision` | decision_id, task_id, approver_id, approver_role, decision, comment, `unique(task_id, approver_id)` |
 | `execution_event` | execution_id, sequence, type, actor_type, actor_id, payload, `unique(execution_id, sequence)` |
 

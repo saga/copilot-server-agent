@@ -29,6 +29,8 @@ create table if not exists agent_execution (
   status varchar(32) not null default 'created',
   input jsonb,
   result jsonb,
+  -- 输出字符数（审计留体量，不存全文）
+  content_chars integer,
   action_intent jsonb,
   action_hash varchar(64),
   -- 批准时依据的数据版本；执行前必须复核（防止“批的是 v1，执行时已是 v2”）
@@ -64,6 +66,8 @@ create table if not exists human_task (
   title text not null,
   description text,
   payload jsonb not null default '{}',
+  -- 人工输入/审批时实际提交的值（resume 时回填给 execution）
+  input_values jsonb,
   input_schema jsonb,
   policy_id varchar(128),
   strategy varchar(32),
@@ -114,3 +118,7 @@ create table if not exists execution_event (
 );
 
 create index if not exists idx_execution_event on execution_event(execution_id, sequence);
+
+-- 已建库的环境：create table if not exists 不会补列，这里保证重跑迁移即收敛。
+alter table agent_execution add column if not exists content_chars integer;
+alter table human_task add column if not exists input_values jsonb;
