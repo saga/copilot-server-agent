@@ -22,12 +22,13 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(here, '../../..');
 
 /**
- * 内置预设：filesystem MCP。生产默认关闭（COPILOT_MCP_FILESYSTEM=true 才开，
- * 且授权目录必须用 COPILOT_MCP_FS_DIR 显式指定，禁挂整个 repo/image 根）。
+ * 内置预设：filesystem MCP。生产默认关闭（COPILOT_MCP_FILESYSTEM=true 才开）。
+ * 开启后授权目录跟随 session workspace（而非 REPO_ROOT），1 session = 1 目录；
+ * 只有无 workspace 上下文的展示/自检路径才回退到 COPILOT_MCP_FS_DIR 或仓库根。
  */
-function filesystemPreset(): { meta: McpPresetMeta; config: MCPServerConfig } | null {
+function filesystemPreset(workspaceDir?: string): { meta: McpPresetMeta; config: MCPServerConfig } | null {
   if (!config.mcpFilesystem) return null;
-  const dir = config.mcpFsDir ? path.resolve(config.mcpFsDir) : REPO_ROOT;
+  const dir = workspaceDir ?? (config.mcpFsDir ? path.resolve(config.mcpFsDir) : REPO_ROOT);
   return {
     meta: {
       name: 'filesystem',
@@ -94,6 +95,8 @@ export interface ResolveMcpOptions {
   enable?: string[];
   /** 内联自定义 servers（前端请求里带的 mcpServers） */
   inline?: Record<string, MCPServerConfig>;
+  /** session workspace：filesystem 预设的授权根跟随它（不传=回退默认目录） */
+  workspaceDir?: string;
 }
 
 /**
@@ -104,7 +107,7 @@ export function resolveMcp(opts: ResolveMcpOptions): {
   mcpServers?: Record<string, MCPServerConfig>;
 } {
   const available = new Map<string, MCPServerConfig>();
-  const fs = filesystemPreset();
+  const fs = filesystemPreset(opts.workspaceDir);
   if (fs) available.set(fs.meta.name, fs.config);
   for (const [name, cfg] of Object.entries(operatorServers())) available.set(name, cfg);
 

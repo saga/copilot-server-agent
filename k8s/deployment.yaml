@@ -30,6 +30,9 @@ spec:
               value: "http://127.0.0.1:4321"
             - name: COPILOT_SESSION_IDLE_TIMEOUT
               value: "1800"
+            # 每 session 独立 workspace（挂同一 PVC 的 subPath，Pod 重启不丢）
+            - name: COPILOT_WORKSPACE_ROOT
+              value: "/workspaces"
             # 生产安全默认值
             - name: COPILOT_MCP_FILESYSTEM
               value: "false"
@@ -49,6 +52,10 @@ spec:
                 secretKeyRef:
                   name: copilot-server-agent
                   key: github-token
+          volumeMounts:
+            - name: copilot-state
+              mountPath: /workspaces
+              subPath: workspaces
           readinessProbe:
             httpGet:
               path: /api/health/ready

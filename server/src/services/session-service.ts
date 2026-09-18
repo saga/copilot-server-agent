@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { CopilotClient, RuntimeConnection, approveAll } from '@github/copilot-sdk';
@@ -24,6 +25,7 @@ import { resolveMcp, listMcp } from '../mcp/registry.js';
 import { resolveHooks } from '../hooks/registry.js';
 import { hookEventCount } from '../hooks/events.js';
 import { HOOK_PRESETS } from '../hooks/builtin.js';
+import { workspaceService } from './workspace-service.js';
 
 const require = createRequire(import.meta.url);
 
@@ -76,6 +78,7 @@ export interface SessionRecord {
   sessionId: string;
   tenantId: string;
   userId: string;
+  workspacePath: string;
 }
 
 export const DEFAULT_OWNER: SessionOwner = { tenantId: 'default', userId: 'default' };
@@ -166,9 +169,9 @@ export interface DebugInfo {
     logDir?: string;
     cliPath?: string;
     sessionIdleTimeoutSeconds?: number;
-    workingDirectory?: string;
     runtimeUrl?: string;
     baseDirectory: string;
+    workspaceRoot: string;
   };
   sessions: { attached: number; attachedIds: string[]; onDisk: number | null; listError?: string };
   hooks: { presets: number; recentEvents: number };
@@ -222,12 +225,11 @@ class SessionService {
         // K8s/远端：连外部 headless runtime（COPILOT_HOME 配在 runtime 那边，本侧 baseDirectory 被忽略）
         clientOptions.connection = RuntimeConnection.forUri(config.runtimeUrl);
       } else {
-        // 本地：SDK 自己拉起 runtime
+        // 本地：SDK 自己拉起 runtime（工作目录是 session 级的，这里不再设 client 默认）
         Object.assign(clientOptions, {
           gitHubToken: config.githubToken,
           // 未提供 token 时默认使用 copilot CLI 已登录用户
           useLoggedInUser: config.githubToken ? false : true,
-          workingDirectory: config.workingDirectory,
           // 会话持久化目录（mode: "empty" 强制要求；缺省 ~/.copilot，与 runtime 默认一致）
           baseDirectory: config.baseDirectory,
           // 调试：自定义 CLI 路径 / 日志目录时才显式建 connection，
@@ -288,9 +290,9 @@ class SessionService {
         ...(config.sessionIdleTimeoutSeconds
           ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
           : {}),
-        ...(config.workingDirectory ? { workingDirectory: config.workingDirectory } : {}),
         ...(config.runtimeUrl ? { runtimeUrl: config.runtimeUrl } : {}),
         baseDirectory: config.baseDirectory,
+        workspaceRoot: config.workspaceRoot,
       },
       sessions: { attached: this.sessions.size, attachedIds: [...this.sessions.keys()], onDisk: null },
       hooks: { presets: HOOK_PRESETS.length, recentEvents: hookEventCount() },
@@ -347,8 +349,9 @@ class SessionService {
    * create 与 resume 共用的会话配置装配。
    * 注意 BYOK 恢复必须重传 provider（key 从不落盘）：这里每次都从当前 provider 现算，
    * 所以 resume 无需调用方操心，换通道后 resume 会自动用新通道凭证。
+   * workspaceDir 必传：session 级 workingDirectory + workspace 级 MCP 根，1 session = 1 目录。
    */
-  private buildSessionConfig(opts: SessionConfigOptions) {
+  private buildSessionConfig(opts: SessionConfigOptions, workspaceDir: string) {
     // 经当前 provider 解析：补默认 model、BYOK 拼 ProviderConfig
     const resolved = getActiveProvider().resolve(opts);
     // agents：预设按名引用 + 内联定义；agent 预选必须命中其一
@@ -363,8 +366,12 @@ class SessionService {
       extra: opts.skillDirs,
       includeBuiltin: !opts.noBuiltinSkills,
     });
-    // MCP：预设按名启用 + 内联自定义（local 有安全门）
-    const { mcpServers } = resolveMcp({ enable: opts.mcp, inline: opts.mcpServers });
+    // MCP：预设按名启用 + 内联自定义（local/http 各有安全门；filesystem 根跟随 workspace）
+    const { mcpServers } = resolveMcp({
+      enable: opts.mcp,
+      inline: opts.mcpServers,
+      workspaceDir,
+    });
     // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设
     const { hooks } = resolveHooks({
       enable: opts.hooks,
@@ -375,6 +382,8 @@ class SessionService {
       model: resolved.model,
       ...(resolved.provider ? { provider: resolved.provider } : {}),
       streaming: true,
+      // session 独立工作目录（软隔离：默认 cwd；硬隔离需要 per-request container）
+      workingDirectory: workspaceDir,
       // session 最大工具集合（mode: "empty" 必填；agent.tools 必须为其子集，见 #2356 说明）
       availableTools: BUILTIN_TOOLS,
       onPermissionRequest: (...args: Parameters<PermissionHandler>) =>
@@ -394,24 +403,31 @@ class SessionService {
     };
   }
 
+  /**
+   * 1 request = 1 session = 1 workspace。
+   * 未传 sessionId 时服务端生成 UUID（SDK 可恢复 ID），所有会话天然可 resume。
+   */
   async createSession(opts: CreateSessionOptions, owner: SessionOwner = DEFAULT_OWNER): Promise<CopilotSession> {
     const client = await this.getClient();
-    if (opts.sessionId !== undefined) assertValidSessionId(opts.sessionId);
+    const sessionId = opts.sessionId ?? randomUUID();
+    assertValidSessionId(sessionId);
+    const workspaceDir = await workspaceService.create(sessionId);
     const session = await client.createSession({
-      ...this.buildSessionConfig(opts),
-      ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
+      ...this.buildSessionConfig(opts, workspaceDir),
+      sessionId,
     });
     this.sessions.set(session.sessionId, session);
     this.owners.set(session.sessionId, {
       sessionId: session.sessionId,
       tenantId: owner.tenantId,
       userId: owner.userId,
+      workspacePath: workspaceDir,
     });
     return session;
   }
 
   /**
-   * 恢复磁盘上的会话（服务重启/换实例后继续）。
+   * 恢复磁盘上的会话（服务重启/换实例后继续），回到同一 workspace。
    * 若内存里已有同 id 的附着会话则直接复用，避免同一会话双附着（文档：并发访问未定义）。
    */
   async resumeSession(
@@ -426,13 +442,16 @@ class SessionService {
       return attached;
     }
     const client = await this.getClient();
+    // workspace 路径是 sessionId 的确定性函数：resume 永远回到同一目录
+    const workspaceDir = await workspaceService.create(sessionId);
     try {
-      const session = await client.resumeSession(sessionId, this.buildSessionConfig(opts));
+      const session = await client.resumeSession(sessionId, this.buildSessionConfig(opts, workspaceDir));
       this.sessions.set(session.sessionId, session);
       this.owners.set(session.sessionId, {
         sessionId: session.sessionId,
         tenantId: owner.tenantId,
         userId: owner.userId,
+        workspacePath: workspaceDir,
       });
       return session;
     } catch (err) {
@@ -480,11 +499,16 @@ class SessionService {
     return this.owners.get(sessionId);
   }
 
-  /** 越权访问直接抛错（路由层转为 403；无记录=本地旧会话，首个调用者认领） */
+  /** 越权访问直接抛错（路由层转为 403；无记录=本地旧会话，首个调用者认领，workspace 可由路径函数重建） */
   assertSessionOwner(sessionId: string, owner: SessionOwner): void {
     const record = this.owners.get(sessionId);
     if (!record) {
-      this.owners.set(sessionId, { sessionId, tenantId: owner.tenantId, userId: owner.userId });
+      this.owners.set(sessionId, {
+        sessionId,
+        tenantId: owner.tenantId,
+        userId: owner.userId,
+        workspacePath: workspaceService.pathFor(sessionId),
+      });
       return;
     }
     if (record.tenantId !== owner.tenantId || record.userId !== owner.userId) {
@@ -540,7 +564,7 @@ class SessionService {
   }
 
   /**
-   * 彻底删除：先断开内存附着，再删磁盘全部数据 → 不可恢复。
+   * 彻底删除：先断开内存附着，再删磁盘全部数据 + workspace 目录 → 不可恢复。
    * 磁盘上不存在时 SDK 会抛错，调用方按 404 处理。
    */
   async deleteSessionPermanently(sessionId: string, owner?: SessionOwner): Promise<void> {
@@ -558,6 +582,12 @@ class SessionService {
       throw err;
     }
     this.owners.delete(sessionId);
+    // workspace 清理失败只告警，不让整个删除 API 失败（避免孤儿 session 删不掉）
+    try {
+      await workspaceService.remove(sessionId);
+    } catch (err) {
+      console.warn(`[session] workspace 清理失败 ${sessionId}：${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   async stop() {

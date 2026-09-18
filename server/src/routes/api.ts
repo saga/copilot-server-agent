@@ -224,7 +224,10 @@ apiRouter.post('/sessions', async (req, res, next) => {
       },
       ownerFromHeaders(req.headers),
     );
-    res.status(201).json({ sessionId: session.sessionId });
+    res.status(201).json({
+      sessionId: session.sessionId,
+      workspacePath: sessionService.getSessionOwner(session.sessionId)?.workspacePath,
+    });
   } catch (err) {
     next(err);
   }

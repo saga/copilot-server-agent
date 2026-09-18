@@ -30,7 +30,8 @@ export const config = {
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
   githubToken: env('GITHUB_TOKEN', '') || undefined,
   defaultModel: env('COPILOT_MODEL', 'gpt-5'),
-  workingDirectory: env('COPILOT_WORKING_DIRECTORY', '') || undefined,
+  // --- Workspace 隔离：每 session 一独立目录（K8s 设 /workspaces；本地默认系统临时目录下） ---
+  workspaceRoot: env('COPILOT_WORKSPACE_ROOT', '') || path.join(os.tmpdir(), 'copilot-workspaces'),
   /** 模型通道：copilot（GitHub 认证）| deepseek（BYOK） */
   provider: env('COPILOT_PROVIDER', 'copilot'),
   // --- DeepSeek BYOK（api key 一律从 .env 读入，不进代码） ---
