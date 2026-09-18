@@ -2,9 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import {
   api,
   type AgentInfo,
+  type DebugInfo,
   type HookEvent,
   type HookPreset,
   type McpPreset,
+  type McpTestResult,
   type SessionMeta,
   type SkillInfo,
   type SubagentEvent,
@@ -69,6 +71,10 @@ export function Chat() {
   const [stopChecklist, setStopChecklist] = useState('');
   const [hookEvents, setHookEvents] = useState<HookEvent[]>([]);
   const [showHooks, setShowHooks] = useState(false);
+  // 调试面板 + MCP 自检结果
+  const [debug, setDebug] = useState<DebugInfo | null>(null);
+  const [showDebug, setShowDebug] = useState(false);
+  const [mcpTests, setMcpTests] = useState<Record<string, McpTestResult | 'testing'>>({});
   const listRef = useRef<HTMLDivElement>(null);
 
   // 后端当前 provider（copilot/deepseek）决定默认模型；用户手动改过则不覆盖
@@ -149,6 +155,32 @@ export function Chat() {
       setHookEvents(recentEvents);
     } catch {
       // 失败不打断主流程
+    }
+  }
+
+  async function refreshDebug() {
+    try {
+      setDebug(await api.debug());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  async function testMcpPreset(name: string) {
+    setMcpTests((m) => ({ ...m, [name]: 'testing' }));
+    try {
+      const r = await api.testMcp({ name });
+      setMcpTests((m) => ({ ...m, [name]: r }));
+    } catch (e) {
+      setMcpTests((m) => ({
+        ...m,
+        [name]: {
+          ok: false,
+          kind: 'local',
+          target: name,
+          error: e instanceof Error ? e.message : String(e),
+        },
+      }));
     }
   }
 
@@ -401,6 +433,15 @@ export function Chat() {
         >
           {showHooks ? '收起事件' : 'hook 事件'}
         </button>
+        <button
+          disabled={busy}
+          onClick={() => {
+            setShowDebug((s) => !s);
+            if (!showDebug) void refreshDebug();
+          }}
+        >
+          {showDebug ? '收起调试' : '调试'}
+        </button>
       </div>
 
       {showHooks && (
@@ -416,6 +457,69 @@ export function Chat() {
               <span>{e.detail}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {showDebug && (
+        <div className="sessions">
+          {!debug && <span className="hint">加载诊断包…</span>}
+          {debug && (
+            <>
+              <div className="session-row">
+                <span className="badge badge-ok">{debug.runtime.state}</span>
+                <span>SDK {debug.sdkVersion}</span>
+                <span className="hint">
+                  {debug.node} · {debug.platform} · 通道 {debug.provider}
+                </span>
+                <button disabled={busy} onClick={() => void refreshDebug()}>
+                  刷新
+                </button>
+              </div>
+              <div className="session-row">
+                <span>
+                  CLI: {debug.runtime.cli ? `${debug.runtime.cli.version} (proto ${debug.runtime.cli.protocolVersion})` : (debug.runtime.cliError ?? '…')}
+                </span>
+                <span>
+                  认证: {debug.runtime.auth ? `${debug.runtime.auth.isAuthenticated ? '✅' : '❌'} ${debug.runtime.auth.authType ?? ''}` : (debug.runtime.authError ?? '…')}
+                </span>
+                <span className="hint">
+                  ping {debug.runtime.pingMs !== undefined ? `${debug.runtime.pingMs}ms` : (debug.runtime.pingError ?? '…')}
+                </span>
+              </div>
+              {(debug.runtime.lastError || debug.runtime.startError) && (
+                <div className="error">
+                  {debug.runtime.lastError ?? debug.runtime.startError}
+                </div>
+              )}
+              <div className="session-row">
+                <span className="hint">
+                  会话 附着 {debug.sessions.attached} / 磁盘 {debug.sessions.onDisk ?? '?'}
+                  · hooks {debug.hooks.presets} 预设 / {debug.hooks.recentEvents} 事件
+                  · MCP {debug.mcp.presets} 预设
+                  · 日志 {debug.config.logLevel}
+                  {debug.config.logDir ? ` → ${debug.config.logDir}` : ''}
+                </span>
+              </div>
+              {mcpPresets.map((p) => {
+                const t = mcpTests[p.name];
+                return (
+                  <div key={p.name} className="session-row">
+                    <code className="sid">{p.name}</code>
+                    <button disabled={busy || t === 'testing'} onClick={() => void testMcpPreset(p.name)}>
+                      {t === 'testing' ? '测试中…' : '连通测试'}
+                    </button>
+                    {t && t !== 'testing' && (
+                      <span className={t.ok ? '' : 'error'} style={t.ok ? undefined : { padding: 0 }}>
+                        {t.ok
+                          ? `✅ ${t.kind === 'http' ? `可达 (HTTP ${t.httpStatus})` : t.target}`
+                          : `❌ ${t.error}`}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
         </div>
       )}
 

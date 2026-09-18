@@ -1,4 +1,7 @@
-import { CopilotClient, approveAll } from '@github/copilot-sdk';
+import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { CopilotClient, RuntimeConnection, approveAll } from '@github/copilot-sdk';
 import type {
   CopilotSession,
   CustomAgentConfig,
@@ -14,8 +17,36 @@ import {
   resolveSkillDirectories,
   type SkillMeta,
 } from '../skills/index.js';
-import { resolveMcp } from '../mcp/registry.js';
+import { resolveMcp, listMcp } from '../mcp/registry.js';
 import { resolveHooks } from '../hooks/registry.js';
+import { hookEventCount } from '../hooks/events.js';
+import { HOOK_PRESETS } from '../hooks/builtin.js';
+
+const require = createRequire(import.meta.url);
+
+function sdkVersion(): string {
+  // SDK 的 exports 映射未暴露 ./package.json，从入口文件向上找包根再读版本
+  try {
+    let dir = path.dirname(require.resolve('@github/copilot-sdk'));
+    for (let i = 0; i < 4; i++) {
+      try {
+        const pkg = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf-8')) as {
+          name?: string;
+          version?: string;
+        };
+        if (pkg.name === '@github/copilot-sdk') return pkg.version ?? 'unknown';
+      } catch {
+        // 继续向上找
+      }
+      dir = path.dirname(dir);
+    }
+    return 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
 /** 自定义 sessionId 规则（对应文档“结构化 ID 便于审计/清理”：字母数字开头，允许 -_） */
 const SESSION_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9-_]{0,127}$/;
@@ -63,12 +94,41 @@ export interface CreateSessionOptions extends SessionConfigOptions {
   sessionId?: string;
 }
 
+export interface DebugInfo {
+  timestamp: string;
+  node: string;
+  platform: string;
+  sdkVersion: string;
+  provider: string;
+  runtime: {
+    state: 'connected' | 'disconnected' | 'error';
+    lastError?: string;
+    startError?: string;
+    pingMs?: number;
+    pingError?: string;
+    cli?: { version: string; protocolVersion: number };
+    cliError?: string;
+    auth?: { isAuthenticated: boolean; authType?: string };
+    authError?: string;
+  };
+  config: {
+    logLevel: string;
+    logDir?: string;
+    cliPath?: string;
+    sessionIdleTimeoutSeconds?: number;
+    workingDirectory?: string;
+  };
+  sessions: { attached: number; attachedIds: string[]; onDisk: number | null; listError?: string };
+  hooks: { presets: number; recentEvents: number };
+  mcp: { presets: number; allowInlineLocal: boolean; allowInlineHttp: boolean };
+}
+
 /**
- * Copilot SDK 单例封装。
- * - Express 启动时 lazy 初始化 client
+ * Copilot 会话服务（单例）。
+ * - Express 启动时 lazy 初始化 CopilotClient
  * - 每个前端会话对应一个 CopilotSession，用 Map 做内存管理（生产可换 Redis）
  */
-class CopilotService {
+class SessionService {
   private client: CopilotClient | null = null;
   private starting: Promise<CopilotClient> | null = null;
   private sessions = new Map<string, CopilotSession>();
@@ -89,6 +149,18 @@ class CopilotService {
         // 无活动超时后 runtime 自动回收（0/缺省=关闭，默认会话常驻）
         ...(config.sessionIdleTimeoutSeconds
           ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
+          : {}),
+        // 调试：SDK 日志级别（none/error/warning/info/debug/all，缺省=SDK 默认）
+        ...(config.logLevel ? { logLevel: config.logLevel } : {}),
+        // 调试：自定义 CLI 路径 / 日志目录时才显式建 connection，
+        // 否则走 SDK 默认（自动 materialize 内置 runtime）
+        ...(config.cliPath || config.logDir
+          ? {
+              connection: RuntimeConnection.forStdio({
+                ...(config.cliPath ? { path: config.cliPath } : {}),
+                ...(config.logDir ? { args: ['--log-dir', config.logDir] } : {}),
+              }),
+            }
           : {}),
         // BYOK：CLI 不知道第三方模型，按官方文档用 onListModels 自报
         ...(customModels ? { onListModels: () => customModels } : {}),
@@ -115,6 +187,68 @@ class CopilotService {
 
   getLastError(): string | null {
     return this.lastError;
+  }
+
+  /**
+   * 诊断包（对应官方 debugging 文档“收集调试信息”清单）：
+   * 版本 / 平台 / 脱敏配置 / runtime 状态（ping 延迟、CLI 版本、认证状态）/ 会话计数。
+   * 会按需启动 runtime（顺带把 CLI 缺失/认证失败等问题暴露出来）；密钥类字段永不包含。
+   */
+  async getDebugInfo(): Promise<DebugInfo> {
+    const info: DebugInfo = {
+      timestamp: new Date().toISOString(),
+      node: process.version,
+      platform: `${process.platform}-${process.arch}`,
+      sdkVersion: sdkVersion(),
+      provider: getActiveProvider().id,
+      runtime: { state: this.getStatus(), ...(this.lastError ? { lastError: this.lastError } : {}) },
+      config: {
+        logLevel: config.logLevel ?? '(sdk default)',
+        ...(config.logDir ? { logDir: config.logDir } : {}),
+        ...(config.cliPath ? { cliPath: config.cliPath } : {}),
+        ...(config.sessionIdleTimeoutSeconds
+          ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
+          : {}),
+        ...(config.workingDirectory ? { workingDirectory: config.workingDirectory } : {}),
+      },
+      sessions: { attached: this.sessions.size, attachedIds: [...this.sessions.keys()], onDisk: null },
+      hooks: { presets: HOOK_PRESETS.length, recentEvents: hookEventCount() },
+      mcp: {
+        presets: listMcp().presets.length,
+        allowInlineLocal: config.allowInlineMcpLocal,
+        allowInlineHttp: config.allowInlineMcpHttp,
+      },
+    };
+    try {
+      const client = await this.getClient();
+      info.runtime.state = this.getStatus();
+      if (this.lastError) info.runtime.lastError = this.lastError;
+      const t0 = Date.now();
+      try {
+        await client.ping('debug');
+        info.runtime.pingMs = Date.now() - t0;
+      } catch (e) {
+        info.runtime.pingError = errMsg(e);
+      }
+      try {
+        info.runtime.cli = await client.getStatus();
+      } catch (e) {
+        info.runtime.cliError = errMsg(e);
+      }
+      try {
+        info.runtime.auth = await client.getAuthStatus();
+      } catch (e) {
+        info.runtime.authError = errMsg(e);
+      }
+      try {
+        info.sessions.onDisk = (await client.listSessions()).length;
+      } catch (e) {
+        info.sessions.listError = errMsg(e);
+      }
+    } catch (e) {
+      info.runtime.startError = errMsg(e);
+    }
+    return info;
   }
 
   async listModels(): Promise<{ provider: string; models: unknown }> {
@@ -290,4 +424,4 @@ class CopilotService {
   }
 }
 
-export const copilotService = new CopilotService();
+export const sessionService = new SessionService();

@@ -1,3 +1,4 @@
+import { accessSync, constants, existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { MCPServerConfig } from '@github/copilot-sdk';
@@ -142,4 +143,92 @@ export function resolveMcp(opts: ResolveMcpOptions): {
   // 显式 enable 为 [] 且无内联 → 不传 mcpServers，保持会话干净
   if (Object.keys(mcpServers).length === 0) return {};
   return { mcpServers };
+}
+
+/** 取单个预设的实际 config（供 /api/mcp/test 做连通性自检） */
+export function getMcpServerConfig(name: string): MCPServerConfig {
+  const fs = filesystemPreset();
+  if (fs && fs.meta.name === name) return fs.config;
+  const op = operatorServers()[name];
+  if (op) return op;
+  const known = [fs?.meta.name, ...Object.keys(operatorServers())].filter(Boolean).join(', ');
+  throw new Error(`未知 MCP 预设：${name}，可选：${known || '(无)'}`);
+}
+
+export interface McpTestResult {
+  ok: boolean;
+  kind: 'local' | 'http';
+  /** local：解析到的可执行文件；http：请求到的 URL */
+  target: string;
+  /** http：服务端回的状态码（任何 HTTP 响应都算可达，MCP 端点对普通 GET 常回 4xx） */
+  httpStatus?: number;
+  tools?: string[];
+  error?: string;
+}
+
+/** 在 PATH 中找可执行文件（对应文档“命令路径正确、用绝对路径”检查项） */
+function which(cmd: string): string | null {
+  const tryPath = (p: string): boolean => {
+    try {
+      accessSync(p, constants.F_OK | (process.platform === 'win32' ? 0 : constants.X_OK));
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (cmd.includes('/') || (process.platform === 'win32' && cmd.includes('\\'))) {
+    return tryPath(cmd) ? cmd : null;
+  }
+  const exts =
+    process.platform === 'win32' ? [...(process.env.PATHEXT?.split(';') ?? ['.EXE']), ''] : [''];
+  for (const dir of (process.env.PATH ?? '').split(path.delimiter)) {
+    for (const ext of exts) {
+      const full = path.join(dir, cmd + ext);
+      if (tryPath(full)) return full;
+    }
+  }
+  return null;
+}
+
+/**
+ * MCP 连通性自检：不建会话、不执行命令。
+ * - local：只验证可执行文件是否存在（对应文档 Quick Checklist 前两项）
+ * - http：发一次带超时的普通 GET，任何 HTTP 响应即算可达（MCP 端点对 GET 常回 4xx，属正常）
+ */
+export async function testMcpServer(cfg: MCPServerConfig): Promise<McpTestResult> {
+  if (cfg.type === 'http' || cfg.type === 'sse') {
+    let url: string;
+    try {
+      url = new URL(cfg.url).toString();
+    } catch {
+      return { ok: false, kind: 'http', target: cfg.url, error: `url 非法：${cfg.url}` };
+    }
+    try {
+      const res = await fetch(url, {
+        signal: AbortSignal.timeout(8000),
+        headers: cfg.headers,
+      });
+      return { ok: true, kind: 'http', target: url, httpStatus: res.status, tools: cfg.tools };
+    } catch (e) {
+      return {
+        ok: false,
+        kind: 'http',
+        target: url,
+        tools: cfg.tools,
+        error: e instanceof Error ? e.message : String(e),
+      };
+    }
+  }
+  const found = 'command' in cfg && cfg.command ? which(cfg.command) : null;
+  if (!found) {
+    const cmd = 'command' in cfg ? cfg.command : '(missing command)';
+    return {
+      ok: false,
+      kind: 'local',
+      target: cmd,
+      tools: cfg.tools,
+      error: `可执行文件找不到：${cmd}（检查 PATH 或改用绝对路径；npx 类命令需先装好 Node）`,
+    };
+  }
+  return { ok: true, kind: 'local', target: found, tools: cfg.tools };
 }

@@ -22,3 +22,7 @@ export function recordHookEvent(sessionId: string, kind: HookEventKind, detail: 
 export function recentHookEvents(limit = 50): HookEvent[] {
   return ring.slice(-Math.max(1, Math.min(limit, MAX_EVENTS)));
 }
+
+export function hookEventCount(): number {
+  return ring.length;
+}

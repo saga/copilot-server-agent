@@ -83,6 +83,38 @@ export interface HookEvent {
   detail: string;
 }
 
+export interface DebugInfo {
+  timestamp: string;
+  node: string;
+  platform: string;
+  sdkVersion: string;
+  provider: string;
+  runtime: {
+    state: string;
+    lastError?: string;
+    startError?: string;
+    pingMs?: number;
+    pingError?: string;
+    cli?: { version: string; protocolVersion: number };
+    cliError?: string;
+    auth?: { isAuthenticated: boolean; authType?: string };
+    authError?: string;
+  };
+  config: Record<string, string | number | undefined>;
+  sessions: { attached: number; attachedIds: string[]; onDisk: number | null; listError?: string };
+  hooks: { presets: number; recentEvents: number };
+  mcp: { presets: number; allowInlineLocal: boolean; allowInlineHttp: boolean };
+}
+
+export interface McpTestResult {
+  ok: boolean;
+  kind: 'local' | 'http';
+  target: string;
+  httpStatus?: number;
+  tools?: string[];
+  error?: string;
+}
+
 export interface SubagentEvent {
   type: string;
   data?: {
@@ -158,6 +190,20 @@ export const api = {
     return fetch(`${API_BASE}/api/hooks?limit=${limit}`).then(
       json<{ presets: HookPreset[]; recentEvents: HookEvent[] }>,
     );
+  },
+
+  /** 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数） */
+  debug(): Promise<DebugInfo> {
+    return fetch(`${API_BASE}/api/debug`).then(json<DebugInfo>);
+  },
+
+  /** MCP 连通性自检（不建会话、不执行命令） */
+  testMcp(body: { name: string }): Promise<{ name: string | null } & McpTestResult> {
+    return fetch(`${API_BASE}/api/mcp/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(json<{ name: string | null } & McpTestResult>);
   },
 
   /** 非流式：一问一答 */

@@ -2,9 +2,9 @@ import express from 'express';
 import cors from 'cors';
 import { config } from './config.js';
 import { healthRouter } from './routes/health.js';
-import { copilotRouter } from './routes/copilot.js';
+import { apiRouter } from './routes/api.js';
 import { errorHandler } from './middleware/errorHandler.js';
-import { copilotService } from './services/copilot.js';
+import { sessionService } from './services/session-service.js';
 
 const app = express();
 
@@ -13,7 +13,7 @@ app.use(express.json({ limit: '1mb' }));
 
 // React 前端统一调用 /api/* 
 app.use('/api/health', healthRouter);
-app.use('/api', copilotRouter);
+app.use('/api', apiRouter);
 
 app.use(errorHandler);
 
@@ -26,7 +26,7 @@ async function shutdown(signal: string) {
   console.log(`[server] received ${signal}, shutting down...`);
   server.close();
   try {
-    await copilotService.stop();
+    await sessionService.stop();
   } finally {
     process.exit(0);
   }

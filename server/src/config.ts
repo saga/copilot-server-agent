@@ -4,6 +4,17 @@ function env(name: string, fallback = ''): string {
   return process.env[name] ?? fallback;
 }
 
+const LOG_LEVELS = ['none', 'error', 'warning', 'info', 'debug', 'all'] as const;
+export type LogLevel = (typeof LOG_LEVELS)[number];
+
+/** 非法值直接抛错、不静默回退（否则“开了 debug 却没日志”极难排查） */
+function parseLogLevel(raw: string): LogLevel | undefined {
+  const v = raw.trim();
+  if (!v) return undefined;
+  if ((LOG_LEVELS as readonly string[]).includes(v)) return v as LogLevel;
+  throw new Error(`COPILOT_LOG_LEVEL 非法："${raw}"，可选：${LOG_LEVELS.join(' | ')}（留空=SDK 默认）`);
+}
+
 export const config = {
   port: Number(env('PORT', '3001')),
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
@@ -27,4 +38,8 @@ export const config = {
   allowInlineMcpLocal: env('COPILOT_ALLOW_INLINE_MCP_LOCAL', 'false') === 'true',
   /** 是否允许前端请求内联 http/sse MCP（默认开；header 密钥由调用方自带） */
   allowInlineMcpHttp: env('COPILOT_ALLOW_INLINE_MCP_HTTP', 'true') === 'true',
+  // --- 调试（对应官方 debugging 文档）：SDK 日志级别 + CLI 日志目录 + CLI 路径 ---
+  logLevel: parseLogLevel(env('COPILOT_LOG_LEVEL', '')),
+  logDir: env('COPILOT_LOG_DIR', '') || undefined,
+  cliPath: env('COPILOT_CLI_PATH', '') || undefined,
 };

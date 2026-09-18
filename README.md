@@ -28,6 +28,8 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | GET | `/api/models` | 当前通道可用模型列表 `{ provider, models }`（前端模型选择器用） |
 | GET | `/api/agents` | agent 预设 + 技能目录 + 可发现技能（建会话表单用） |
 | GET | `/api/mcp` | MCP 预设与内联开关（只含元信息，密钥不返回） |
+| POST | `/api/mcp/test` `{ name? , server? }`（二选一） | MCP 连通性自检（不建会话、不执行命令；local 查可执行文件，http 发 8s 超时 GET） |
+| GET | `/api/debug` | 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime） |
 | GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计） |
 | POST | `/api/sessions` `{ model?, sessionId?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers?, hooks?, sessionContext?, agentStopChecklist? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话） |
 | GET | `/api/sessions` | 磁盘全部会话（含 `attached` 标记；刚建未对话的会话 runtime 尚未落盘，可能不在列表） |
@@ -79,6 +81,19 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 - **用法**：建/恢复会话传 `hooks: [...]`（缺省=默认启用项，`[]` 全关，未知名 400）；传 `sessionContext`/`agentStopChecklist` 自动启用对应预设；多预设 start 上下文拼接、end 汇总、error 首个非空决策生效。
 - **审计**：`GET /api/hooks` 返回预设 + 最近 hook 事件（纯内存环，重启清空）。
 - 注意：以 SDK 实际类型为准——handler 返回 `void`（非文档示例的 `null`），start 输入字段为 `workingDirectory`（非 `cwd`）、`timestamp` 为 `Date`。
+
+## 调试
+
+参考官方 debugging 文档：
+
+- **日志**：`COPILOT_LOG_LEVEL`（none/error/warning/info/debug/all，留空=SDK 默认，非法值启动即报错）、`COPILOT_LOG_DIR`（透传 `--log-dir` 给 CLI）、`COPILOT_CLI_PATH`（CLI 不在 PATH 时指定完整路径，对应文档“CLI not found”一节）。
+- **诊断包**：`GET /api/debug` 一次返回排障清单——Node/平台/SDK 版本、当前通道、脱敏配置（密钥永不出现）、runtime 状态（`ping` 延迟、CLI 版本 + 协议版本、认证状态）、会话计数（内存附着/磁盘）、hooks 与 MCP 预设数。会按需启动 runtime，CLI 缺失/未认证等问题直接暴露在包里。
+- **MCP 自检**：`POST /api/mcp/test`（`{ name }` 测预设，或 `{ server }` 测内联配置，内联同样受安全门约束）——local 只验证可执行文件可找到（不执行），http 发一次 8s 超时 GET（任何 HTTP 响应即算可达，MCP 端点对普通 GET 常回 4xx 属正常）。前端「调试」面板每个预设都有连通测试按钮。
+
+## 服务端结构
+
+- `server/src/services/session-service.ts` — `SessionService` 单例（Client 生命周期 + 会话管理 + 诊断包）
+- `server/src/routes/api.ts` — `apiRouter`（全部 `/api/*` 路由）
 
 ## 前提
 

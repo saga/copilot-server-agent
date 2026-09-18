@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { copilotService } from '../services/copilot.js';
+import { sessionService } from '../services/session-service.js';
 import type { HealthResponse } from '../types.js';
 
 export const healthRouter = Router();
@@ -9,9 +9,9 @@ healthRouter.get('/', (_req, res) => {
     status: 'ok',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    copilot: copilotService.getStatus(),
-    ...(copilotService.getLastError()
-      ? { copilotError: copilotService.getLastError() as string }
+    copilot: sessionService.getStatus(),
+    ...(sessionService.getLastError()
+      ? { copilotError: sessionService.getLastError() as string }
       : {}),
   };
   res.json(body);
