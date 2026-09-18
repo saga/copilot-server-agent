@@ -25,6 +25,18 @@ function parseList(raw: string): string[] {
     .filter(Boolean);
 }
 
+/** bash 授权策略：workspace=命令涉及的路径必须在 session workspace 内（默认）；allow=全放行；deny=全拒 */
+const BASH_POLICIES = ['workspace', 'allow', 'deny'] as const;
+export type BashPolicy = (typeof BASH_POLICIES)[number];
+
+function parseBashPolicy(raw: string): BashPolicy {
+  const v = raw.trim() || 'workspace';
+  if ((BASH_POLICIES as readonly string[]).includes(v)) return v as BashPolicy;
+  throw new Error(`COPILOT_BASH_POLICY 非法："${raw}"，可选：${BASH_POLICIES.join(' | ')}`);
+}
+
+const homeDir = env('COPILOT_HOME', '') || path.join(os.homedir(), '.copilot');
+
 export const config = {
   port: Number(env('PORT', '3001')),
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
@@ -44,7 +56,17 @@ export const config = {
   runtimeUrl: env('COPILOT_RUNTIME_URL', '') || undefined,
   // --- 本地 runtime 的数据目录（透传为 SDK baseDirectory → COPILOT_HOME；forUri 时被 runtime 侧忽略） ---
   // 缺省 ~/.copilot（与 runtime 默认一致；mode: "empty" 要求 client 级别显式设置，不可留空）
-  baseDirectory: env('COPILOT_HOME', '') || path.join(os.homedir(), '.copilot'),
+  baseDirectory: homeDir,
+  // --- Session Registry：ownership 持久化（重启/换 Pod 后归属不丢；K8s 指到 PVC 上的路径） ---
+  // 缺省落在 baseDirectory 同目录，生产必须指到持久卷（否则重启后归属丢失 = 谁先访问谁认领）
+  registryPath: env('COPILOT_REGISTRY_PATH', '') || path.join(homeDir, 'session-registry.json'),
+  // --- 身份头可信开关：只有网关/IAP 会剥离客户端自带 x-tenant-id/x-user-id 时才可开 ---
+  // 关闭（默认）= 单租户模式，所有请求按 DEFAULT_OWNER 处理，避免客户端自报身份越过归属校验
+  trustIdentityHeaders: env('COPILOT_TRUST_IDENTITY_HEADERS', 'false') === 'true',
+  // --- 工具授权策略（取代 approveAll）：write 恒限制在 workspace；bash 按此策略 ---
+  bashPolicy: parseBashPolicy(env('COPILOT_BASH_POLICY', '')),
+  /** URL 允许访问的域名 allowlist（逗号分隔；留空=任意公网地址，仍过 SSRF 检查） */
+  urlAllowlist: parseList(env('COPILOT_URL_ALLOWLIST', '')),
   // --- 技能目录 allowlist（逗号分隔；留空=本地开发模式不限制；生产必须配） ---
   skillRoots: parseList(env('COPILOT_SKILL_ROOTS', '')),
   // --- 管理接口令牌（留空=不设防本地开发；生产设置后 /api/debug、/api/hooks 需带 x-admin-token） ---

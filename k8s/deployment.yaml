@@ -17,6 +17,12 @@ spec:
         app: copilot-server-agent
     spec:
       terminationGracePeriodSeconds: 60
+      # 镜像以 USER node(uid/gid 1000) 运行，PVC 挂进来默认属 root → workspace mkdir 会 EACCES。
+      # fsGroup=1000 让卷对容器主组可写；OnRootMismatch 避免每次启动全量 chown 大卷。
+      # 部署前用 `kubectl exec ... -- id` 确认镜像实际 uid/gid 与此处一致。
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: api
           image: your-registry/copilot-server-agent:latest
@@ -30,9 +36,18 @@ spec:
               value: "http://127.0.0.1:4321"
             - name: COPILOT_SESSION_IDLE_TIMEOUT
               value: "1800"
-            # 每 session 独立 workspace（挂同一 PVC 的 subPath，Pod 重启不丢）
+            # 每 session 独立 workspace（独立 PVC，Pod 重启不丢）
             - name: COPILOT_WORKSPACE_ROOT
               value: "/workspaces"
+            # Session Registry：归属持久化（重启后不退化成“谁先访问谁认领”）
+            - name: COPILOT_REGISTRY_PATH
+              value: "/var/lib/copilot/session-registry.json"
+            # 身份头只有在网关/IAP 会剥离客户端自带头时才可开启
+            - name: COPILOT_TRUST_IDENTITY_HEADERS
+              value: "false"
+            # bash 授权：命令涉及路径必须在 session workspace 内
+            - name: COPILOT_BASH_POLICY
+              value: "workspace"
             # 生产安全默认值
             - name: COPILOT_MCP_FILESYSTEM
               value: "false"
@@ -53,9 +68,12 @@ spec:
                   name: copilot-server-agent
                   key: github-token
           volumeMounts:
-            - name: copilot-state
+            # workspace 独立卷（不用 subPath）
+            - name: workspaces
               mountPath: /workspaces
-              subPath: workspaces
+            # registry 与 runtime 同卷（同 Pod 同卷，RWO 可用）
+            - name: runtime-state
+              mountPath: /var/lib/copilot
           readinessProbe:
             httpGet:
               path: /api/health/ready
@@ -95,7 +113,7 @@ spec:
           ports:
             - containerPort: 4321
           volumeMounts:
-            - name: copilot-state
+            - name: runtime-state
               mountPath: /var/lib/copilot
           resources:
             requests:
@@ -106,6 +124,9 @@ spec:
               memory: 2Gi
 
       volumes:
-        - name: copilot-state
+        - name: runtime-state
           persistentVolumeClaim:
             claimName: copilot-runtime-state
+        - name: workspaces
+          persistentVolumeClaim:
+            claimName: copilot-workspaces

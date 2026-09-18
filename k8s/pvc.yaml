@@ -1,5 +1,8 @@
+# 两个独立 PVC：runtime 会话状态 与 session workspace 分开（不再用 subPath 拼目录）
+# Kubernetes 文档明确提示 subPath 方案不适合生产；拆卷后挂载点就是卷根，权限与扩容都更干净
+---
 # Runtime 会话持久化（/var/lib/copilot/session-state/<sessionId>）
-# 第一阶段单 PVC；多副本阶段按 runtime 分片或换共享存储 + Session Registry
+# 同时存放 Session Registry（COPILOT_REGISTRY_PATH），API 容器也挂这份卷
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -10,3 +13,15 @@ spec:
   resources:
     requests:
       storage: 10Gi
+---
+# Session workspace（/workspaces/<hash>；1 session = 1 目录）
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: copilot-workspaces
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

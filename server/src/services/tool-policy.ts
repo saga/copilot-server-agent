@@ -1,0 +1,206 @@
+import path from 'node:path';
+import { realpathSync } from 'node:fs';
+import type {
+  PermissionHandler,
+  PermissionRequest,
+  PermissionRequestResult,
+  SessionHooks,
+} from '@github/copilot-sdk';
+
+/** SDK 未直接导出 PreToolUse 类型，从 SessionHooks 上取 */
+type PreToolUseHandler = NonNullable<SessionHooks['onPreToolUse']>;
+type PreToolUseHookInput = Parameters<PreToolUseHandler>[0];
+type PreToolUseHookOutput = NonNullable<Awaited<ReturnType<PreToolUseHandler>>>;
+import { config } from '../config.js';
+import { assertSafeOutboundUrl } from '../mcp/registry.js';
+import { recordHookEvent } from '../hooks/events.js';
+
+/**
+ * 工具授权 Policy（取代 approveAll）。
+ *
+ * 三层防线：
+ * 1. session.availableTools —— 模型能看到的工具集合（mode: "empty" 必填）
+ * 2. onPermissionRequest    —— 这里：按 kind 分级裁决（read/write/shell/mcp/url）
+ * 3. onPreToolUse           —— 真正执行前的最后一道：写类工具路径必须落在 session workspace
+ *
+ * 说明：customAgents[].tools 只当作“软约束”（SDK #2356：某些组合下 agent.tools 可能
+ * 不进模型 callable set），真正边界是 availableTools + onPreToolUse。
+ */
+
+export interface ToolPolicyContext {
+  sessionId: string;
+  workspacePath: string;
+  /** 本次会话实际启用的 MCP server 名（MCP 调用只放行这些） */
+  mcpServers: string[];
+}
+
+const ALLOW: PermissionRequestResult = { kind: 'approved' };
+
+function deny(message: string): PermissionRequestResult {
+  return { kind: 'denied-by-permission-request-hook', message, interrupt: false };
+}
+
+/** 规范化路径：能对上真实路径就解析 symlink，解析不了就用字面（不因异常放行） */
+function canonical(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * target 是否落在 workspace 内（相对路径按 workspace 作为 cwd 解析）。
+ * 同时比对“字面路径”与“解析 symlink 后的真实路径”：macOS 的 /var → /private/var、
+ * K8s 里 workspace 经 symlink 挂载都会让两者不一致，只比一边会误杀或误放行。
+ */
+export function isWithinWorkspace(target: string, workspacePath: string): boolean {
+  if (!target) return false;
+  const wsLiteral = path.resolve(workspacePath);
+  const wsReal = canonical(workspacePath);
+  const abs = path.isAbsolute(target) ? path.resolve(target) : path.resolve(wsLiteral, target);
+  const roots = new Set([wsLiteral, wsReal]);
+  const targets = new Set([abs, canonical(abs)]);
+  for (const root of roots) {
+    for (const t of targets) {
+      if (t === root || t.startsWith(root + path.sep)) return true;
+    }
+  }
+  return false;
+}
+
+function hostAllowed(url: URL): boolean {
+  if (config.urlAllowlist.length === 0) return true;
+  const host = url.hostname.toLowerCase();
+  return config.urlAllowlist.some((d) => {
+    const dd = d.toLowerCase();
+    return host === dd || host.endsWith(`.${dd}`);
+  });
+}
+
+/**
+ * onPermissionRequest：按 kind 分级裁决。
+ * - read：放行（只读无副作用；workspace 外的库/系统文件读取是刚需）
+ * - write：只允许落在 session workspace
+ * - shell：COPILOT_BASH_POLICY=workspace 时，命令涉及路径必须落在 workspace；
+ *   任何 sandbox bypass 提权请求一律拒绝
+ * - mcp：只放行本次会话实际启用的 server（会话未配置的 server 名 = 越权）
+ * - url：SSRF 检查 + 可选域名 allowlist
+ * - 其它（memory/custom-tool/extension…）：默认拒绝（服务端 agent 无人在环）
+ */
+export function createPermissionHandler(ctx: ToolPolicyContext): PermissionHandler {
+  return async (request: PermissionRequest) => {
+    const audit = (decision: string, detail: string) => {
+      recordHookEvent(ctx.sessionId, 'permission', `${decision} kind=${request.kind} ${detail}`);
+    };
+    switch (request.kind) {
+      case 'read':
+        audit('allow', `path=${'path' in request ? request.path : '?'}`);
+        return ALLOW;
+      case 'write': {
+        const target = (request.resolvedPath ?? request.fileName ?? '') as string;
+        if (!isWithinWorkspace(target, ctx.workspacePath)) {
+          audit('deny', `write outside workspace: ${target}`);
+          return deny(`禁止写入 workspace 之外的路径：${target}（workspace=${ctx.workspacePath}）`);
+        }
+        audit('allow', `write ${target}`);
+        return ALLOW;
+      }
+      case 'shell': {
+        if (config.bashPolicy === 'deny') {
+          audit('deny', 'bash policy=deny');
+          return deny('当前策略禁止执行 shell 命令');
+        }
+        if (request.requestSandboxBypass) {
+          audit('deny', 'sandbox bypass requested');
+          return deny('禁止 shell 请求绕过沙箱执行');
+        }
+        if (config.bashPolicy === 'workspace') {
+          const paths = [
+            ...(request.possiblePaths ?? []),
+            ...Object.values(request.resolvedPaths ?? {}).filter((v): v is string => !!v),
+          ];
+          const outside = paths.filter((p) => !isWithinWorkspace(p, ctx.workspacePath));
+          if (outside.length) {
+            audit('deny', `shell paths outside workspace: ${outside.join(', ')}`);
+            return deny(
+              `命令涉及 workspace 之外的路径：${outside.slice(0, 5).join(', ')}（workspace=${ctx.workspacePath}）`,
+            );
+          }
+        }
+        audit('allow', 'shell');
+        return ALLOW;
+      }
+      case 'mcp': {
+        if (!ctx.mcpServers.includes(request.serverName)) {
+          audit('deny', `mcp server not enabled: ${request.serverName}`);
+          return deny(`MCP server 未在本次会话启用：${request.serverName}`);
+        }
+        audit('allow', `mcp ${request.serverName}/${request.toolName}`);
+        return ALLOW;
+      }
+      case 'url': {
+        try {
+          const url = await assertSafeOutboundUrl(request.url);
+          if (!hostAllowed(url)) {
+            audit('deny', `url host not allowlisted: ${url.hostname}`);
+            return deny(`URL 域名不在 allowlist：${url.hostname}`);
+          }
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          audit('deny', `url rejected: ${msg}`);
+          return deny(msg);
+        }
+        audit('allow', `url ${request.url}`);
+        return ALLOW;
+      }
+      default:
+        audit('deny', `unhandled kind=${request.kind}`);
+        return deny(`未授权的权限请求类型：${request.kind}`);
+    }
+  };
+}
+
+/** 写类工具（view/grep/glob 只读，不限制） */
+const WRITE_TOOLS = new Set([
+  'edit',
+  'create',
+  'write',
+  'apply_patch',
+  'str_replace_editor',
+  'insert',
+  'notebook_edit',
+]);
+
+/** 从 toolArgs 里抠出可能的路径字段（不同工具字段名不统一，取常见几个） */
+function extractPaths(toolName: string, args: unknown): string[] {
+  if (!args || typeof args !== 'object') return [];
+  const rec = args as Record<string, unknown>;
+  const out: string[] = [];
+  for (const key of ['path', 'filePath', 'file_path', 'target', 'filename', 'notebookPath']) {
+    const v = rec[key];
+    if (typeof v === 'string' && v.trim()) out.push(v.trim());
+  }
+  // bash 的 command 不做静态解析（静态判断极易误伤），由 onPermissionRequest 的
+  // possiblePaths 与 bash policy 兜底
+  void toolName;
+  return out;
+}
+
+/**
+ * onPreToolUse：真正执行前的最后一道门。
+ * 只拦写类工具（读类放开），路径必须落在 session workspace。
+ */
+export function createPreToolUseGuard(ctx: ToolPolicyContext): PreToolUseHandler {
+  return async (input: PreToolUseHookInput): Promise<PreToolUseHookOutput | void> => {
+    if (!WRITE_TOOLS.has(input.toolName)) return undefined;
+    const paths = extractPaths(input.toolName, input.toolArgs);
+    const outside = paths.filter((p) => !isWithinWorkspace(p, ctx.workspacePath));
+    if (outside.length) {
+      const reason = `工具 ${input.toolName} 只能操作 session workspace 内的路径：${outside.join(', ')}（workspace=${ctx.workspacePath}）`;
+      recordHookEvent(ctx.sessionId, 'tool-guard', `deny ${input.toolName} ${outside.join(', ')}`);
+      return { permissionDecision: 'deny', permissionDecisionReason: reason };
+    }
+    return undefined;
+  };
+}

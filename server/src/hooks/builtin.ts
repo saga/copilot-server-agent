@@ -139,10 +139,15 @@ const stopGuard: HookPreset = {
 
 export const HOOK_PRESETS: HookPreset[] = [audit, sessionContext, errorPolicy, stopGuard];
 
-/** 把启用的预设拼成一份 SessionHooks（同类输出按上面的 merge 策略合并） */
+/**
+ * 把启用的预设拼成一份 SessionHooks（同类输出按上面的 merge 策略合并）。
+ * extraHooks 用于注入会话级强制 hook（如 workspace 守卫的 onPreToolUse）：
+ * 先跑强制 hook，有决策就直接生效，否则交给预设。
+ */
 export function composeHooks(
   presets: HookPreset[],
   params: { sessionContext?: string; agentStopChecklist?: string },
+  extraHooks: SessionHooks = {},
 ): SessionHooks {
   const built = presets.map((p) => p.build(params));
   return {
@@ -167,5 +172,18 @@ export function composeHooks(
       }
       return undefined;
     },
+    ...(extraHooks.onPreToolUse || built.some((h) => h.onPreToolUse)
+      ? {
+          onPreToolUse: async (input, invocation) => {
+            const forced = await extraHooks.onPreToolUse?.(input, invocation);
+            if (forced) return forced;
+            for (const h of built) {
+              const out = await h.onPreToolUse?.(input, invocation);
+              if (out) return out;
+            }
+            return undefined;
+          },
+        }
+      : {}),
   };
 }

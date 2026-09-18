@@ -229,14 +229,18 @@ apiRouter.post('/sessions', async (req, res, next) => {
       workspacePath: sessionService.getSessionOwner(session.sessionId)?.workspacePath,
     });
   } catch (err) {
+    if (err instanceof Error && /无权访问/.test(err.message)) {
+      return res.status(403).json({ error: err.message });
+    }
     next(err);
   }
 });
 
-/** GET /api/sessions — 磁盘全部会话（含 attached 标记） */
-apiRouter.get('/sessions', async (_req, res, next) => {
+/** GET /api/sessions — 当前调用方的会话（按 Session Registry 归属过滤，不再返回全量） */
+apiRouter.get('/sessions', async (req, res, next) => {
   try {
-    res.json({ sessions: await sessionService.listSessions() });
+    const owner = ownerFromHeaders(req.headers);
+    res.json({ sessions: await sessionService.listSessions(owner) });
   } catch (err) {
     next(err);
   }
@@ -247,17 +251,13 @@ apiRouter.get('/sessions/:id', async (req, res, next) => {
   try {
     assertValidSessionId(req.params.id);
     const owner = ownerFromHeaders(req.headers);
-    const record = sessionService.getSessionOwner(req.params.id);
-    if (
-      record &&
-      (record.tenantId !== owner.tenantId || record.userId !== owner.userId)
-    ) {
-      return res.status(403).json({ error: `无权访问 session："${req.params.id}"` });
-    }
-    const meta = await sessionService.getSessionMeta(req.params.id);
+    const meta = await sessionService.getSessionMeta(req.params.id, owner);
     if (!meta) return res.status(404).json({ error: `session 不存在："${req.params.id}"` });
     return res.json(meta);
   } catch (err) {
+    if (err instanceof Error && /无权访问/.test(err.message)) {
+      return res.status(403).json({ error: err.message });
+    }
     return next(err);
   }
 });
@@ -282,6 +282,9 @@ apiRouter.post('/sessions/:id/resume', async (req, res, next) => {
     );
     res.json({ sessionId: session.sessionId, resumed: true });
   } catch (err) {
+    if (err instanceof Error && /无权访问/.test(err.message)) {
+      return res.status(403).json({ error: err.message });
+    }
     if (err instanceof Error && /无法恢复/.test(err.message)) {
       return res.status(404).json({ error: err.message });
     }
@@ -304,6 +307,9 @@ apiRouter.delete('/sessions/:id', async (req, res, next) => {
     const wasAttached = await sessionService.disconnectSession(req.params.id, owner);
     return res.json({ sessionId: req.params.id, detached: wasAttached, resumable: true });
   } catch (err) {
+    if (err instanceof Error && /无权访问/.test(err.message)) {
+      return res.status(403).json({ error: err.message });
+    }
     if (err instanceof Error && /无法删除/.test(err.message)) {
       return res.status(404).json({ error: err.message });
     }
@@ -318,6 +324,8 @@ apiRouter.delete('/sessions/:id', async (req, res, next) => {
  *   （subagent.* 为 custom agent 生命周期事件，原样透传，含 agentId/agentName 等）
  */
 apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
+  /** SSE 已开流后的错误收尾（写 error 帧 + 停心跳 + 摘监听），由下面 SSE 分支赋值 */
+  let sseFail: ((err: unknown) => void) | null = null;
   try {
     const body = chatSchema.parse(req.body ?? {});
     const owner = ownerFromHeaders(req.headers);
@@ -326,11 +334,15 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
       // 内存未附着时尝试从 runtime 磁盘状态恢复（重启/换 Pod 后不断连；失败才 404）
       session = await sessionService.getOrResumeSession(req.params.id, {}, owner);
     } catch (err) {
+      if (err instanceof Error && /无权访问/.test(err.message)) {
+        return res.status(403).json({ error: err.message });
+      }
       if (err instanceof Error && /无法恢复/.test(err.message)) {
         return res.status(404).json({ error: 'session not found, 请先 POST /api/sessions' });
       }
       throw err;
     }
+    void sessionService.touch(session.sessionId);
 
     if (!body.streaming) {
       const content = await sessionService.withSessionLock(session.sessionId, async () => {
@@ -366,49 +378,84 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
       }
     }, 15000);
 
-    const offDelta = session.on('assistant.message_delta', (evt) => {
-      const delta = (evt as unknown as { data?: { deltaContent?: string } }).data
-        ?.deltaContent;
-      if (delta) send('delta', { delta });
-    });
-    const offMsg = session.on('assistant.message', (evt) => {
-      const content = (evt as unknown as { data?: { content?: string } }).data?.content;
-      if (content) send('message', { content });
-    });
-    // sub-agent 生命周期事件透传（selected/started/completed/failed/deselected）
-    const offAll = session.on((evt) => {
-      const t = (evt as unknown as { type?: string }).type;
-      if (typeof t === 'string' && t.startsWith('subagent.')) send('subagent', evt);
-    });
-    const offIdle = session.on('session.idle', () => {
-      cleanup();
-      send('done', { sessionId: session.sessionId });
-      res.end();
-    });
+    let finished = false;
+    let turnRunning = false;
+    let offs: Array<() => void> = [];
+    sseFail = (err) => finish('error', { error: (err as Error).message });
 
-    const cleanup = () => {
+    const finish = (event: 'done' | 'error', data: unknown) => {
+      if (finished) return;
+      finished = true;
       clearInterval(heartbeat);
-      offDelta();
-      offMsg();
-      offAll();
-      offIdle();
+      for (const off of offs) off();
+      offs = [];
+      sessionService.markTurnIdle(session.sessionId);
+      if (!res.writableEnded) {
+        send(event, data);
+        res.end();
+      }
     };
 
-    req.on('close', cleanup);
-
-    // 同一 session 的并发 send 串行化（dispatch 级；流式增量仍按 idle 结束）
-    await sessionService.withSessionLock(session.sessionId, async () => {
-      if (body.model) {
-        await session.setModel(body.model);
+    // 客户端断开 = 中止当前 turn（server agent 无人看输出，继续跑只会白烧 token 并改文件）。
+    // 注意是 abort 当前 turn，不是断开 session：之后还能继续对话。
+    req.on('close', () => {
+      if (turnRunning && !finished) {
+        void sessionService.abortTurn(session.sessionId).catch(() => undefined);
       }
-      await session.send({ prompt: body.prompt });
+      finished = true; // 客户端已走，后面的写一律跳过
+      turnRunning = false;
+      clearInterval(heartbeat);
+      for (const off of offs) off();
+      offs = [];
     });
+
+    /**
+     * 锁必须覆盖整个 agent turn：session.send() 只是把消息排进队列就返回，
+     * 真正的 loop 仍在后台跑（sendAndWait() 才等到 session.idle）。
+     * 监听器也必须在锁内注册，否则并发请求会互相收到对方的 delta。
+     */
+    await sessionService.withSessionLock(session.sessionId, async () => {
+      const offDelta = session.on('assistant.message_delta', (evt) => {
+        const delta = (evt as unknown as { data?: { deltaContent?: string } }).data
+          ?.deltaContent;
+        if (delta) send('delta', { delta });
+      });
+      const offMsg = session.on('assistant.message', (evt) => {
+        const content = (evt as unknown as { data?: { content?: string } }).data?.content;
+        if (content) send('message', { content });
+      });
+      // sub-agent 生命周期事件透传（selected/started/completed/failed/deselected）
+      const offAll = session.on((evt) => {
+        const t = (evt as unknown as { type?: string }).type;
+        if (typeof t === 'string' && t.startsWith('subagent.')) send('subagent', evt);
+      });
+      const offIdle = session.on('session.idle', () => {
+        finish('done', { sessionId: session.sessionId });
+      });
+      offs = [offDelta, offMsg, offAll, offIdle];
+
+      turnRunning = true;
+      sessionService.markTurnActive(session.sessionId);
+      try {
+        if (body.model) {
+          await session.setModel(body.model);
+        }
+        await session.sendAndWait({ prompt: body.prompt });
+      } finally {
+        turnRunning = false;
+        for (const off of offs) off();
+        offs = [];
+      }
+    });
+    // sendAndWait 已等到 idle；idle 监听若未触发（少见）在这里兜底收尾
+    finish('done', { sessionId: session.sessionId });
     return undefined;
   } catch (err) {
-    // SSE 已开始写头时不能再 next(err) 走 JSON
-    if (res.headersSent && !res.writableEnded) {
-      res.write(`event: error\ndata: ${JSON.stringify({ error: (err as Error).message })}\n\n`);
-      return res.end();
+    // SSE 已开始写头时不能再 next(err) 走 JSON：交给 SSE 自己的收尾（停心跳/摘监听/结束响应）
+    if (res.headersSent) {
+      sseFail?.(err);
+      if (!res.writableEnded) res.end();
+      return undefined;
     }
     return next(err);
   }

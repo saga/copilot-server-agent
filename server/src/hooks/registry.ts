@@ -16,6 +16,8 @@ export interface ResolveHooksOptions {
   sessionContext?: string;
   /** 停机检查项（传了即自动启用 stop-guard 预设） */
   agentStopChecklist?: string;
+  /** 会话级强制 hook（workspace 守卫等；不可被请求关闭） */
+  extraHooks?: SessionHooks;
 }
 
 /** 供 GET /api/hooks：预设元信息 + 最近 hook 事件（审计） */
@@ -49,9 +51,13 @@ export function resolveHooks(opts: ResolveHooksOptions): { hooks?: SessionHooks 
   if (wanted.size === 0) return {};
   const presets = HOOK_PRESETS.filter((p) => wanted.has(p.name));
   return {
-    hooks: composeHooks(presets, {
-      sessionContext: opts.sessionContext,
-      agentStopChecklist: opts.agentStopChecklist,
-    }),
+    hooks: composeHooks(
+      presets,
+      {
+        sessionContext: opts.sessionContext,
+        agentStopChecklist: opts.agentStopChecklist,
+      },
+      opts.extraHooks,
+    ),
   };
 }

@@ -2,15 +2,12 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { CopilotClient, RuntimeConnection, approveAll } from '@github/copilot-sdk';
+import { CopilotClient, RuntimeConnection } from '@github/copilot-sdk';
 import type {
-  AttributedPermissionResult,
   CopilotSession,
   CustomAgentConfig,
   MCPServerConfig,
   ModelInfo,
-  PermissionHandler,
-  PermissionRequestResult,
   SessionMetadata,
 } from '@github/copilot-sdk';
 import { config } from '../config.js';
@@ -26,6 +23,14 @@ import { resolveHooks } from '../hooks/registry.js';
 import { hookEventCount } from '../hooks/events.js';
 import { HOOK_PRESETS } from '../hooks/builtin.js';
 import { workspaceService } from './workspace-service.js';
+import {
+  SessionRegistry,
+  type RegistryRecord,
+  type SessionOwner,
+} from './session-registry.js';
+import { createPermissionHandler, createPreToolUseGuard } from './tool-policy.js';
+
+export type { SessionOwner, RegistryRecord };
 
 const require = createRequire(import.meta.url);
 
@@ -64,16 +69,7 @@ export function assertValidSessionId(id: string): void {
   }
 }
 
-/**
- * 会话归属（多租户 K8s 的 ownership 概念；第一阶段单副本内存实现）。
- * tenantId/userId 默认都取 `default`（本地开发无感知）；生产由网关/IAP 在
- * `x-tenant-id` / `x-user-id` 头里注入，之后切 Session Registry 时字段不变。
- */
-export interface SessionOwner {
-  tenantId: string;
-  userId: string;
-}
-
+/** 内存态 session 记录（registry 是持久真相源；这里只做进程内缓存） */
 export interface SessionRecord {
   sessionId: string;
   tenantId: string;
@@ -83,7 +79,19 @@ export interface SessionRecord {
 
 export const DEFAULT_OWNER: SessionOwner = { tenantId: 'default', userId: 'default' };
 
+/** 身份头只有在网关会剥离客户端自带头时才可信；否则一律按单租户处理 */
+let identityWarned = false;
+
 export function ownerFromHeaders(h: Record<string, unknown>): SessionOwner {
+  if (!config.trustIdentityHeaders) {
+    if ((h['x-tenant-id'] || h['x-user-id']) && !identityWarned) {
+      identityWarned = true;
+      console.warn(
+        '[session] 收到 x-tenant-id/x-user-id 但 COPILOT_TRUST_IDENTITY_HEADERS=false，已忽略（按单租户处理）',
+      );
+    }
+    return { ...DEFAULT_OWNER };
+  }
   const pick = (v: unknown, fallback: string): string => {
     if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 128);
     if (Array.isArray(v) && typeof v[0] === 'string' && v[0].trim()) {
@@ -96,21 +104,6 @@ export function ownerFromHeaders(h: Record<string, unknown>): SessionOwner {
     userId: pick(h['x-user-id'], DEFAULT_OWNER.userId),
   };
 }
-
-/**
- * 工具授权 Policy 接口（第一阶段 = approveAll 行为；以后在这里分 read/edit/bash/network 分级，
- * SessionService 不用再改）。
- */
-export const permissionPolicy = {
-  async evaluate(
-    ...args: Parameters<PermissionHandler>
-  ): Promise<PermissionRequestResult | AttributedPermissionResult> {
-    const [request, invocation] = args;
-    return approveAll(request, invocation);
-  },
-};
-
-export type PermissionPolicy = typeof permissionPolicy;
 
 export interface SessionConfigOptions {
   model?: string;
@@ -196,8 +189,14 @@ class SessionService {
   private starting: Promise<CopilotClient> | null = null;
   private sessions = new Map<string, CopilotSession>();
   private owners = new Map<string, SessionRecord>();
-  /** 单进程 session 并发锁：同一 session 的 send 串行化（多副本阶段升级为分布式锁） */
+  /** 单进程 session 并发锁：同一 session 的 agent turn 串行化（多副本阶段升级为分布式锁） */
   private sessionLocks = new Map<string, Promise<unknown>>();
+  /** attach 专用锁：resume 只允许一个 request 真正执行（与 chat lock 分开，避免互相阻塞） */
+  private attachLocks = new Map<string, Promise<unknown>>();
+  /** 正在跑 agent turn 的 session（客户端断开时按此决定是否 abort） */
+  private activeTurns = new Set<string>();
+  /** 持久归属表（重启后不丢；生产应换 PostgreSQL，见 README） */
+  private readonly registry = new SessionRegistry(config.registryPath);
   private lastError: string | null = null;
 
   async getClient(): Promise<CopilotClient> {
@@ -351,7 +350,7 @@ class SessionService {
    * 所以 resume 无需调用方操心，换通道后 resume 会自动用新通道凭证。
    * workspaceDir 必传：session 级 workingDirectory + workspace 级 MCP 根，1 session = 1 目录。
    */
-  private buildSessionConfig(opts: SessionConfigOptions, workspaceDir: string) {
+  private buildSessionConfig(sessionId: string, opts: SessionConfigOptions, workspaceDir: string) {
     // 经当前 provider 解析：补默认 model、BYOK 拼 ProviderConfig
     const resolved = getActiveProvider().resolve(opts);
     // agents：预设按名引用 + 内联定义；agent 预选必须命中其一
@@ -372,11 +371,19 @@ class SessionService {
       inline: opts.mcpServers,
       workspaceDir,
     });
-    // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设
+    // 授权上下文：write/shell 限制在 workspace、MCP 只放行本次启用的 server
+    const policyCtx = {
+      sessionId,
+      workspacePath: workspaceDir,
+      mcpServers: mcpServers ? Object.keys(mcpServers) : [],
+    };
+    // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设；
+    // workspace 守卫（onPreToolUse）为强制项，请求无法关闭
     const { hooks } = resolveHooks({
       enable: opts.hooks,
       sessionContext: opts.sessionContext,
       agentStopChecklist: opts.agentStopChecklist,
+      extraHooks: { onPreToolUse: createPreToolUseGuard(policyCtx) },
     });
     return {
       model: resolved.model,
@@ -386,8 +393,7 @@ class SessionService {
       workingDirectory: workspaceDir,
       // session 最大工具集合（mode: "empty" 必填；agent.tools 必须为其子集，见 #2356 说明）
       availableTools: BUILTIN_TOOLS,
-      onPermissionRequest: (...args: Parameters<PermissionHandler>) =>
-        permissionPolicy.evaluate(...args),
+      onPermissionRequest: createPermissionHandler(policyCtx),
       ...(resolved.systemMessage ? { systemMessage: resolved.systemMessage } : {}),
       ...(customAgents.length ? { customAgents } : {}),
       ...(opts.agent ? { agent: opts.agent } : {}),
@@ -413,7 +419,7 @@ class SessionService {
     assertValidSessionId(sessionId);
     const workspaceDir = await workspaceService.create(sessionId);
     const session = await client.createSession({
-      ...this.buildSessionConfig(opts, workspaceDir),
+      ...this.buildSessionConfig(sessionId, opts, workspaceDir),
       sessionId,
     });
     this.sessions.set(session.sessionId, session);
@@ -423,6 +429,8 @@ class SessionService {
       userId: owner.userId,
       workspacePath: workspaceDir,
     });
+    // 归属落持久表：重启后不会退化成“谁先访问谁认领”
+    await this.registry.upsert({ sessionId: session.sessionId, owner, workspacePath: workspaceDir });
     return session;
   }
 
@@ -438,14 +446,19 @@ class SessionService {
     assertValidSessionId(sessionId);
     const attached = this.sessions.get(sessionId);
     if (attached) {
-      this.assertSessionOwner(sessionId, owner);
+      await this.assertOwnership(sessionId, owner);
       return attached;
     }
     const client = await this.getClient();
     // workspace 路径是 sessionId 的确定性函数：resume 永远回到同一目录
     const workspaceDir = await workspaceService.create(sessionId);
+    // resume 前先过归属校验（官方 multi-tenancy：session id 本身不构成访问边界）
+    await this.assertOwnership(sessionId, owner, workspaceDir);
     try {
-      const session = await client.resumeSession(sessionId, this.buildSessionConfig(opts, workspaceDir));
+      const session = await client.resumeSession(
+        sessionId,
+        this.buildSessionConfig(sessionId, opts, workspaceDir),
+      );
       this.sessions.set(session.sessionId, session);
       this.owners.set(session.sessionId, {
         sessionId: session.sessionId,
@@ -475,13 +488,22 @@ class SessionService {
     assertValidSessionId(sessionId);
     const attached = this.sessions.get(sessionId);
     if (attached) {
-      this.assertSessionOwner(sessionId, owner);
+      await this.assertOwnership(sessionId, owner);
       return attached;
     }
-    return this.resumeSession(sessionId, opts, owner);
+    // attach lock：并发首访只允许一个 request 真正 resume，其余复用同一个 session object
+    // （“检查 sessions 是否有” 与 “真正 resume” 之间必须原子，否则会双附着同一 runtime session）
+    return this.withAttachLock(sessionId, async () => {
+      const again = this.sessions.get(sessionId);
+      if (again) {
+        await this.assertOwnership(sessionId, owner);
+        return again;
+      }
+      return this.resumeSession(sessionId, opts, owner);
+    });
   }
 
-  /** 同一 session 的并发 chat 串行化（单进程；多副本阶段升级为分布式锁/session ownership） */
+  /** 同一 session 的 agent turn 串行化（单进程；多副本阶段升级为分布式锁） */
   async withSessionLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.sessionLocks.get(sessionId) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(fn);
@@ -495,37 +517,111 @@ class SessionService {
     }
   }
 
+  /** resume 专用锁（与 chat lock 分开：attach 不该被正在跑的 turn 阻塞，反之亦然） */
+  private async withAttachLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.attachLocks.get(sessionId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(fn);
+    this.attachLocks.set(sessionId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.attachLocks.get(sessionId) === current) {
+        this.attachLocks.delete(sessionId);
+      }
+    }
+  }
+
+  /** 标记 turn 起止（客户端断开时据此决定是否 abort） */
+  markTurnActive(sessionId: string): void {
+    this.activeTurns.add(sessionId);
+  }
+
+  markTurnIdle(sessionId: string): void {
+    this.activeTurns.delete(sessionId);
+  }
+
+  /** 中止当前 turn（不是断开 session；之后仍可继续对话） */
+  async abortTurn(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
+    try {
+      await session.abort();
+      return true;
+    } finally {
+      this.activeTurns.delete(sessionId);
+    }
+  }
+
   getSessionOwner(sessionId: string): SessionRecord | undefined {
     return this.owners.get(sessionId);
   }
 
-  /** 越权访问直接抛错（路由层转为 403；无记录=本地旧会话，首个调用者认领，workspace 可由路径函数重建） */
-  assertSessionOwner(sessionId: string, owner: SessionOwner): void {
-    const record = this.owners.get(sessionId);
-    if (!record) {
-      this.owners.set(sessionId, {
-        sessionId,
-        tenantId: owner.tenantId,
-        userId: owner.userId,
-        workspacePath: workspaceService.pathFor(sessionId),
-      });
-      return;
-    }
-    if (record.tenantId !== owner.tenantId || record.userId !== owner.userId) {
-      throw new Error(`无权访问 session："${sessionId}"（归属 ${record.tenantId}/${record.userId}）`);
-    }
+  /** 更新 lastUsedAt（chat 时调用；便于按活跃度清理） */
+  touch(sessionId: string): Promise<void> {
+    return this.registry.touch(sessionId);
   }
 
-  /** 磁盘上的全部会话（含未附着到本进程的），附带 attached 标记 */
-  async listSessions(): Promise<(SessionMetadata & { attached: boolean })[]> {
+  /** 持久归属记录（跨重启真相源；GET /api/sessions 按此过滤） */
+  async getRegistryRecord(sessionId: string): Promise<RegistryRecord | undefined> {
+    return this.registry.get(sessionId);
+  }
+
+  /**
+   * 归属校验：所有 session 操作（resume/chat/delete/list）统一走这里。
+   * 无记录时仅在单租户（owner=default）下补登记，避免本地旧会话直接不可访问；
+   * 多租户下无记录 = 无权访问（不再“谁先访问谁认领”）。
+   */
+  async assertOwnership(
+    sessionId: string,
+    owner: SessionOwner,
+    workspacePath = workspaceService.pathFor(sessionId),
+  ): Promise<void> {
+    const isSingleTenant = this.isSingleTenant(owner);
+    const record = await this.registry.assertAccess(sessionId, owner, {
+      allowLegacyClaim: isSingleTenant,
+      workspacePath,
+    });
+    this.owners.set(sessionId, {
+      sessionId,
+      tenantId: record.tenantId,
+      userId: record.userId,
+      workspacePath: record.workspacePath || workspacePath,
+    });
+  }
+
+  /** 当前 owner 的会话（磁盘全量 ∩ registry 归属；不再返回所有人的会话） */
+  async listSessions(
+    owner: SessionOwner = DEFAULT_OWNER,
+  ): Promise<(SessionMetadata & { attached: boolean })[]> {
+    const client = await this.getClient();
+    const mine = await this.registry.listByOwner(owner);
+    const allowed = new Set(mine.map((r) => r.sessionId));
+    const all = await client.listSessions();
+    return all
+      .filter((m) => allowed.has(m.sessionId))
+      .map((m) => ({ ...m, attached: this.sessions.has(m.sessionId) }));
+  }
+
+  async getSessionMeta(
+    sessionId: string,
+    owner: SessionOwner = DEFAULT_OWNER,
+  ): Promise<(SessionMetadata & { attached: boolean }) | null> {
+    // 只读路径不认领：无归属记录时按无权处理（单租户除外，历史会话仍可读）
+    const record = await this.registry.get(sessionId);
+    if (record && (record.tenantId !== owner.tenantId || record.userId !== owner.userId)) {
+      throw new Error(`无权访问 session："${sessionId}"`);
+    }
+    if (!record && !this.isSingleTenant(owner)) {
+      throw new Error(`无权访问 session："${sessionId}"（无归属记录）`);
+    }
     const client = await this.getClient();
     const all = await client.listSessions();
-    return all.map((m) => ({ ...m, attached: this.sessions.has(m.sessionId) }));
+    const meta = all.find((m) => m.sessionId === sessionId);
+    return meta ? { ...meta, attached: this.sessions.has(sessionId) } : null;
   }
 
-  async getSessionMeta(sessionId: string): Promise<(SessionMetadata & { attached: boolean }) | null> {
-    const all = await this.listSessions();
-    return all.find((m) => m.sessionId === sessionId) ?? null;
+  private isSingleTenant(owner: SessionOwner): boolean {
+    return owner.tenantId === DEFAULT_OWNER.tenantId && owner.userId === DEFAULT_OWNER.userId;
   }
 
   /** 供 GET /api/agents：预设、内置技能目录、可发现的技能（无需启动 runtime） */
@@ -547,15 +643,18 @@ class SessionService {
    * 未附着时返回 false（调用方可视为“已不在内存”，照样可 resume）。
    */
   async disconnectSession(sessionId: string, owner?: SessionOwner): Promise<boolean> {
-    if (owner) this.assertSessionOwner(sessionId, owner);
-    const session = this.sessions.get(sessionId);
-    if (!session) return false;
-    try {
-      await session.disconnect();
-    } finally {
-      this.sessions.delete(sessionId);
-    }
-    return true;
+    // 与 agent turn 共用 session lock：等当前 turn 跑完再断，避免 agent 还在写文件时被拔掉
+    return this.withSessionLock(sessionId, async () => {
+      if (owner) await this.assertOwnership(sessionId, owner);
+      const session = this.sessions.get(sessionId);
+      if (!session) return false;
+      try {
+        await session.disconnect();
+      } finally {
+        this.sessions.delete(sessionId);
+      }
+      return true;
+    });
   }
 
   /** @deprecated 用 disconnectSession（语义更准：断开不断数据） */
@@ -569,25 +668,43 @@ class SessionService {
    */
   async deleteSessionPermanently(sessionId: string, owner?: SessionOwner): Promise<void> {
     assertValidSessionId(sessionId);
-    if (owner) this.assertSessionOwner(sessionId, owner);
-    await this.disconnectSession(sessionId).catch(() => false);
-    const client = await this.getClient();
-    try {
-      await client.deleteSession(sessionId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (/not found|no such|unknown session|does not exist/i.test(msg)) {
-        throw new Error(`session 不存在（无法删除）："${sessionId}"`);
+    // 同样排队在 session lock 之后：绝不在 agent turn 进行中删 runtime session 与 workspace
+    await this.withSessionLock(sessionId, async () => {
+      if (owner) await this.assertOwnership(sessionId, owner);
+      await this.disconnectUnlocked(sessionId);
+      const client = await this.getClient();
+      try {
+        await client.deleteSession(sessionId);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (/not found|no such|unknown session|does not exist/i.test(msg)) {
+          throw new Error(`session 不存在（无法删除）："${sessionId}"`);
+        }
+        throw err;
       }
-      throw err;
-    }
-    this.owners.delete(sessionId);
-    // workspace 清理失败只告警，不让整个删除 API 失败（避免孤儿 session 删不掉）
+      this.owners.delete(sessionId);
+      await this.registry.remove(sessionId);
+      // workspace 清理失败只告警，不让整个删除 API 失败（避免孤儿 session 删不掉）
+      try {
+        await workspaceService.remove(sessionId);
+      } catch (err) {
+        console.warn(
+          `[session] workspace 清理失败 ${sessionId}：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    });
+  }
+
+  /** 锁内调用版本（deleteSessionPermanently 已持锁，避免重复取锁死锁） */
+  private async disconnectUnlocked(sessionId: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return false;
     try {
-      await workspaceService.remove(sessionId);
-    } catch (err) {
-      console.warn(`[session] workspace 清理失败 ${sessionId}：${err instanceof Error ? err.message : String(err)}`);
+      await session.disconnect();
+    } finally {
+      this.sessions.delete(sessionId);
     }
+    return true;
   }
 
   async stop() {
@@ -601,6 +718,8 @@ class SessionService {
     this.sessions.clear();
     this.owners.clear();
     this.sessionLocks.clear();
+    this.attachLocks.clear();
+    this.activeTurns.clear();
     if (this.client) {
       await this.client.stop();
       this.client = null;
