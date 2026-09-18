@@ -57,6 +57,35 @@ header h1 {
 .sid {
   color: #888;
 }
+.activity {
+  padding: 6px 12px;
+  border-bottom: 1px solid #eee;
+  background: #fafafa;
+  font-size: 13px;
+  color: #555;
+  max-height: 110px;
+  overflow-y: auto;
+}
+.sessions {
+  padding: 6px 12px;
+  border-bottom: 1px solid #eee;
+  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.session-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+  flex-wrap: wrap;
+}
+.session-row button {
+  font-size: 12px;
+}
 .messages {
   height: 420px;
   overflow-y: auto;
