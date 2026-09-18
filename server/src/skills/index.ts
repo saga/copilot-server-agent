@@ -1,6 +1,7 @@
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { config } from '../config.js';
 
 export interface SkillMeta {
   name: string;
@@ -50,9 +51,30 @@ export function discoverSkills(dir: string): SkillMeta[] {
 }
 
 /**
+ * 技能目录 allowlist：COPILOT_SKILL_ROOTS 留空=本地开发不限制；
+ * 生产一旦配置，extra 目录必须落在其中（内置 server/skills 永远放行）。
+ */
+export function assertAllowedSkillDir(dir: string): string {
+  const abs = path.resolve(dir);
+  if (abs === BUILTIN_SKILL_DIR) return abs;
+  if (config.skillRoots.length === 0) return abs;
+  const allowed = config.skillRoots.some((root) => {
+    const r = path.resolve(root);
+    return abs === r || abs.startsWith(r + path.sep);
+  });
+  if (!allowed) {
+    throw new Error(
+      `技能目录被拒绝："${dir}" 不在 COPILOT_SKILL_ROOTS allowlist 中（${config.skillRoots.join(', ') || '(未配置)'}）`,
+    );
+  }
+  return abs;
+}
+
+/**
  * 解析本次会话的 skillDirectories：
  * - 默认带上内置 server/skills（`noBuiltinSkills: true` 可关掉）
  * - 额外目录不存在直接抛错（路由层转为 400），避免静默“技能没加载”
+ * - 额外目录受 COPILOT_SKILL_ROOTS allowlist 约束（配置后生效）
  */
 export function resolveSkillDirectories(opts: {
   extra?: string[];
@@ -63,7 +85,7 @@ export function resolveSkillDirectories(opts: {
     dirs.push(BUILTIN_SKILL_DIR);
   }
   for (const d of opts.extra ?? []) {
-    const abs = path.resolve(d);
+    const abs = assertAllowedSkillDir(d);
     if (!existsSync(abs) || !statSync(abs).isDirectory()) {
       throw new Error(`技能目录不存在：${d}（解析为 ${abs}）`);
     }

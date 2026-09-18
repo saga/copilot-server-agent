@@ -1,13 +1,36 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import type { MCPServerConfig } from '@github/copilot-sdk';
-import { sessionService, assertValidSessionId } from '../services/session-service.js';
+import {
+  sessionService,
+  assertValidSessionId,
+  ownerFromHeaders,
+} from '../services/session-service.js';
 import { listProviderStatus } from '../providers/index.js';
-import { listMcp, getMcpServerConfig, testMcpServer } from '../mcp/registry.js';
+import {
+  listMcp,
+  getMcpServerConfig,
+  testMcpServer,
+  assertSafeOutboundUrl,
+} from '../mcp/registry.js';
 import { listHooks } from '../hooks/registry.js';
 import { config } from '../config.js';
 
 export const apiRouter = Router();
+
+/**
+ * 管理接口保护：COPILOT_ADMIN_TOKEN 留空=本地开发不设防；
+ * 生产一旦设置，/api/debug 与 /api/hooks 必须带 x-admin-token 头（或由 ingress 统一鉴权）。
+ */
+function requireAdmin(
+  req: import('express').Request,
+  res: import('express').Response,
+  next: import('express').NextFunction,
+) {
+  if (!config.adminToken) return next();
+  if (req.header('x-admin-token') === config.adminToken) return next();
+  return res.status(401).json({ error: 'unauthorized（管理接口需 x-admin-token）' });
+}
 
 const SESSION_ID_HINT = '须字母数字开头，仅含字母/数字/-/_，最长 128 字符（推荐 user-xxx-task-yyy）';
 const sessionIdSchema = z
@@ -153,6 +176,21 @@ apiRouter.post('/mcp/test', async (req, res, next) => {
           '内联 local MCP 测试被拒绝：在服务器执行任意命令风险高，如确需开放请设 COPILOT_ALLOW_INLINE_MCP_LOCAL=true',
       });
     }
+    if ((t === 'http' || t === 'sse') && !config.allowInlineMcpHttp) {
+      return res.status(400).json({
+        error:
+          '内联 http MCP 测试被拒绝：服务端已关闭（生产请用运维预置的 COPILOT_MCP_SERVERS）',
+      });
+    }
+    if ((t === 'http' || t === 'sse') && 'url' in cfg && typeof cfg.url === 'string') {
+      try {
+        await assertSafeOutboundUrl(cfg.url);
+      } catch (e) {
+        return res.status(400).json({
+          error: e instanceof Error ? e.message : String(e),
+        });
+      }
+    }
     return res.json({ name: null, ...(await testMcpServer(cfg)) });
   } catch (err) {
     return next(err);
@@ -160,7 +198,7 @@ apiRouter.post('/mcp/test', async (req, res, next) => {
 });
 
 /** GET /api/debug — 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime） */
-apiRouter.get('/debug', async (_req, res, next) => {
+apiRouter.get('/debug', requireAdmin, async (_req, res, next) => {
   try {
     res.json(await sessionService.getDebugInfo());
   } catch (err) {
@@ -169,7 +207,7 @@ apiRouter.get('/debug', async (_req, res, next) => {
 });
 
 /** GET /api/hooks — hook 预设与最近 hook 事件（审计；事件环纯内存，重启清空） */
-apiRouter.get('/hooks', (req, res) => {
+apiRouter.get('/hooks', requireAdmin, (req, res) => {
   const limit = Math.max(1, Math.min(200, Number(req.query.limit ?? 50) || 50));
   res.json(listHooks(limit));
 });
@@ -179,10 +217,13 @@ apiRouter.post('/sessions', async (req, res, next) => {
   try {
     const body = createSessionSchema.parse(req.body ?? {});
     const { mcpServers, ...rest } = body;
-    const session = await sessionService.createSession({
-      ...rest,
-      mcpServers: normalizeInlineMcp(mcpServers),
-    });
+    const session = await sessionService.createSession(
+      {
+        ...rest,
+        mcpServers: normalizeInlineMcp(mcpServers),
+      },
+      ownerFromHeaders(req.headers),
+    );
     res.status(201).json({ sessionId: session.sessionId });
   } catch (err) {
     next(err);
@@ -202,6 +243,14 @@ apiRouter.get('/sessions', async (_req, res, next) => {
 apiRouter.get('/sessions/:id', async (req, res, next) => {
   try {
     assertValidSessionId(req.params.id);
+    const owner = ownerFromHeaders(req.headers);
+    const record = sessionService.getSessionOwner(req.params.id);
+    if (
+      record &&
+      (record.tenantId !== owner.tenantId || record.userId !== owner.userId)
+    ) {
+      return res.status(403).json({ error: `无权访问 session："${req.params.id}"` });
+    }
     const meta = await sessionService.getSessionMeta(req.params.id);
     if (!meta) return res.status(404).json({ error: `session 不存在："${req.params.id}"` });
     return res.json(meta);
@@ -220,10 +269,14 @@ apiRouter.post('/sessions/:id/resume', async (req, res, next) => {
     assertValidSessionId(req.params.id);
     const body = sessionConfigSchema.parse(req.body ?? {});
     const { mcpServers, ...rest } = body;
-    const session = await sessionService.resumeSession(req.params.id, {
-      ...rest,
-      mcpServers: normalizeInlineMcp(mcpServers),
-    });
+    const session = await sessionService.resumeSession(
+      req.params.id,
+      {
+        ...rest,
+        mcpServers: normalizeInlineMcp(mcpServers),
+      },
+      ownerFromHeaders(req.headers),
+    );
     res.json({ sessionId: session.sessionId, resumed: true });
   } catch (err) {
     if (err instanceof Error && /无法恢复/.test(err.message)) {
@@ -240,11 +293,12 @@ apiRouter.post('/sessions/:id/resume', async (req, res, next) => {
 apiRouter.delete('/sessions/:id', async (req, res, next) => {
   try {
     assertValidSessionId(req.params.id);
+    const owner = ownerFromHeaders(req.headers);
     if (req.query.permanent === 'true') {
-      await sessionService.deleteSessionPermanently(req.params.id);
+      await sessionService.deleteSessionPermanently(req.params.id, owner);
       return res.json({ sessionId: req.params.id, deleted: true });
     }
-    const wasAttached = await sessionService.disconnectSession(req.params.id);
+    const wasAttached = await sessionService.disconnectSession(req.params.id, owner);
     return res.json({ sessionId: req.params.id, detached: wasAttached, resumable: true });
   } catch (err) {
     if (err instanceof Error && /无法删除/.test(err.message)) {
@@ -263,21 +317,30 @@ apiRouter.delete('/sessions/:id', async (req, res, next) => {
 apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
   try {
     const body = chatSchema.parse(req.body ?? {});
-    const session = sessionService.getSession(req.params.id);
-    if (!session) {
-      return res.status(404).json({ error: 'session not found, 请先 POST /api/sessions' });
-    }
-
-    if (body.model) {
-      await session.setModel(body.model);
+    const owner = ownerFromHeaders(req.headers);
+    let session;
+    try {
+      // 内存未附着时尝试从 runtime 磁盘状态恢复（重启/换 Pod 后不断连；失败才 404）
+      session = await sessionService.getOrResumeSession(req.params.id, {}, owner);
+    } catch (err) {
+      if (err instanceof Error && /无法恢复/.test(err.message)) {
+        return res.status(404).json({ error: 'session not found, 请先 POST /api/sessions' });
+      }
+      throw err;
     }
 
     if (!body.streaming) {
-      const finalEvent = await session.sendAndWait({ prompt: body.prompt });
-      const content =
-        // sendAndWait 返回 AssistantMessageEvent | undefined
-        (finalEvent as unknown as { data?: { content?: string } } | undefined)?.data
-          ?.content ?? '';
+      const content = await sessionService.withSessionLock(session.sessionId, async () => {
+        if (body.model) {
+          await session.setModel(body.model);
+        }
+        const finalEvent = await session.sendAndWait({ prompt: body.prompt });
+        return (
+          // sendAndWait 返回 AssistantMessageEvent | undefined
+          (finalEvent as unknown as { data?: { content?: string } } | undefined)?.data
+            ?.content ?? ''
+        );
+      });
       return res.json({ sessionId: session.sessionId, content });
     }
 
@@ -292,6 +355,13 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
       res.write(`event: ${event}\n`);
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
+
+    // Ingress/ALB 空闲超时保护：长推理无输出时保活
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(': heartbeat\n\n');
+      }
+    }, 15000);
 
     const offDelta = session.on('assistant.message_delta', (evt) => {
       const delta = (evt as unknown as { data?: { deltaContent?: string } }).data
@@ -314,6 +384,7 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
     });
 
     const cleanup = () => {
+      clearInterval(heartbeat);
       offDelta();
       offMsg();
       offAll();
@@ -322,7 +393,13 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
 
     req.on('close', cleanup);
 
-    await session.send({ prompt: body.prompt });
+    // 同一 session 的并发 send 串行化（dispatch 级；流式增量仍按 idle 结束）
+    await sessionService.withSessionLock(session.sessionId, async () => {
+      if (body.model) {
+        await session.setModel(body.model);
+      }
+      await session.send({ prompt: body.prompt });
+    });
     return undefined;
   } catch (err) {
     // SSE 已开始写头时不能再 next(err) 走 JSON

@@ -1,0 +1,104 @@
+# 第一阶段：单 Pod sidecar（API + headless runtime 同 Pod 经 localhost 通信）
+# replicas 固定 1（sessions 仍是进程内存；多副本需要 Session Registry + 分布式锁，见下一阶段）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: copilot-server-agent
+  labels:
+    app: copilot-server-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: copilot-server-agent
+  template:
+    metadata:
+      labels:
+        app: copilot-server-agent
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: api
+          image: your-registry/copilot-server-agent:latest
+          ports:
+            - containerPort: 3001
+          env:
+            - name: PORT
+              value: "3001"
+            # 连同 Pod 内的 runtime sidecar
+            - name: COPILOT_RUNTIME_URL
+              value: "http://127.0.0.1:4321"
+            - name: COPILOT_SESSION_IDLE_TIMEOUT
+              value: "1800"
+            # 生产安全默认值
+            - name: COPILOT_MCP_FILESYSTEM
+              value: "false"
+            - name: COPILOT_ALLOW_INLINE_MCP_LOCAL
+              value: "false"
+            - name: COPILOT_ALLOW_INLINE_MCP_HTTP
+              value: "false"
+            - name: COPILOT_SKILL_ROOTS
+              value: "/opt/copilot/skills,/workspace/skills"
+            - name: COPILOT_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: copilot-server-agent
+                  key: admin-token
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: copilot-server-agent
+                  key: github-token
+          readinessProbe:
+            httpGet:
+              path: /api/health/ready
+              port: 3001
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /api/health/live
+              port: 3001
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+
+        - name: copilot-runtime
+          image: your-registry/copilot-runtime:1.0.14
+          args:
+            - --headless
+            - --host
+            - 127.0.0.1
+            - --port
+            - "4321"
+          env:
+            - name: COPILOT_HOME
+              value: /var/lib/copilot
+            - name: COPILOT_GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: copilot-server-agent
+                  key: github-token
+          ports:
+            - containerPort: 4321
+          volumeMounts:
+            - name: copilot-state
+              mountPath: /var/lib/copilot
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+
+      volumes:
+        - name: copilot-state
+          persistentVolumeClaim:
+            claimName: copilot-runtime-state

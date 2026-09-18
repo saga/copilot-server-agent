@@ -17,6 +17,10 @@ export function errorHandler(
     });
   }
   const message = err instanceof Error ? err.message : 'Internal Server Error';
+  // 会话归属校验失败 → 403（多租户 ownership）
+  if (/无权访问/.test(message)) {
+    return res.status(403).json({ error: message });
+  }
   // 已知的“缺配置/名字写错”类错误也给 400
   const badRequest = /未知 agent|未知 MCP|未知 hook|不存在|缺少|必须|可选：|被拒绝|非法|解析失败/.test(message);
   return res.status(badRequest ? 400 : 500).json({ error: message });

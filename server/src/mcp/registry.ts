@@ -1,4 +1,6 @@
 import { accessSync, constants, existsSync } from 'node:fs';
+import { lookup } from 'node:dns/promises';
+import { isIP } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { MCPServerConfig } from '@github/copilot-sdk';
@@ -20,8 +22,8 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 export const REPO_ROOT = path.resolve(here, '../../..');
 
 /**
- * 内置预设：filesystem MCP，授权目录限定在仓库根（与 agent 已有的 view/edit 权限对等）。
- * 用 COPILOT_MCP_FILESYSTEM=false 关闭，或 COPILOT_MCP_FS_DIR 改授权目录。
+ * 内置预设：filesystem MCP。生产默认关闭（COPILOT_MCP_FILESYSTEM=true 才开，
+ * 且授权目录必须用 COPILOT_MCP_FS_DIR 显式指定，禁挂整个 repo/image 根）。
  */
 function filesystemPreset(): { meta: McpPresetMeta; config: MCPServerConfig } | null {
   if (!config.mcpFilesystem) return null;
@@ -131,6 +133,10 @@ export function resolveMcp(opts: ResolveMcpOptions): {
     if (!isLocal && !('url' in cfg && cfg.url)) {
       throw new Error(`内联 http MCP "${name}" 缺少 url`);
     }
+    if (!isLocal && 'url' in cfg && typeof cfg.url === 'string') {
+      // 同步字面 IP 检查（禁内网/回环/元数据；DNS 解析在 /mcp/test 做全量检查）
+      assertSafeOutboundUrlLiteral(cfg.url);
+    }
     if (isLocal && !('command' in cfg && cfg.command)) {
       throw new Error(`内联 local MCP "${name}" 缺少 command`);
     }
@@ -164,6 +170,92 @@ export interface McpTestResult {
   httpStatus?: number;
   tools?: string[];
   error?: string;
+}
+
+/**
+ * SSRF 防护：内联 http/sse MCP 的出站 URL 检查。
+ * - 只允许 http/https
+ * - 禁止字面内网/回环/链路本地/组播/云元数据 IP
+ * - 异步版额外做 DNS 解析，域名解析到内网 IP 同样拒绝（含 DNS rebinding 的首次形态）
+ * 注意：fetch 默认跟随跳转，调用方对不可信 URL 应配合 redirect 手动处理；
+ * /mcp/test 路由已做全量检查，运维预置（COPILOT_MCP_SERVERS）视为可信源不强制检查。
+ */
+export function isPrivateIp(ip: string): boolean {
+  const v = isIP(ip);
+  if (v === 4) {
+    const p = ip.split('.').map(Number);
+    if (p[0] === 10) return true; // 10.0.0.0/8
+    if (p[0] === 172 && p[1] >= 16 && p[1] <= 31) return true; // 172.16.0.0/12
+    if (p[0] === 192 && p[1] === 168) return true; // 192.168.0.0/16
+    if (p[0] === 127) return true; // 127.0.0.0/8
+    if (p[0] === 169 && p[1] === 254) return true; // 169.254.0.0/16（含云元数据 169.254.169.254）
+    if (p[0] === 0) return true; // 0.0.0.0/8
+    if (p[0] >= 224) return true; // 组播/保留
+    if (p[0] === 192 && p[1] === 0 && p[2] === 2) return true; // TEST-NET-1
+    if (p[0] === 198 && p[1] === 51 && p[2] === 100) return true; // TEST-NET-2
+    if (p[0] === 203 && p[1] === 0 && p[2] === 113) return true; // TEST-NET-3
+    return false;
+  }
+  if (v === 6) {
+    const n = ip.toLowerCase();
+    if (n === '::1' || n === '::') return true;
+    if (n.startsWith('fc') || n.startsWith('fd')) return true; // fc00::/7
+    if (/^fe[89ab]/.test(n)) return true; // fe80::/10
+    if (n.startsWith('ff')) return true; // 组播
+    // IPv4 映射（::ffff:10.0.0.1 或 ::ffff:a00:1）：尾 32 位按 v4 判定
+    const f = n.match(/^::ffff:(.+)$/);
+    if (f) {
+      const tail = f[1];
+      if (tail.includes('.')) {
+        if (isPrivateIp(tail)) return true;
+      } else {
+        const hex = tail.replace(/:/g, '').padStart(8, '0');
+        const v4 = [0, 2, 4, 6]
+          .map((i) => parseInt(hex.slice(i, i + 2), 16))
+          .join('.');
+        if (isPrivateIp(v4)) return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+/** 同步版：协议 + 字面 IP 检查（resolveMcp 内联分支用，不做 DNS） */
+export function assertSafeOutboundUrlLiteral(raw: string): URL {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error(`MCP http url 非法：${raw}`);
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error(`MCP http url 协议被拒绝：${url.protocol}（仅允许 http/https）`);
+  }
+  // hostname 可能是字面 IP（部分 Node 版本 hostname 保留 IPv6 方括号，先剥掉）
+  const host = url.hostname.replace(/^\[|\]$/g, '');
+  if (isIP(host) && isPrivateIp(host)) {
+    throw new Error(`MCP http url 指向内网/保留地址被拒绝：${url.hostname}`);
+  }
+  return url;
+}
+
+/** 异步全量版：字面检查 + DNS 解析全部 A/AAAA 记录检查（/mcp/test 内联分支用） */
+export async function assertSafeOutboundUrl(raw: string): Promise<URL> {
+  const url = assertSafeOutboundUrlLiteral(raw);
+  if (!isIP(url.hostname)) {
+    let addrs;
+    try {
+      addrs = await lookup(url.hostname, { all: true });
+    } catch {
+      throw new Error(`MCP http 域名解析失败：${url.hostname}`);
+    }
+    const bad = addrs.filter((a) => isPrivateIp(a.address)).map((a) => a.address);
+    if (bad.length) {
+      throw new Error(`MCP http 域名解析到内网地址被拒绝：${url.hostname} → ${bad.join(', ')}`);
+    }
+  }
+  return url;
 }
 
 /** 在 PATH 中找可执行文件（对应文档“命令路径正确、用绝对路径”检查项） */

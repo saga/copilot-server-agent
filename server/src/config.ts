@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import os from 'node:os';
+import path from 'node:path';
 
 function env(name: string, fallback = ''): string {
   return process.env[name] ?? fallback;
@@ -15,6 +17,14 @@ function parseLogLevel(raw: string): LogLevel | undefined {
   throw new Error(`COPILOT_LOG_LEVEL 非法："${raw}"，可选：${LOG_LEVELS.join(' | ')}（留空=SDK 默认）`);
 }
 
+/** 逗号分隔列表（空=未配置） */
+function parseList(raw: string): string[] {
+  return raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
 export const config = {
   port: Number(env('PORT', '3001')),
   corsOrigin: env('CORS_ORIGIN', 'http://localhost:5173'),
@@ -29,15 +39,24 @@ export const config = {
   deepseekBaseUrl: env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
   // --- 会话持久化：服务端 idle 超时（秒，0=关闭，无活动超时后 runtime 自动回收） ---
   sessionIdleTimeoutSeconds: Number(env('COPILOT_SESSION_IDLE_TIMEOUT', '0')) || undefined,
-  // --- MCP：filesystem 预设开关与授权目录（agent 已有 view/edit，默认开，限定在本仓库） ---
-  mcpFilesystem: env('COPILOT_MCP_FILESYSTEM', 'true') === 'true',
+  // --- Runtime 连接：留空=SDK 自己拉起本地 runtime；K8s sidecar/远端填 http://127.0.0.1:4321 ---
+  runtimeUrl: env('COPILOT_RUNTIME_URL', '') || undefined,
+  // --- 本地 runtime 的数据目录（透传为 SDK baseDirectory → COPILOT_HOME；forUri 时被 runtime 侧忽略） ---
+  // 缺省 ~/.copilot（与 runtime 默认一致；mode: "empty" 要求 client 级别显式设置，不可留空）
+  baseDirectory: env('COPILOT_HOME', '') || path.join(os.homedir(), '.copilot'),
+  // --- 技能目录 allowlist（逗号分隔；留空=本地开发模式不限制；生产必须配） ---
+  skillRoots: parseList(env('COPILOT_SKILL_ROOTS', '')),
+  // --- 管理接口令牌（留空=不设防本地开发；生产设置后 /api/debug、/api/hooks 需带 x-admin-token） ---
+  adminToken: env('COPILOT_ADMIN_TOKEN', '') || undefined,
+  // --- MCP：filesystem 预设开关与授权目录（生产默认关；开则必须配 COPILOT_MCP_FS_DIR） ---
+  mcpFilesystem: env('COPILOT_MCP_FILESYSTEM', 'false') === 'true',
   mcpFsDir: env('COPILOT_MCP_FS_DIR', '') || undefined,
   /** 运维预置的额外 MCP servers（JSON，如 {"github":{"type":"http","url":"...","headers":{...}}}） */
   mcpServersJson: env('COPILOT_MCP_SERVERS', ''),
   /** 是否允许前端请求内联 local/stdio MCP（= 在服务器上执行任意命令，默认关） */
   allowInlineMcpLocal: env('COPILOT_ALLOW_INLINE_MCP_LOCAL', 'false') === 'true',
-  /** 是否允许前端请求内联 http/sse MCP（默认开；header 密钥由调用方自带） */
-  allowInlineMcpHttp: env('COPILOT_ALLOW_INLINE_MCP_HTTP', 'true') === 'true',
+  /** 是否允许前端请求内联 http/sse MCP（默认关；生产只用运维预置的 COPILOT_MCP_SERVERS） */
+  allowInlineMcpHttp: env('COPILOT_ALLOW_INLINE_MCP_HTTP', 'false') === 'true',
   // --- 调试（对应官方 debugging 文档）：SDK 日志级别 + CLI 日志目录 + CLI 路径 ---
   logLevel: parseLogLevel(env('COPILOT_LOG_LEVEL', '')),
   logDir: env('COPILOT_LOG_DIR', '') || undefined,

@@ -1,0 +1,12 @@
+# Runtime 会话持久化（/var/lib/copilot/session-state/<sessionId>）
+# 第一阶段单 PVC；多副本阶段按 runtime 分片或换共享存储 + Session Registry
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: copilot-runtime-state
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

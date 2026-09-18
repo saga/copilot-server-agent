@@ -3,10 +3,13 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { CopilotClient, RuntimeConnection, approveAll } from '@github/copilot-sdk';
 import type {
+  AttributedPermissionResult,
   CopilotSession,
   CustomAgentConfig,
   MCPServerConfig,
   ModelInfo,
+  PermissionHandler,
+  PermissionRequestResult,
   SessionMetadata,
 } from '@github/copilot-sdk';
 import { config } from '../config.js';
@@ -58,6 +61,53 @@ export function assertValidSessionId(id: string): void {
     );
   }
 }
+
+/**
+ * 会话归属（多租户 K8s 的 ownership 概念；第一阶段单副本内存实现）。
+ * tenantId/userId 默认都取 `default`（本地开发无感知）；生产由网关/IAP 在
+ * `x-tenant-id` / `x-user-id` 头里注入，之后切 Session Registry 时字段不变。
+ */
+export interface SessionOwner {
+  tenantId: string;
+  userId: string;
+}
+
+export interface SessionRecord {
+  sessionId: string;
+  tenantId: string;
+  userId: string;
+}
+
+export const DEFAULT_OWNER: SessionOwner = { tenantId: 'default', userId: 'default' };
+
+export function ownerFromHeaders(h: Record<string, unknown>): SessionOwner {
+  const pick = (v: unknown, fallback: string): string => {
+    if (typeof v === 'string' && v.trim()) return v.trim().slice(0, 128);
+    if (Array.isArray(v) && typeof v[0] === 'string' && v[0].trim()) {
+      return v[0].trim().slice(0, 128);
+    }
+    return fallback;
+  };
+  return {
+    tenantId: pick(h['x-tenant-id'], DEFAULT_OWNER.tenantId),
+    userId: pick(h['x-user-id'], DEFAULT_OWNER.userId),
+  };
+}
+
+/**
+ * 工具授权 Policy 接口（第一阶段 = approveAll 行为；以后在这里分 read/edit/bash/network 分级，
+ * SessionService 不用再改）。
+ */
+export const permissionPolicy = {
+  async evaluate(
+    ...args: Parameters<PermissionHandler>
+  ): Promise<PermissionRequestResult | AttributedPermissionResult> {
+    const [request, invocation] = args;
+    return approveAll(request, invocation);
+  },
+};
+
+export type PermissionPolicy = typeof permissionPolicy;
 
 export interface SessionConfigOptions {
   model?: string;
@@ -117,11 +167,21 @@ export interface DebugInfo {
     cliPath?: string;
     sessionIdleTimeoutSeconds?: number;
     workingDirectory?: string;
+    runtimeUrl?: string;
+    baseDirectory: string;
   };
   sessions: { attached: number; attachedIds: string[]; onDisk: number | null; listError?: string };
   hooks: { presets: number; recentEvents: number };
   mcp: { presets: number; allowInlineLocal: boolean; allowInlineHttp: boolean };
 }
+
+/**
+ * session-level 工具 allowlist（mode: "empty" 要求每个会话显式声明 availableTools；
+ * 也是 SDK #2356 workaround：customAgents.tools 在特定 server/runtime 组合下会“显示选中
+ * 但模型拿不到”，session-level availableTools 才是可靠的生效层）。
+ * customAgents[].tools 保持为其子集（两层模型：session=最大集合，agent=子集）。
+ */
+export const BUILTIN_TOOLS = ['grep', 'glob', 'view', 'edit', 'bash'];
 
 /**
  * Copilot 会话服务（单例）。
@@ -132,6 +192,9 @@ class SessionService {
   private client: CopilotClient | null = null;
   private starting: Promise<CopilotClient> | null = null;
   private sessions = new Map<string, CopilotSession>();
+  private owners = new Map<string, SessionRecord>();
+  /** 单进程 session 并发锁：同一 session 的 send 串行化（多副本阶段升级为分布式锁） */
+  private sessionLocks = new Map<string, Promise<unknown>>();
   private lastError: string | null = null;
 
   async getClient(): Promise<CopilotClient> {
@@ -141,30 +204,46 @@ class SessionService {
     this.starting = (async () => {
       const provider = getActiveProvider();
       const customModels = provider.getCustomModels();
-      const client = new CopilotClient({
-        gitHubToken: config.githubToken,
-        // 未提供 token 时默认使用 copilot CLI 已登录用户
-        useLoggedInUser: config.githubToken ? false : true,
-        workingDirectory: config.workingDirectory,
+      // 多租户 server 安全基线：mode "empty" 关掉 CLI 风格 ambient tools/host filesystem，
+      // 工具集由每个 session 的 availableTools 显式声明。
+      const clientOptions: ConstructorParameters<typeof CopilotClient>[0] = {
+        mode: 'empty',
         // 无活动超时后 runtime 自动回收（0/缺省=关闭，默认会话常驻）
         ...(config.sessionIdleTimeoutSeconds
           ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
           : {}),
         // 调试：SDK 日志级别（none/error/warning/info/debug/all，缺省=SDK 默认）
         ...(config.logLevel ? { logLevel: config.logLevel } : {}),
-        // 调试：自定义 CLI 路径 / 日志目录时才显式建 connection，
-        // 否则走 SDK 默认（自动 materialize 内置 runtime）
-        ...(config.cliPath || config.logDir
-          ? {
-              connection: RuntimeConnection.forStdio({
-                ...(config.cliPath ? { path: config.cliPath } : {}),
-                ...(config.logDir ? { args: ['--log-dir', config.logDir] } : {}),
-              }),
-            }
-          : {}),
         // BYOK：CLI 不知道第三方模型，按官方文档用 onListModels 自报
         ...(customModels ? { onListModels: () => customModels } : {}),
-      });
+      };
+
+      if (config.runtimeUrl) {
+        // K8s/远端：连外部 headless runtime（COPILOT_HOME 配在 runtime 那边，本侧 baseDirectory 被忽略）
+        clientOptions.connection = RuntimeConnection.forUri(config.runtimeUrl);
+      } else {
+        // 本地：SDK 自己拉起 runtime
+        Object.assign(clientOptions, {
+          gitHubToken: config.githubToken,
+          // 未提供 token 时默认使用 copilot CLI 已登录用户
+          useLoggedInUser: config.githubToken ? false : true,
+          workingDirectory: config.workingDirectory,
+          // 会话持久化目录（mode: "empty" 强制要求；缺省 ~/.copilot，与 runtime 默认一致）
+          baseDirectory: config.baseDirectory,
+          // 调试：自定义 CLI 路径 / 日志目录时才显式建 connection，
+          // 否则走 SDK 默认（自动 materialize 内置 runtime）
+          ...(config.cliPath || config.logDir
+            ? {
+                connection: RuntimeConnection.forStdio({
+                  ...(config.cliPath ? { path: config.cliPath } : {}),
+                  ...(config.logDir ? { args: ['--log-dir', config.logDir] } : {}),
+                }),
+              }
+            : {}),
+        });
+      }
+
+      const client = new CopilotClient(clientOptions);
       await client.start();
       this.client = client;
       this.lastError = null;
@@ -210,6 +289,8 @@ class SessionService {
           ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
           : {}),
         ...(config.workingDirectory ? { workingDirectory: config.workingDirectory } : {}),
+        ...(config.runtimeUrl ? { runtimeUrl: config.runtimeUrl } : {}),
+        baseDirectory: config.baseDirectory,
       },
       sessions: { attached: this.sessions.size, attachedIds: [...this.sessions.keys()], onDisk: null },
       hooks: { presets: HOOK_PRESETS.length, recentEvents: hookEventCount() },
@@ -294,7 +375,10 @@ class SessionService {
       model: resolved.model,
       ...(resolved.provider ? { provider: resolved.provider } : {}),
       streaming: true,
-      onPermissionRequest: approveAll,
+      // session 最大工具集合（mode: "empty" 必填；agent.tools 必须为其子集，见 #2356 说明）
+      availableTools: BUILTIN_TOOLS,
+      onPermissionRequest: (...args: Parameters<PermissionHandler>) =>
+        permissionPolicy.evaluate(...args),
       ...(resolved.systemMessage ? { systemMessage: resolved.systemMessage } : {}),
       ...(customAgents.length ? { customAgents } : {}),
       ...(opts.agent ? { agent: opts.agent } : {}),
@@ -310,7 +394,7 @@ class SessionService {
     };
   }
 
-  async createSession(opts: CreateSessionOptions): Promise<CopilotSession> {
+  async createSession(opts: CreateSessionOptions, owner: SessionOwner = DEFAULT_OWNER): Promise<CopilotSession> {
     const client = await this.getClient();
     if (opts.sessionId !== undefined) assertValidSessionId(opts.sessionId);
     const session = await client.createSession({
@@ -318,6 +402,11 @@ class SessionService {
       ...(opts.sessionId ? { sessionId: opts.sessionId } : {}),
     });
     this.sessions.set(session.sessionId, session);
+    this.owners.set(session.sessionId, {
+      sessionId: session.sessionId,
+      tenantId: owner.tenantId,
+      userId: owner.userId,
+    });
     return session;
   }
 
@@ -325,14 +414,26 @@ class SessionService {
    * 恢复磁盘上的会话（服务重启/换实例后继续）。
    * 若内存里已有同 id 的附着会话则直接复用，避免同一会话双附着（文档：并发访问未定义）。
    */
-  async resumeSession(sessionId: string, opts: SessionConfigOptions): Promise<CopilotSession> {
+  async resumeSession(
+    sessionId: string,
+    opts: SessionConfigOptions,
+    owner: SessionOwner = DEFAULT_OWNER,
+  ): Promise<CopilotSession> {
     assertValidSessionId(sessionId);
     const attached = this.sessions.get(sessionId);
-    if (attached) return attached;
+    if (attached) {
+      this.assertSessionOwner(sessionId, owner);
+      return attached;
+    }
     const client = await this.getClient();
     try {
       const session = await client.resumeSession(sessionId, this.buildSessionConfig(opts));
       this.sessions.set(session.sessionId, session);
+      this.owners.set(session.sessionId, {
+        sessionId: session.sessionId,
+        tenantId: owner.tenantId,
+        userId: owner.userId,
+      });
       return session;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -340,6 +441,54 @@ class SessionService {
         throw new Error(`session 不存在（无法恢复）："${sessionId}"。${msg}`);
       }
       throw err;
+    }
+  }
+
+  /**
+   * 内存未附着时尝试从 runtime 磁盘状态恢复（跨 Pod/重启后的 resume-on-miss）。
+   * 恢复失败抛“无法恢复”（调用方按 404 处理）。
+   */
+  async getOrResumeSession(
+    sessionId: string,
+    opts: SessionConfigOptions,
+    owner: SessionOwner = DEFAULT_OWNER,
+  ): Promise<CopilotSession> {
+    assertValidSessionId(sessionId);
+    const attached = this.sessions.get(sessionId);
+    if (attached) {
+      this.assertSessionOwner(sessionId, owner);
+      return attached;
+    }
+    return this.resumeSession(sessionId, opts, owner);
+  }
+
+  /** 同一 session 的并发 chat 串行化（单进程；多副本阶段升级为分布式锁/session ownership） */
+  async withSessionLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sessionLocks.get(sessionId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(fn);
+    this.sessionLocks.set(sessionId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.sessionLocks.get(sessionId) === current) {
+        this.sessionLocks.delete(sessionId);
+      }
+    }
+  }
+
+  getSessionOwner(sessionId: string): SessionRecord | undefined {
+    return this.owners.get(sessionId);
+  }
+
+  /** 越权访问直接抛错（路由层转为 403；无记录=本地旧会话，首个调用者认领） */
+  assertSessionOwner(sessionId: string, owner: SessionOwner): void {
+    const record = this.owners.get(sessionId);
+    if (!record) {
+      this.owners.set(sessionId, { sessionId, tenantId: owner.tenantId, userId: owner.userId });
+      return;
+    }
+    if (record.tenantId !== owner.tenantId || record.userId !== owner.userId) {
+      throw new Error(`无权访问 session："${sessionId}"（归属 ${record.tenantId}/${record.userId}）`);
     }
   }
 
@@ -373,7 +522,8 @@ class SessionService {
    * 断开内存附着，释放资源但保留磁盘数据 → 之后仍可 resume。
    * 未附着时返回 false（调用方可视为“已不在内存”，照样可 resume）。
    */
-  async disconnectSession(sessionId: string): Promise<boolean> {
+  async disconnectSession(sessionId: string, owner?: SessionOwner): Promise<boolean> {
+    if (owner) this.assertSessionOwner(sessionId, owner);
     const session = this.sessions.get(sessionId);
     if (!session) return false;
     try {
@@ -393,8 +543,9 @@ class SessionService {
    * 彻底删除：先断开内存附着，再删磁盘全部数据 → 不可恢复。
    * 磁盘上不存在时 SDK 会抛错，调用方按 404 处理。
    */
-  async deleteSessionPermanently(sessionId: string): Promise<void> {
+  async deleteSessionPermanently(sessionId: string, owner?: SessionOwner): Promise<void> {
     assertValidSessionId(sessionId);
+    if (owner) this.assertSessionOwner(sessionId, owner);
     await this.disconnectSession(sessionId).catch(() => false);
     const client = await this.getClient();
     try {
@@ -406,6 +557,7 @@ class SessionService {
       }
       throw err;
     }
+    this.owners.delete(sessionId);
   }
 
   async stop() {
@@ -417,6 +569,8 @@ class SessionService {
       }
     }
     this.sessions.clear();
+    this.owners.clear();
+    this.sessionLocks.clear();
     if (this.client) {
       await this.client.stop();
       this.client = null;

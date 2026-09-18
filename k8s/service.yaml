@@ -1,0 +1,13 @@
+# 只暴露 Agent API；runtime sidecar 仅 Pod 内 127.0.0.1:4321，不进 Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: copilot-server-agent
+spec:
+  selector:
+    app: copilot-server-agent
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3001
+  type: ClusterIP
