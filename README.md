@@ -23,7 +23,7 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/api/health` | `{ status, uptime, copilot: connected\|disconnected\|error }` |
+| GET | `/api/health` | `{ status, uptime, copilot: connected\|idle\|error }`（`idle` = client 尚未建连的懒加载态，不是故障；判连接可用性看 `/api/health/ready`） |
 | GET | `/api/providers` | 通道列表 `{ providers: [{ id, displayName, defaultModel, configured, active, hint? }] }` |
 | GET | `/api/models` | 当前通道可用模型列表 `{ provider, models }`（前端模型选择器用） |
 | GET | `/api/agents` | agent 预设 + 技能目录 + 可发现技能（建会话表单用） |
@@ -114,6 +114,7 @@ create table agent_sessions (
 | `COPILOT_TRUST_IDENTITY_HEADERS` | `false` | 是否信任 `x-tenant-id`/`x-user-id`；仅网关注入时才开 |
 | `COPILOT_REGISTRY_PATH` | `$COPILOT_HOME/session-registry.json` | Session Registry 落盘位置；K8s 必须指到持久卷 |
 | `COPILOT_BASH_POLICY` | `workspace` | `workspace`=命令涉及路径须在 workspace；`allow`=放行；`deny`=禁止 bash |
+| `COPILOT_WARMUP` | `true` | 启动时后台预热 runtime（首屏徽章与首个会话不必等 CLI 拉起）；`false`=纯懒加载 |
 | `COPILOT_URL_ALLOWLIST` | 空 | 允许访问的域名（逗号分隔；空=任意公网，仍过 SSRF 检查） |
 
 ## 版本锁定与自检

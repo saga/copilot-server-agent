@@ -54,6 +54,8 @@ export const config = {
   sessionIdleTimeoutSeconds: Number(env('COPILOT_SESSION_IDLE_TIMEOUT', '0')) || undefined,
   // --- Runtime 连接：留空=SDK 自己拉起本地 runtime；K8s sidecar/远端填 http://127.0.0.1:4321 ---
   runtimeUrl: env('COPILOT_RUNTIME_URL', '') || undefined,
+  /** 启动时后台预热 runtime（首屏徽章与首个会话不用等 CLI 拉起；设 false 则纯懒加载） */
+  warmup: env('COPILOT_WARMUP', 'true') === 'true',
   // --- 本地 runtime 的数据目录（透传为 SDK baseDirectory → COPILOT_HOME；forUri 时被 runtime 侧忽略） ---
   // 缺省 ~/.copilot（与 runtime 默认一致；mode: "empty" 要求 client 级别显式设置，不可留空）
   baseDirectory: homeDir,
@@ -69,6 +71,13 @@ export const config = {
   urlAllowlist: parseList(env('COPILOT_URL_ALLOWLIST', '')),
   // --- 技能目录 allowlist（逗号分隔；留空=本地开发模式不限制；生产必须配） ---
   skillRoots: parseList(env('COPILOT_SKILL_ROOTS', '')),
+  // --- 执行审计：execution / tool evidence 的字段预览上限与内存保留量 ---
+  /** 单条 tool 参数/结果预览的最大字符数（超出只记长度，不保内容） */
+  evidenceMaxChars: Number(env('COPILOT_EVIDENCE_MAX_CHARS', '2000')) || 2000,
+  /** 内存保留的 execution 条数（超出按插入顺序淘汰最旧的） */
+  maxTrackedExecutions: Number(env('COPILOT_MAX_TRACKED_EXECUTIONS', '200')) || 200,
+  /** 单个 execution 最多记多少条 tool call（超出只累加计数） */
+  maxToolCallsPerExecution: Number(env('COPILOT_MAX_TOOL_CALLS', '100')) || 100,
   // --- 管理接口令牌（留空=不设防本地开发；生产设置后 /api/debug、/api/hooks 需带 x-admin-token） ---
   adminToken: env('COPILOT_ADMIN_TOKEN', '') || undefined,
   // --- MCP：filesystem 预设开关与授权目录（生产默认关；开则必须配 COPILOT_MCP_FS_DIR） ---

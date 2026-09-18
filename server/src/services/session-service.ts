@@ -28,7 +28,9 @@ import {
   type RegistryRecord,
   type SessionOwner,
 } from './session-registry.js';
-import { createPermissionHandler, createPreToolUseGuard } from './tool-policy.js';
+import { createPermissionHandler } from './tool-policy.js';
+import { createToolEvidenceHooks } from './tool-evidence.js';
+import { executionStore } from '../execution/index.js';
 
 export type { SessionOwner, RegistryRecord };
 
@@ -147,7 +149,7 @@ export interface DebugInfo {
   sdkVersion: string;
   provider: string;
   runtime: {
-    state: 'connected' | 'disconnected' | 'error';
+    state: 'connected' | 'idle' | 'error';
     lastError?: string;
     startError?: string;
     pingMs?: number;
@@ -165,9 +167,13 @@ export interface DebugInfo {
     runtimeUrl?: string;
     baseDirectory: string;
     workspaceRoot: string;
+    registryPath: string;
+    trustIdentityHeaders: boolean;
+    bashPolicy: string;
   };
   sessions: { attached: number; attachedIds: string[]; onDisk: number | null; listError?: string };
   hooks: { presets: number; recentEvents: number };
+  executions: { tracked: number; running: number; toolCalls: number };
   mcp: { presets: number; allowInlineLocal: boolean; allowInlineHttp: boolean };
 }
 
@@ -259,10 +265,27 @@ class SessionService {
     return this.starting;
   }
 
-  getStatus(): 'connected' | 'disconnected' | 'error' {
+  /**
+   * connected = client 已建连；idle = client 尚未创建（懒加载，首次会话操作/预热时才连）；
+   * error = 建连失败（详情见 lastError / copilotError）。
+   */
+  getStatus(): 'connected' | 'idle' | 'error' {
     if (this.client) return 'connected';
     if (this.lastError) return 'error';
-    return 'disconnected';
+    return 'idle';
+  }
+
+  /**
+   * 预热 runtime：进程启动时后台建连，避免「首屏徽章显示未启动、首个会话还要等 CLI 拉起来」。
+   * 失败不抛（错误记在 lastError，由 /api/health 与 /api/debug 暴露）。
+   */
+  async warmup(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      await this.getClient();
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, error: errMsg(e) };
+    }
   }
 
   getLastError(): string | null {
@@ -282,19 +305,23 @@ class SessionService {
       sdkVersion: sdkVersion(),
       provider: getActiveProvider().id,
       runtime: { state: this.getStatus(), ...(this.lastError ? { lastError: this.lastError } : {}) },
-      config: {
-        logLevel: config.logLevel ?? '(sdk default)',
-        ...(config.logDir ? { logDir: config.logDir } : {}),
-        ...(config.cliPath ? { cliPath: config.cliPath } : {}),
-        ...(config.sessionIdleTimeoutSeconds
-          ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
-          : {}),
-        ...(config.runtimeUrl ? { runtimeUrl: config.runtimeUrl } : {}),
-        baseDirectory: config.baseDirectory,
-        workspaceRoot: config.workspaceRoot,
-      },
+    config: {
+      logLevel: config.logLevel ?? '(sdk default)',
+      ...(config.logDir ? { logDir: config.logDir } : {}),
+      ...(config.cliPath ? { cliPath: config.cliPath } : {}),
+      ...(config.sessionIdleTimeoutSeconds
+        ? { sessionIdleTimeoutSeconds: config.sessionIdleTimeoutSeconds }
+        : {}),
+      ...(config.runtimeUrl ? { runtimeUrl: config.runtimeUrl } : {}),
+      baseDirectory: config.baseDirectory,
+      workspaceRoot: config.workspaceRoot,
+      registryPath: config.registryPath,
+      trustIdentityHeaders: config.trustIdentityHeaders,
+      bashPolicy: config.bashPolicy,
+    },
       sessions: { attached: this.sessions.size, attachedIds: [...this.sessions.keys()], onDisk: null },
       hooks: { presets: HOOK_PRESETS.length, recentEvents: hookEventCount() },
+      executions: executionStore.stats(),
       mcp: {
         presets: listMcp().presets.length,
         allowInlineLocal: config.allowInlineMcpLocal,
@@ -378,12 +405,13 @@ class SessionService {
       mcpServers: mcpServers ? Object.keys(mcpServers) : [],
     };
     // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设；
-    // workspace 守卫（onPreToolUse）为强制项，请求无法关闭
+    // 工具证据 + workspace 守卫（onPreToolUse/onPostToolUse/onPostToolUseFailure）为强制项，
+    // 请求无法关闭——审计链不能由调用方决定开不开
     const { hooks } = resolveHooks({
       enable: opts.hooks,
       sessionContext: opts.sessionContext,
       agentStopChecklist: opts.agentStopChecklist,
-      extraHooks: { onPreToolUse: createPreToolUseGuard(policyCtx) },
+      extraHooks: createToolEvidenceHooks(policyCtx),
     });
     return {
       model: resolved.model,

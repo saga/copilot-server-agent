@@ -34,7 +34,12 @@ export interface ToolPolicyContext {
   mcpServers: string[];
 }
 
-const ALLOW: PermissionRequestResult = { kind: 'approved' };
+/**
+ * 放行必须用 approve-once（与 SDK 的 approveAll 一致）：
+ * 类型联合里也有 `approved`，但那是“已批准”的状态回执，runtime 在 hook 响应
+ * 路径上不认它 —— 用了会报 `unexpected user permission response: approved`。
+ */
+const ALLOW: PermissionRequestResult = { kind: 'approve-once' };
 
 function deny(message: string): PermissionRequestResult {
   return { kind: 'denied-by-permission-request-hook', message, interrupt: false };
@@ -198,7 +203,7 @@ export function createPreToolUseGuard(ctx: ToolPolicyContext): PreToolUseHandler
     const outside = paths.filter((p) => !isWithinWorkspace(p, ctx.workspacePath));
     if (outside.length) {
       const reason = `工具 ${input.toolName} 只能操作 session workspace 内的路径：${outside.join(', ')}（workspace=${ctx.workspacePath}）`;
-      recordHookEvent(ctx.sessionId, 'tool-guard', `deny ${input.toolName} ${outside.join(', ')}`);
+      // 事件由 tool-evidence 统一记录（带 toolCallId/executionId），这里不重复写
       return { permissionDecision: 'deny', permissionDecisionReason: reason };
     }
     return undefined;

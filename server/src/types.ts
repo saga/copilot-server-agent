@@ -2,7 +2,11 @@ export interface HealthResponse {
   status: 'ok';
   uptime: number;
   timestamp: string;
-  copilot: 'connected' | 'disconnected' | 'error';
+  /**
+   * connected = client 已建连；idle = client 尚未创建（懒加载，首次会话操作时连）；
+   * error = 建连失败（详情见 copilotError）。判「runtime 能否 ping 通」用 /api/health/ready。
+   */
+  copilot: 'connected' | 'idle' | 'error';
   copilotError?: string;
 }
 

@@ -12,7 +12,8 @@ export interface Health {
   status: string;
   uptime: number;
   timestamp: string;
-  copilot: 'connected' | 'disconnected' | 'error';
+  /** idle = client 尚未创建（懒加载，首次会话操作时连）；判连接可用性看 /api/health/ready */
+  copilot: 'connected' | 'idle' | 'error';
   copilotError?: string;
 }
 

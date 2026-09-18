@@ -185,5 +185,10 @@ export function composeHooks(
           },
         }
       : {}),
+    // 工具证据（pre/post/post-failure）由 tool-evidence 注入，直接透传
+    ...(extraHooks.onPostToolUse ? { onPostToolUse: extraHooks.onPostToolUse } : {}),
+    ...(extraHooks.onPostToolUseFailure
+      ? { onPostToolUseFailure: extraHooks.onPostToolUseFailure }
+      : {}),
   };
 }

@@ -20,6 +20,13 @@ app.use(errorHandler);
 
 const server = app.listen(config.port, () => {
   console.log(`[server] listening on http://localhost:${config.port}`);
+  // 后台预热 runtime：不阻塞监听，失败只记日志（/api/health 会显示 error + 原因）
+  if (config.warmup) {
+    void sessionService.warmup().then((r) => {
+      if (r.ok) console.log('[server] copilot runtime 预热完成');
+      else console.warn(`[server] copilot runtime 预热失败：${r.error}（首个会话请求会重试）`);
+    });
+  }
 });
 
 // 优雅退出：SIGTERM → readiness 先 503（K8s 摘流）→ 关 HTTP（drain SSE/请求）→ 断 sessions → exit

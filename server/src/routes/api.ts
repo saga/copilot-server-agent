@@ -1,11 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import type { MCPServerConfig } from '@github/copilot-sdk';
+import type { CopilotSession, MCPServerConfig } from '@github/copilot-sdk';
 import {
   sessionService,
   assertValidSessionId,
   ownerFromHeaders,
 } from '../services/session-service.js';
+import {
+  executionStore,
+  type LlmUsageSample,
+} from '../execution/index.js';
 import { listProviderStatus } from '../providers/index.js';
 import {
   listMcp,
@@ -117,6 +121,25 @@ const chatSchema = z.object({
   streaming: z.boolean().optional().default(false),
   model: z.string().optional(),
 });
+
+/**
+ * usage 事件流入当前 execution 的累加器（execution-local，并发 turn 不串数据）。
+ * assistant.usage = 每次 LLM 调用的 token/耗时；session.usage_info = 上下文窗口水位。
+ */
+function attachUsageListener(session: CopilotSession, executionId: string): () => void {
+  const offUsage = session.on('assistant.usage', (evt) => {
+    const data = (evt as unknown as { data?: LlmUsageSample }).data;
+    if (data) executionStore.addUsage(executionId, data);
+  });
+  const offInfo = session.on('session.usage_info', (evt) => {
+    const data = (evt as unknown as { data?: { tokenLimit?: number } }).data;
+    executionStore.setContextWindow(executionId, data?.tokenLimit);
+  });
+  return () => {
+    offUsage();
+    offInfo();
+  };
+}
 
 /** GET /api/providers — 通道列表与当前生效项（是否配好 key 一目了然） */
 apiRouter.get('/providers', (_req, res) => {
@@ -319,13 +342,18 @@ apiRouter.delete('/sessions/:id', async (req, res, next) => {
 
 /**
  * POST /api/sessions/:id/chat
- * - { streaming: false } → 等待完成，一次性返回 { sessionId, content }
- * - { streaming: true }  → SSE：event: delta / message / subagent / done / error
+ * - { streaming: false } → 等待完成，一次性返回 { sessionId, executionId, content, usage }
+ * - { streaming: true }  → SSE：event: execution / delta / message / subagent / done / error
  *   （subagent.* 为 custom agent 生命周期事件，原样透传，含 agentId/agentName 等）
+ *
+ * 每次请求 = 一个 execution（session 与 execution 是两层：审计/usage/工具证据/取消
+ * 全部挂在 executionId 上，不挂 sessionId）。
  */
 apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
   /** SSE 已开流后的错误收尾（写 error 帧 + 停心跳 + 摘监听），由下面 SSE 分支赋值 */
   let sseFail: ((err: unknown) => void) | null = null;
+  /** execution 终态兜底：任何路径出错/取消都在这里落 failed/cancelled */
+  let executionId: string | null = null;
   try {
     const body = chatSchema.parse(req.body ?? {});
     const owner = ownerFromHeaders(req.headers);
@@ -344,19 +372,52 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
     }
     void sessionService.touch(session.sessionId);
 
+    const execution = executionStore.start({
+      sessionId: session.sessionId,
+      owner,
+      prompt: body.prompt,
+      model: body.model,
+      streaming: !!body.streaming,
+    });
+    executionId = execution.executionId;
+
     if (!body.streaming) {
-      const content = await sessionService.withSessionLock(session.sessionId, async () => {
-        if (body.model) {
-          await session.setModel(body.model);
-        }
-        const finalEvent = await session.sendAndWait({ prompt: body.prompt });
-        return (
-          // sendAndWait 返回 AssistantMessageEvent | undefined
-          (finalEvent as unknown as { data?: { content?: string } } | undefined)?.data
-            ?.content ?? ''
-        );
-      });
-      return res.json({ sessionId: session.sessionId, content });
+      try {
+        const content = await sessionService.withSessionLock(session.sessionId, async () => {
+          executionStore.setActive(session.sessionId, execution.executionId);
+          const offUsage = attachUsageListener(session, execution.executionId);
+          try {
+            if (body.model) {
+              await session.setModel(body.model);
+            }
+            const finalEvent = await session.sendAndWait({ prompt: body.prompt });
+            return (
+              // sendAndWait 返回 AssistantMessageEvent | undefined
+              (finalEvent as unknown as { data?: { content?: string } } | undefined)?.data
+                ?.content ?? ''
+            );
+          } finally {
+            offUsage();
+            executionStore.clearActive(session.sessionId, execution.executionId);
+          }
+        });
+        executionStore.finish(execution.executionId, {
+          status: 'completed',
+          contentChars: content.length,
+        });
+        return res.json({
+          sessionId: session.sessionId,
+          executionId: execution.executionId,
+          content,
+          usage: executionStore.get(execution.executionId)?.usage,
+        });
+      } catch (err) {
+        executionStore.finish(execution.executionId, {
+          status: 'failed',
+          error: err instanceof Error ? err.message : String(err),
+        });
+        throw err;
+      }
     }
 
     // ---- SSE 流式 ----
@@ -371,6 +432,9 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
       res.write(`data: ${JSON.stringify(data)}\n\n`);
     };
 
+    // 首个帧就把 executionId 给客户端：之后 tool 证据/usage/报错都能按它对齐
+    send('execution', { executionId: execution.executionId, sessionId: session.sessionId });
+
     // Ingress/ALB 空闲超时保护：长推理无输出时保活
     const heartbeat = setInterval(() => {
       if (!res.writableEnded) {
@@ -380,8 +444,18 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
 
     let finished = false;
     let turnRunning = false;
+    let chars = 0;
     let offs: Array<() => void> = [];
-    sseFail = (err) => finish('error', { error: (err as Error).message });
+    /** execution 终态（幂等：非 running 时 store 不再改） */
+    const settle = (
+      status: 'completed' | 'failed' | 'cancelled',
+      extra: { error?: string; contentChars?: number } = {},
+    ) => executionStore.finish(execution.executionId, { status, ...extra });
+    sseFail = (err) => {
+      const message = err instanceof Error ? err.message : String(err);
+      settle('failed', { error: message });
+      finish('error', { error: message });
+    };
 
     const finish = (event: 'done' | 'error', data: unknown) => {
       if (finished) return;
@@ -400,6 +474,7 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
     // 注意是 abort 当前 turn，不是断开 session：之后还能继续对话。
     req.on('close', () => {
       if (turnRunning && !finished) {
+        settle('cancelled');
         void sessionService.abortTurn(session.sessionId).catch(() => undefined);
       }
       finished = true; // 客户端已走，后面的写一律跳过
@@ -418,7 +493,10 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
       const offDelta = session.on('assistant.message_delta', (evt) => {
         const delta = (evt as unknown as { data?: { deltaContent?: string } }).data
           ?.deltaContent;
-        if (delta) send('delta', { delta });
+        if (delta) {
+          chars += delta.length;
+          send('delta', { delta });
+        }
       });
       const offMsg = session.on('assistant.message', (evt) => {
         const content = (evt as unknown as { data?: { content?: string } }).data?.content;
@@ -430,12 +508,18 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
         if (typeof t === 'string' && t.startsWith('subagent.')) send('subagent', evt);
       });
       const offIdle = session.on('session.idle', () => {
-        finish('done', { sessionId: session.sessionId });
+        settle('completed', { contentChars: chars });
+        finish('done', {
+          sessionId: session.sessionId,
+          executionId: execution.executionId,
+          usage: executionStore.get(execution.executionId)?.usage,
+        });
       });
-      offs = [offDelta, offMsg, offAll, offIdle];
+      offs = [offDelta, offMsg, offAll, offIdle, attachUsageListener(session, execution.executionId)];
 
       turnRunning = true;
       sessionService.markTurnActive(session.sessionId);
+      executionStore.setActive(session.sessionId, execution.executionId);
       try {
         if (body.model) {
           await session.setModel(body.model);
@@ -443,14 +527,27 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
         await session.sendAndWait({ prompt: body.prompt });
       } finally {
         turnRunning = false;
+        executionStore.clearActive(session.sessionId, execution.executionId);
         for (const off of offs) off();
         offs = [];
       }
     });
     // sendAndWait 已等到 idle；idle 监听若未触发（少见）在这里兜底收尾
-    finish('done', { sessionId: session.sessionId });
+    settle('completed', { contentChars: chars });
+    finish('done', {
+      sessionId: session.sessionId,
+      executionId: execution.executionId,
+      usage: executionStore.get(execution.executionId)?.usage,
+    });
     return undefined;
   } catch (err) {
+    // 未开流的错误：execution 落 failed（SSE 分支由 sseFail 统一收尾）
+    if (executionId) {
+      executionStore.finish(executionId, {
+        status: 'failed',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     // SSE 已开始写头时不能再 next(err) 走 JSON：交给 SSE 自己的收尾（停心跳/摘监听/结束响应）
     if (res.headersSent) {
       sseFail?.(err);
@@ -459,4 +556,30 @@ apiRouter.post('/sessions/:id/chat', async (req, res, next) => {
     }
     return next(err);
   }
+});
+
+/** GET /api/executions — 最近 execution 记录（审计：usage + tool 证据；可按 sessionId 过滤） */
+apiRouter.get('/executions', requireAdmin, (req, res) => {
+  const limit = Math.max(1, Math.min(500, Number(req.query.limit ?? 50) || 50));
+  const sessionId = typeof req.query.sessionId === 'string' ? req.query.sessionId : undefined;
+  // 多租户（身份头可信）时按调用方过滤；单租户部署返回全部
+  const owner = config.trustIdentityHeaders ? ownerFromHeaders(req.headers) : undefined;
+  res.json({
+    executions: executionStore.list({ sessionId, owner, limit }),
+    stats: executionStore.stats(),
+  });
+});
+
+/** GET /api/executions/:id — 单条 execution（含 toolCalls 与 usage） */
+apiRouter.get('/executions/:id', requireAdmin, (req, res) => {
+  const id = String(req.params.id);
+  const record = executionStore.get(id);
+  if (!record) return res.status(404).json({ error: `execution 不存在："${req.params.id}"` });
+  if (config.trustIdentityHeaders) {
+    const owner = ownerFromHeaders(req.headers);
+    if (record.tenantId !== owner.tenantId || record.userId !== owner.userId) {
+      return res.status(403).json({ error: `无权访问 execution："${req.params.id}"` });
+    }
+  }
+  return res.json(record);
 });
