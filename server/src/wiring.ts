@@ -1,5 +1,5 @@
 import { config } from './config.js';
-import { isDatabaseEnabled } from './db/pool.js';
+import { currentBackend, sqliteFilePath } from './db/connection.js';
 import { ActionService } from './actions/action-service.js';
 import { ApprovalService } from './approval/approval-service.js';
 import { ExecutionService } from './execution/execution-service.js';
@@ -7,38 +7,36 @@ import {
   MemoryEventRepository,
   MemoryExecutionRepository,
 } from './execution/memory-repository.js';
-import {
-  PostgresEventRepository,
-  PostgresExecutionRepository,
-} from './execution/postgres-repository.js';
+import { SqlEventRepository, SqlExecutionRepository } from './execution/sql-repository.js';
 import type { EventRepository, ExecutionRepository } from './execution/repository.js';
 import { HumanTaskService } from './human-tasks/human-task-service.js';
 import { MemoryHumanTaskRepository } from './human-tasks/memory-repository.js';
-import { PostgresHumanTaskRepository } from './human-tasks/postgres-repository.js';
+import { SqlHumanTaskRepository } from './human-tasks/sql-repository.js';
 import type { HumanTaskRepository } from './human-tasks/repository.js';
 
 /**
- * 依赖装配（唯一一处决定用 PostgreSQL 还是内存实现的地方）。
+ * 依赖装配（唯一一处决定用哪个后端的地方）。
  *
- *   routes → services → repositories → PostgreSQL | Memory
+ *   routes → services → repositories → SQLite（默认）| PostgreSQL（配 DATABASE_URL）
  *
- * 配了 DATABASE_URL 就走 PG（durable：execution/human task/approval/event 跨重启存活）；
- * 否则内存实现，仅适合单副本本地开发。
+ * 两种后端共用同一份 SQL 仓储实现，差别只在方言与部署形态；内存实现只给单测用
+ * （`COPILOT_STATE_BACKEND=memory` 可强制，用于不落盘的临时验证）。
  */
 
-const usePostgres = isDatabaseEnabled();
+const useMemory = config.stateBackend === 'memory';
+const backend = useMemory ? 'memory' : currentBackend();
 
-export const executionRepository: ExecutionRepository = usePostgres
-  ? new PostgresExecutionRepository()
-  : new MemoryExecutionRepository();
+export const executionRepository: ExecutionRepository = useMemory
+  ? new MemoryExecutionRepository()
+  : new SqlExecutionRepository();
 
-export const eventRepository: EventRepository = usePostgres
-  ? new PostgresEventRepository()
-  : new MemoryEventRepository();
+export const eventRepository: EventRepository = useMemory
+  ? new MemoryEventRepository()
+  : new SqlEventRepository();
 
-export const humanTaskRepository: HumanTaskRepository = usePostgres
-  ? new PostgresHumanTaskRepository()
-  : new MemoryHumanTaskRepository();
+export const humanTaskRepository: HumanTaskRepository = useMemory
+  ? new MemoryHumanTaskRepository()
+  : new SqlHumanTaskRepository();
 
 export const approvalService = new ApprovalService({
   allowInitiatorApproval: config.allowInitiatorApproval,
@@ -61,12 +59,14 @@ export const humanTaskService = new HumanTaskService({
 
 executionService.bindHumanTasks(humanTaskService);
 
-export const stateBackend: 'postgres' | 'memory' = usePostgres ? 'postgres' : 'memory';
+export type StateBackend = 'postgres' | 'sqlite' | 'memory';
 
-if (usePostgres) {
-  console.log('[wiring] durable state = PostgreSQL（execution/human task/approval/event）');
+export const stateBackend: StateBackend = backend;
+
+if (backend === 'memory') {
+  console.warn('[wiring] durable state = 内存（COPILOT_STATE_BACKEND=memory）：重启后 execution 与审批中的任务丢失');
+} else if (backend === 'postgres') {
+  console.log('[wiring] durable state = PostgreSQL（execution/human task/approval/event/ownership）');
 } else {
-  console.warn(
-    '[wiring] durable state = 内存（未配 DATABASE_URL）：execution 与审批中的任务在重启后丢失',
-  );
+  console.log(`[wiring] durable state = SQLite：${sqliteFilePath()}`);
 }

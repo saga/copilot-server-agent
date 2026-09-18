@@ -5,7 +5,7 @@ import type { HumanTask, HumanTaskFilter } from './types.js';
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
 
-/** 内存实现（单副本/单测）。生产用 PostgresHumanTaskRepository。 */
+/** 内存实现（单测/强制内存后端）。运行期用 SqlHumanTaskRepository（SQLite 或 PostgreSQL）。 */
 export class MemoryHumanTaskRepository implements HumanTaskRepository {
   private tasks = new Map<string, HumanTask>();
   private decisions = new Map<string, HumanTaskDecision[]>();

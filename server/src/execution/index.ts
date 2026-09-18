@@ -7,9 +7,9 @@ export {
   MemoryExecutionRepository,
 } from './memory-repository.js';
 export {
-  PostgresEventRepository,
-  PostgresExecutionRepository,
-} from './postgres-repository.js';
+  SqlEventRepository,
+  SqlExecutionRepository,
+} from './sql-repository.js';
 export type { EventRepository, ExecutionRepository, ExecutionStats } from './repository.js';
 export {
   ALLOWED_TRANSITIONS,
@@ -37,4 +37,5 @@ export {
   executionService,
   humanTaskService,
   stateBackend,
+  type StateBackend,
 } from '../wiring.js';

@@ -19,7 +19,12 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 
 单独启动：`npm run dev:server` / `npm run dev:client`；构建：`npm run build`；类型检查：`npm run typecheck`；测试：`npm run test`。
 
-架构设计（分层、execution 状态机、HITL 审批、审计分层、PostgreSQL schema）见 [`docs/architecture.md`](docs/architecture.md)。
+**状态存储零配置**：默认用 SQLite（Node 内置 `node:sqlite`，不装任何依赖），库文件落在
+`$COPILOT_HOME/agent.db`，首次启动自动建表 —— 开箱即 durable：会话归属、execution 审计、
+审批中的任务都跨进程重启存活。要换 PostgreSQL 只需配 `DATABASE_URL`（见
+[Durable state](#durable-state)），代码无需改动。
+
+架构设计（分层、execution 状态机、HITL 审批、审计分层、数据模型）见 [`docs/architecture.md`](docs/architecture.md)。
 
 ## API 契约（React → Express）
 
@@ -86,7 +91,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 
 参考官方 session-persistence / mcp 两篇文档：
 
-- **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 按归属列会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。归属存 `COPILOT_REGISTRY_PATH`，重启后不会退化成“谁先访问谁认领”。
+- **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 按归属列会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。归属与 execution 同库（默认 SQLite），重启后不会退化成“谁先访问谁认领”。
 - **MCP**（`server/src/mcp/registry.ts`）：内置 `filesystem` 预设（官方 server，授权目录限定仓库根，可用 `COPILOT_MCP_FS_DIR` 改、`COPILOT_MCP_FILESYSTEM=false` 关）；运维经 `COPILOT_MCP_SERVERS`（JSON）预置额外 servers；前端建会话用 `mcp: [...]` 按名启用、`disabledMcpServers` 精确禁用。安全门：内联 `local/stdio` MCP = 在服务器执行任意命令，默认 400 拒绝（`COPILOT_ALLOW_INLINE_MCP_LOCAL=true` 才放行）；内联 `http/sse` 默认允许。`GET /api/mcp` 只返回元信息，headers/env 密钥永不外泄。
 
 ## 并发隔离与多租户安全
@@ -98,7 +103,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 | attach lock | `sessionAttachLocks` | 并发首访只 resume 一次，避免同一 runtime session 双附着 |
 | chat lock | `withSessionLock` 覆盖整个 `sendAndWait()` | `session.send()` 只是入队就返回，锁必须持续到 `session.idle`，否则同一 session 两个 turn 会同时写 workspace |
 | lifecycle lock | `disconnect` / `permanent delete` 走同一个 session lock | 不在 agent 正在写文件时删 workspace / 删 runtime session |
-| Session Registry | `server/src/services/session-registry.ts`（`DATABASE_URL` 有值走 PostgreSQL，否则持久 JSON） | 重启后归属不丢，杜绝“谁先访问谁认领” |
+| Session Registry | `server/src/services/session-registry.ts`（`SqlRegistryStore`，与 execution 同库） | 重启后归属不丢，杜绝“谁先访问谁认领” |
 | 全局并发闸门 | `server/src/services/concurrency.ts` | `COPILOT_MAX_CONCURRENT_EXECUTIONS`：限制同时运行的 agent turn，避免 N 个用户烧满 runtime |
 | 工具授权 | `server/src/services/tool-policy.ts` | 取代 `approveAll`：write 限 workspace、bash 按策略、MCP 按会话启用名单、URL 过 SSRF + 域名 allowlist |
 | 执行前守卫 | `onPreToolUse`（强制 hook，请求关不掉） | 写类工具路径必须在 session workspace |
@@ -111,20 +116,43 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 - **断开**：客户端断开 = `session.abort()` 当前 turn（不是断开 session），之后还能继续对话。
 - **workspace 是软隔离**：`workingDirectory` 只是默认 cwd，`bash` 仍能 `cd` 出去。策略层按 `possiblePaths` 拦截、写类工具按路径拦截；不可信代码场景仍需 per-request container。
 
-### Durable state（PostgreSQL）
+### Durable state（默认 SQLite，可配 PostgreSQL）
 
 execution / human task / approval / event / session ownership 都是业务状态，必须跨 Pod 重启存活
-（否则“审批中的任务”会在重启后消失）。配 `DATABASE_URL` 即切到 PostgreSQL：
+（否则“审批中的任务”会在重启后消失）。
+
+**默认：SQLite，零配置。** 用 Node 内置的 `node:sqlite`，不装任何依赖，也不需要迁移命令：
 
 ```bash
-npm i pg                                                     # 可选依赖，未配 DATABASE_URL 时不需要
-psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
+# 什么都不用做。库文件默认落在 $COPILOT_HOME/agent.db（首次启动自动建表）
+COPILOT_DB_PATH=/var/lib/copilot/agent.db npm run dev:server   # 需要改路径时
 ```
 
-五张表：`agent_session`、`agent_execution`、`human_task`、`human_task_decision`、`execution_event`
-（完整 DDL 见迁移文件）。未配 `DATABASE_URL` 时全部走内存实现，启动日志会打印
-`durable state = 内存` 警告。仓储接口在 `execution/repository.ts` 与 `human-tasks/repository.ts`，
-业务层只认接口，换存储不改代码。
+**可选：PostgreSQL**（多副本 / 已有数据库 / 需要集中备份时）：
+
+```bash
+npm i pg                                                     # 可选依赖，不用 PG 时不需要装
+psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
+DATABASE_URL=postgres://user:pass@host:5432/copilot npm run dev:server
+```
+
+五张表：`agent_session`、`agent_execution`、`human_task`、`human_task_decision`、`execution_event`。
+两种后端**共用同一份 SQL 仓储实现**（`execution|human-tasks/sql-repository.ts`），
+差异只有方言，收敛在 `server/src/db/dialect.ts`：占位符、JSON 列编解码、布尔/时间戳表示、
+JSON 数组命中判定、聚合取整。业务层只认 `repository.ts` 里的接口，换存储不改代码。
+
+依赖装配在 `server/src/wiring.ts`（唯一一处决定后端的地方），启动日志会打印实际后端：
+
+```text
+[wiring] durable state = SQLite：/Users/you/.copilot/agent.db
+[wiring] durable state = PostgreSQL（execution/human task/approval/event/ownership）
+```
+
+`COPILOT_STATE_BACKEND=memory` 可强制内存实现（不落盘，重启即丢，仅临时验证）。
+
+**SQLite 的部署约束**：单文件、单写者，因此必须单副本部署（`k8s/deployment.yaml` 已固定
+`replicas: 1`），库文件必须落在持久卷上。需要多副本时切 PostgreSQL —— 但注意 session 锁与
+session 对象仍是进程内的，多副本还需分布式锁。
 
 ## Execution Record（执行审计）
 
@@ -156,7 +184,7 @@ session ── execution #1 ── LLM ── tool ── tool
 
 | 组成 | 位置 | 说明 |
 |------|------|------|
-| ExecutionService + Repository | `server/src/execution/execution-service.ts`（仓储：memory / postgres） | 生命周期与状态机；配了 `DATABASE_URL` 就持久化，否则内存 LRU（`COPILOT_MAX_TRACKED_EXECUTIONS`） |
+| ExecutionService + Repository | `server/src/execution/execution-service.ts`（仓储：`sql-repository.ts` 一份实现跑 SQLite/PG，另有 memory） | 生命周期与状态机；默认 SQLite 落盘，`COPILOT_STATE_BACKEND=memory` 时走内存 LRU（`COPILOT_MAX_TRACKED_EXECUTIONS`） |
 | ExecutionEvent | `server/src/execution/events.ts` | 审计**时间线**（`GET /api/executions/:id/events`）：ExecutionRecord 只存当前状态，回答不了“谁批准 / 何时 / 依据什么” |
 | Usage | `server/src/execution/usage.ts` | **execution-local** 累加器：并发 turn 不串数据。监听 `assistant.usage`（token/耗时/模型）+ `session.usage_info`（上下文窗口） |
 | 工具证据 | `server/src/services/tool-evidence.ts` | `onPreToolUse` 开条（toolCallId/参数/守卫裁决）→ `onPostToolUse` / `onPostToolUseFailure` 收口（结果/错误/耗时） |
@@ -199,14 +227,16 @@ agent 侧入口（可选）：`scripts/governance-mcp.mjs` 是 stdio MCP server�
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `COPILOT_TRUST_IDENTITY_HEADERS` | `false` | 是否信任 `x-tenant-id`/`x-user-id`；仅网关注入时才开 |
-| `COPILOT_REGISTRY_PATH` | `$COPILOT_HOME/session-registry.json` | Session Registry 落盘位置；K8s 必须指到持久卷 |
 | `COPILOT_BASH_POLICY` | `workspace` | `workspace`=命令涉及路径须在 workspace；`allow`=放行；`deny`=禁止 bash |
 | `COPILOT_WARMUP` | `true` | 启动时后台预热 runtime（首屏徽章与首个会话不必等 CLI 拉起）；`false`=纯懒加载 |
 | `COPILOT_URL_ALLOWLIST` | 空 | 允许访问的域名（逗号分隔；空=任意公网，仍过 SSRF 检查） |
 | `COPILOT_EVIDENCE_MAX_CHARS` | `2000` | 单条 tool 参数/结果预览的最大字符数（超出只记长度） |
-| `COPILOT_MAX_TRACKED_EXECUTIONS` | `200` | 内存模式下保留的 execution 条数 |
+| `COPILOT_MAX_TRACKED_EXECUTIONS` | `200` | **内存后端**保留的 execution 条数（SQLite/PG 模式下不生效） |
 | `COPILOT_MAX_TOOL_CALLS` | `100` | 单个 execution 最多记多少条 tool call |
-| `DATABASE_URL` | 空 | 留空=内存实现（重启即丢）；配置后 execution/human task/approval/event/ownership 全部落 PostgreSQL。非空时必须是 `postgres://` / `postgresql://`，否则启动即失败 |
+| `COPILOT_STATE_BACKEND` | `auto` | `auto`=按 `DATABASE_URL` 自动选（默认 SQLite）；`memory`=不落盘，仅临时验证 |
+| `COPILOT_DB_PATH` | `$COPILOT_HOME/agent.db` | SQLite 库文件路径（K8s 必须指到持久卷） |
+| `COPILOT_SQLITE_EXTENSIONS` | 空 | 可选 SQLite 扩展（逗号分隔绝对路径），如 sqlite-vec |
+| `DATABASE_URL` | 空 | 留空=用 SQLite；配置后 execution/human task/approval/event/ownership 全部落 PostgreSQL。非空时必须是 `postgres://` / `postgresql://`，否则启动即失败 |
 | `COPILOT_MAX_CONCURRENT_EXECUTIONS` | `0` | 全进程同时运行的 agent turn 上限（`0`=不限） |
 | `COPILOT_HUMAN_TASK_TTL` | `86400` | Human Task 默认 TTL（秒，`0`=不过期）；到期 `OPEN → EXPIRED` |
 | `COPILOT_HUMAN_TASK_SWEEP` | `60` | 过期扫描间隔（秒） |
@@ -247,13 +277,13 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 - `server/src/services/session-registry.ts` — 持久归属表 + resume 用会话配置（凭证不落库）
 - `server/src/services/tool-policy.ts` — 工具授权 policy + `onPreToolUse` workspace 守卫
 - `server/src/services/tool-evidence.ts` — 工具证据 hook（toolCallId / 裁决 / 耗时 / 脱敏结果）
-- `server/src/execution/` — `execution-service.ts`（生命周期 + 状态机 + HITL）、`repository.ts`（memory/postgres 仓储）、`events.ts`（审计时间线）、`hash.ts`（actionHash）、`usage.ts`、`redact.ts`
+- `server/src/execution/` — `execution-service.ts`（生命周期 + 状态机 + HITL）、`sql-repository.ts`（SQLite/PG 共用的 SQL 仓储）、`memory-repository.ts`（单测用）、`events.ts`（审计时间线）、`hash.ts`（actionHash）、`usage.ts`、`redact.ts`
 - `server/src/human-tasks/` — HumanTask + Decision（审批与人工输入统一抽象）、`assignment.ts`（资格判定）
 - `server/src/approval/` — `approval-policy.ts`（ANY/ALL/N_OF_M/SEQUENTIAL）、`approval-service.ts`（谁能批、几票、顺序）
 - `server/src/actions/` — `action-registry.ts`（server-controlled executor）、`action-service.ts`（业务动作策略裁决 + hash/版本复核）
 - `server/src/agent/` — `agent-runner.ts`（Copilot SDK 事件收口）、`agent-context.ts`（turn 级 execution 上下文）
-- `server/src/db/` — `pool.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql`
-- `server/src/wiring.ts` — 依赖装配（唯一决定 PostgreSQL vs 内存的地方）
+- `server/src/db/` — `connection.ts`（后端选择）、`dialect.ts`（SQL 方言钩子）、`sqlite.ts` + `sqlite-schema.ts`（默认后端，schema 内嵌自动应用）、`postgres.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql`（PG 版 DDL）
+- `server/src/wiring.ts` — 依赖装配（唯一决定 SQLite / PostgreSQL / 内存的地方）
 - `server/src/services/workspace-service.ts` — session workspace（路径是 sessionId 的确定性哈希）
 - `server/src/routes/` — `api.ts`（挂载）+ `sessions.ts` / `executions.ts` / `human-tasks.ts` / `meta.ts` / `shared.ts`
 

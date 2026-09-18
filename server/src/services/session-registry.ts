@@ -1,6 +1,5 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
-import { getSql, isDatabaseEnabled, type SqlRow } from '../db/pool.js';
+import { currentDialect, getDb } from '../db/connection.js';
+import type { SqlRow } from '../db/dialect.js';
 import type { CustomAgentConfig } from '@github/copilot-sdk';
 
 /** 会话归属（K8s/多租户的 ownership 概念；单租户时为 default/default） */
@@ -51,8 +50,8 @@ export interface RegistryRecord {
  * - 只靠进程内存 Map，Pod 重启后 owners 清空 → “谁第一次访问谁认领 session”（安全漏洞）
  * - 官方多租户文档要求 resume/delete 前做访问控制；Copilot session id 本身不构成边界
  *
- * 存储后端：配了 DATABASE_URL 走 PostgreSQL（agent_session 表），否则单文件 JSON
- * （原子写 + 串行化写入）。接口全部 async，换存储不需要改调用方。
+ * 存储后端：统一落在 SQL 库的 `agent_session` 表 —— 默认 SQLite（单文件，零配置），
+ * 配了 DATABASE_URL 则 PostgreSQL。接口全部 async，换存储不需要改调用方。
  */
 
 export interface RegistryStore {
@@ -61,78 +60,19 @@ export interface RegistryStore {
   remove(sessionId: string): Promise<void>;
 }
 
-export class FileRegistryStore implements RegistryStore {
-  private records = new Map<string, RegistryRecord>();
-  private loaded: Promise<void> | null = null;
-
-  constructor(private readonly filePath: string) {}
-
-  private async load(): Promise<void> {
-    if (!this.loaded) {
-      this.loaded = (async () => {
-        try {
-          const raw = await readFile(this.filePath, 'utf-8');
-          const parsed = JSON.parse(raw) as { sessions?: RegistryRecord[] } | RegistryRecord[];
-          const list = Array.isArray(parsed) ? parsed : (parsed.sessions ?? []);
-          for (const r of list) {
-            if (r && typeof r.sessionId === 'string') this.records.set(r.sessionId, r);
-          }
-        } catch (err) {
-          const code = (err as NodeJS.ErrnoException).code;
-          if (code !== 'ENOENT') {
-            console.warn(
-              `[registry] 读取失败（按空注册表继续）${this.filePath}：${
-                err instanceof Error ? err.message : String(err)
-              }`,
-            );
-          }
-        }
-      })();
-    }
-    return this.loaded;
-  }
-
-  /** 原子写：tmp + rename，避免进程被杀留下半截 JSON */
-  private async flush(): Promise<void> {
-    const payload = JSON.stringify({ sessions: [...this.records.values()] }, null, 2);
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.tmp`;
-    await writeFile(tmp, payload, 'utf-8');
-    await rename(tmp, this.filePath);
-  }
-
+export class SqlRegistryStore implements RegistryStore {
   async all(): Promise<RegistryRecord[]> {
-    await this.load();
-    return [...this.records.values()];
-  }
-
-  async upsert(record: RegistryRecord): Promise<RegistryRecord> {
-    await this.load();
-    this.records.set(record.sessionId, record);
-    await this.flush();
-    return record;
-  }
-
-  async remove(sessionId: string): Promise<void> {
-    await this.load();
-    this.records.delete(sessionId);
-    await this.flush();
-  }
-}
-
-export class PostgresRegistryStore implements RegistryStore {
-  async all(): Promise<RegistryRecord[]> {
-    const sql = getSql();
-    const { rows } = await sql.query<SqlRow>('select * from agent_session');
+    const { rows } = await getDb().query<SqlRow>('select * from agent_session');
     return rows.map((r) => this.toRecord(r));
   }
 
   async upsert(record: RegistryRecord): Promise<RegistryRecord> {
-    const sql = getSql();
-    const { rows } = await sql.query<SqlRow>(
+    const dialect = currentDialect();
+    const ph = (i: number): string => dialect.ph(i);
+    const { rows } = await getDb().query<SqlRow>(
       `insert into agent_session
          (session_id, tenant_id, user_id, workspace_path, status, config, created_at, updated_at, last_used_at)
-       values ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       values (${ph(1)},${ph(2)},${ph(3)},${ph(4)},${ph(5)},${ph(6)},${ph(7)},${ph(8)},${ph(9)})
        on conflict (session_id) do update set
          tenant_id = excluded.tenant_id,
          user_id = excluded.user_id,
@@ -149,31 +89,30 @@ export class PostgresRegistryStore implements RegistryStore {
         record.workspacePath,
         record.status,
         JSON.stringify(record.config ?? {}),
-        record.createdAt,
-        new Date().toISOString(),
-        record.lastUsedAt,
+        dialect.tsParam(record.createdAt),
+        dialect.tsParam(new Date().toISOString()),
+        record.lastUsedAt ? dialect.tsParam(record.lastUsedAt) : null,
       ],
     );
     return this.toRecord(rows[0]!);
   }
 
   async remove(sessionId: string): Promise<void> {
-    const sql = getSql();
-    await sql.query('delete from agent_session where session_id = $1', [sessionId]);
+    const dialect = currentDialect();
+    await getDb().query(`delete from agent_session where session_id = ${dialect.ph(1)}`, [sessionId]);
   }
 
   private toRecord(r: SqlRow): RegistryRecord {
-    const iso = (v: unknown): string =>
-      v instanceof Date ? v.toISOString() : String(v ?? new Date(0).toISOString());
+    const dialect = currentDialect();
     return {
       sessionId: String(r.session_id),
       tenantId: String(r.tenant_id),
       userId: String(r.user_id),
       workspacePath: String(r.workspace_path),
-      createdAt: iso(r.created_at),
-      lastUsedAt: iso(r.last_used_at ?? r.created_at),
+      createdAt: dialect.ts(r.created_at) ?? new Date(0).toISOString(),
+      lastUsedAt: dialect.ts(r.last_used_at ?? r.created_at) ?? new Date(0).toISOString(),
       status: r.status as RegistryRecord['status'],
-      ...(r.config ? { config: r.config as PersistedSessionConfig } : {}),
+      ...(r.config ? { config: dialect.json<PersistedSessionConfig>(r.config) } : {}),
     };
   }
 }
@@ -288,6 +227,7 @@ export class SessionRegistry {
   }
 }
 
-export function createRegistryStore(filePath: string): RegistryStore {
-  return isDatabaseEnabled() ? new PostgresRegistryStore() : new FileRegistryStore(filePath);
+/** 归属表与 execution / human task 同库：默认 SQLite，配 DATABASE_URL 则 PostgreSQL */
+export function createRegistryStore(): RegistryStore {
+  return new SqlRegistryStore();
 }

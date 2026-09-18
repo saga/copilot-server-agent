@@ -36,17 +36,27 @@ function parseBashPolicy(raw: string): BashPolicy {
 }
 
 /**
- * Durable state 连接的 scheme 校验。
- * 留空=内存实现。一旦给了值就当作生产连接串：占位值/拼错的 scheme 会让服务切到 PG 模式
+ * PostgreSQL 连接串校验。
+ * 留空=用 SQLite（默认）。一旦给了值就当作生产连接串：占位值/拼错的 scheme 会让服务切到 PG 模式
  * 却连不上，启动即失败比“上线后审批全 500”好排查。
  */
 function parseDatabaseUrl(raw: string): string | undefined {
   const v = raw.trim();
   if (!v) return undefined;
   if (!/^postgres(ql)?:\/\//i.test(v)) {
-    throw new Error(`DATABASE_URL 非法：必须以 postgres:// 或 postgresql:// 开头（留空=内存实现）`);
+    throw new Error(`DATABASE_URL 非法：必须以 postgres:// 或 postgresql:// 开头（留空=用 SQLite）`);
   }
   return v;
+}
+
+/** 状态后端强制开关：留空/auto = 按 DATABASE_URL 自动选；memory = 不落盘（临时验证用） */
+const STATE_BACKENDS = ['auto', 'memory'] as const;
+export type StateBackendSetting = (typeof STATE_BACKENDS)[number];
+
+function parseStateBackend(raw: string): StateBackendSetting {
+  const v = raw.trim() || 'auto';
+  if ((STATE_BACKENDS as readonly string[]).includes(v)) return v as StateBackendSetting;
+  throw new Error(`COPILOT_STATE_BACKEND 非法："${raw}"，可选：${STATE_BACKENDS.join(' | ')}`);
 }
 
 const homeDir = env('COPILOT_HOME', '') || path.join(os.homedir(), '.copilot');
@@ -73,9 +83,8 @@ export const config = {
   // --- 本地 runtime 的数据目录（透传为 SDK baseDirectory → COPILOT_HOME；forUri 时被 runtime 侧忽略） ---
   // 缺省 ~/.copilot（与 runtime 默认一致；mode: "empty" 要求 client 级别显式设置，不可留空）
   baseDirectory: homeDir,
-  // --- Session Registry：ownership 持久化（重启/换 Pod 后归属不丢；K8s 指到 PVC 上的路径） ---
-  // 缺省落在 baseDirectory 同目录，生产必须指到持久卷（否则重启后归属丢失 = 谁先访问谁认领）
-  registryPath: env('COPILOT_REGISTRY_PATH', '') || path.join(homeDir, 'session-registry.json'),
+  // --- Session Registry：ownership 持久化（重启/换 Pod 后归属不丢） ---
+  // 存在与 execution/human task 同一个库里，不再单独落 JSON 文件
   // --- 身份头可信开关：只有网关/IAP 会剥离客户端自带 x-tenant-id/x-user-id 时才可开 ---
   // 关闭（默认）= 单租户模式，所有请求按 DEFAULT_OWNER 处理，避免客户端自报身份越过归属校验
   trustIdentityHeaders: env('COPILOT_TRUST_IDENTITY_HEADERS', 'false') === 'true',
@@ -95,7 +104,11 @@ export const config = {
   // --- 管理接口令牌（留空=不设防本地开发；生产设置后 /api/debug、/api/hooks 需带 x-admin-token） ---
   adminToken: env('COPILOT_ADMIN_TOKEN', '') || undefined,
   // --- Durable state：execution / human task / approval / event / session ownership 的持久真相源 ---
-  // 留空=内存实现（单副本、重启即丢，仅适合本地开发）；生产配 PostgreSQL 连接串
+  // 默认 SQLite（零依赖、零配置，单文件落盘）；配了 DATABASE_URL 则切 PostgreSQL（多副本/集中部署）
+  stateBackend: parseStateBackend(env('COPILOT_STATE_BACKEND', '')),
+  sqlitePath: env('COPILOT_DB_PATH', '') || path.join(homeDir, 'agent.db'),
+  /** 可选 SQLite 扩展（逗号分隔的绝对路径；用于加载 sqlite-vec 之类的能力） */
+  sqliteExtensions: parseList(env('COPILOT_SQLITE_EXTENSIONS', '')),
   databaseUrl: parseDatabaseUrl(env('DATABASE_URL', '')),
   /** 全进程同时运行的 agent turn 上限（0=不限；防止 N 个用户同时烧满 runtime CPU） */
   maxConcurrentExecutions: Number(env('COPILOT_MAX_CONCURRENT_EXECUTIONS', '0')) || 0,

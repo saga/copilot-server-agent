@@ -19,3 +19,8 @@ client/.env
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# SQLite durable state（正常落在 $COPILOT_HOME，防本地把 COPILOT_DB_PATH 指到仓库内）
+*.db
+*.db-wal
+*.db-shm

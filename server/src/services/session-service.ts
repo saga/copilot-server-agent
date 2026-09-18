@@ -32,7 +32,8 @@ import {
 } from './session-registry.js';
 import { createPermissionHandler } from './tool-policy.js';
 import { createToolEvidenceHooks } from './tool-evidence.js';
-import { executionService, stateBackend } from '../execution/index.js';
+import { executionService, stateBackend, type StateBackend } from '../execution/index.js';
+import { sqliteFilePath } from '../db/connection.js';
 
 export type { SessionOwner, RegistryRecord };
 
@@ -170,8 +171,8 @@ export interface DebugInfo {
   platform: string;
   sdkVersion: string;
   provider: string;
-  /** durable state 后端（postgres=跨重启存活；memory=重启即丢） */
-  stateBackend: 'postgres' | 'memory';
+  /** durable state 后端（sqlite/postgres=跨重启存活；memory=重启即丢） */
+  stateBackend: StateBackend;
   runtime: {
     state: 'connected' | 'idle' | 'error';
     lastError?: string;
@@ -191,7 +192,8 @@ export interface DebugInfo {
     runtimeUrl?: string;
     baseDirectory: string;
     workspaceRoot: string;
-    registryPath: string;
+    /** SQLite 文件路径；PostgreSQL 模式为 undefined */
+    sqlitePath?: string;
     trustIdentityHeaders: boolean;
     bashPolicy: string;
   };
@@ -225,8 +227,8 @@ class SessionService {
   private attachLocks = new Map<string, Promise<unknown>>();
   /** 正在跑 agent turn 的 session（客户端断开时按此决定是否 abort） */
   private activeTurns = new Set<string>();
-  /** 持久归属表（重启后不丢；配了 DATABASE_URL 走 PostgreSQL，否则单文件 JSON） */
-  private readonly registry = new SessionRegistry(createRegistryStore(config.registryPath));
+  /** 持久归属表（重启后不丢；与 execution 同库：默认 SQLite，配 DATABASE_URL 则 PostgreSQL） */
+  private readonly registry = new SessionRegistry(createRegistryStore());
   private lastError: string | null = null;
 
   async getClient(): Promise<CopilotClient> {
@@ -340,7 +342,7 @@ class SessionService {
       ...(config.runtimeUrl ? { runtimeUrl: config.runtimeUrl } : {}),
       baseDirectory: config.baseDirectory,
       workspaceRoot: config.workspaceRoot,
-      registryPath: config.registryPath,
+      ...(sqliteFilePath() ? { sqlitePath: sqliteFilePath()! } : {}),
       trustIdentityHeaders: config.trustIdentityHeaders,
       bashPolicy: config.bashPolicy,
     },

@@ -34,12 +34,23 @@ Services              SessionService / ExecutionService / HumanTaskService
 Repositories          ExecutionRepository / EventRepository / HumanTaskRepository
                       SessionRegistry（registry store）
         ↓
-PostgreSQL | Memory   未配 DATABASE_URL 时全部走内存实现（接口一致）
+SQL 仓储（一份实现）   execution|human-tasks/sql-repository.ts + SessionRegistry
+        ↓
+SQLite（默认）| PostgreSQL（配 DATABASE_URL）     方言差异收敛在 db/dialect.ts
         ↓
 Copilot Runtime       mode: "empty" + session 级 availableTools + hooks
 ```
 
-依赖装配集中在 `server/src/wiring.ts`：唯一一处决定用 PostgreSQL 还是内存实现。
+依赖装配集中在 `server/src/wiring.ts`：唯一一处决定用哪个后端的地方。
+
+**两种后端共用同一份仓储实现**，差异只有方言：占位符（`$1` / `?1`）、JSON 列编解码、
+布尔与时间戳表示、JSON 数组命中判定、聚合取整 —— 全部由 `db/dialect.ts` 的钩子提供，
+仓储里不出现 `if (backend === ...)`。这也意味着**两份 DDL 必须逐列一致**，
+否则某个后端会在运行期炸（`test/schema.test.ts` 会解析两份 DDL 逐列比对拦住这种漂移）。
+
+- **SQLite**：默认。单文件落盘，零依赖（Node 内置 `node:sqlite`）、零配置，启动自动建表。
+- **PostgreSQL**：配 `DATABASE_URL` 即切换，用 `pg`（可选依赖），DDL 由运维用 `psql` 应用。
+- **Memory**：仅单测与 `COPILOT_STATE_BACKEND=memory` 临时验证，重启即丢。
 
 ## 2. 核心对象关系
 
@@ -154,22 +165,32 @@ Server-controlled executor（真正的 mutation）
 
 ## 8. 数据模型（PostgreSQL）
 
-迁移文件：`server/src/db/migrations/001_agent_execution.sql`
+**SQLite（默认）**：schema 内嵌在 `server/src/db/sqlite-schema.ts`，首次连接自动应用，
+无需任何迁移命令。写成 TS 常量而不是 `.sql` 文件，是为了让构建产物自带 schema
+（`tsc` 只产 JS，运行时再去磁盘找 `src/**/*.sql` 在容器里会失效）。
+
+**PostgreSQL（可选）**：`server/src/db/migrations/001_agent_execution.sql`，由运维应用：
 
 ```bash
 psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
 ```
 
+两份 DDL 的表名与列名**必须完全一致**（共用同一份仓储实现），`test/schema.test.ts` 逐列比对。
+
 | 表 | 关键字段 |
 |----|---------|
-| `agent_session` | session_id, tenant_id, user_id, workspace_path, status, **config jsonb**（resume 用，不含凭证） |
+| `agent_session` | session_id, tenant_id, user_id, workspace_path, status, **config**（resume 用，不含凭证） |
 | `agent_execution` | execution_id, session_id, tenant/user, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars |
 | `human_task` | task_id, execution_id, type, status, payload, **input_values**（人工输入回填）, input_schema, policy_id, strategy, required_count, eligible_roles/users, initiated_by, expires_at, delegated_* |
 | `human_task_decision` | decision_id, task_id, approver_id, approver_role, decision, comment, `unique(task_id, approver_id)` |
 | `execution_event` | execution_id, sequence, type, actor_type, actor_id, payload, `unique(execution_id, sequence)` |
 
-未配 `DATABASE_URL` 时全部走内存实现：单副本本地开发可用，重启即丢
-（启动日志会打印 `durable state = 内存` 警告）。
+类型映射（SQLite）：`jsonb → text`（JSON 文本）、`timestamptz → text`（ISO 8601）、
+`boolean → integer`（0/1）、`bigserial → integer primary key autoincrement`。
+时间戳列刻意不设 SQL default —— 应用层一律显式写 ISO 字符串，混排会破坏排序。
+`pragma foreign_keys = ON` 必须开（默认关），否则 `on delete cascade` 不生效。
+
+`COPILOT_STATE_BACKEND=memory` 可强制内存实现（不落盘，仅临时验证），重启即丢。
 
 ## 9. API
 
@@ -191,19 +212,33 @@ server/src/
 ├── agent/       agent-runner.ts（SDK 事件收口） agent-context.ts agent-events.ts
 ├── services/    session-service workspace-service session-registry
 │                tool-policy tool-evidence principal concurrency task-sweeper
-├── execution/   types execution-service execution-repository(+memory/postgres)
+├── execution/   types execution-service sql-repository(+memory)
 │                events hash usage redact
-├── human-tasks/ types repository(+memory/postgres) human-task-service assignment
+├── human-tasks/ types repository sql-repository(+memory) human-task-service assignment
 ├── approval/    types approval-policy approval-service
 ├── actions/     action-registry（server-controlled executor） action-service
-├── db/          pool.ts migrations/001_agent_execution.sql
+├── db/          connection.ts（后端选择） dialect.ts（方言钩子）
+│                sqlite.ts + sqlite-schema.ts（默认后端）
+│                postgres.ts（可选） migrations/001_agent_execution.sql
 ├── providers/ agents/ skills/ mcp/ hooks/
-└── wiring.ts    依赖装配（PG vs 内存）
+└── wiring.ts    依赖装配（SQLite / PostgreSQL / Memory）
 ```
 
 ## 11. 明确不做
 
 Temporal / BPMN / Camunda / Kafka / Redis / 通用 workflow DSL / A2A EventBus。
+
+**向量检索**：当前没有语义检索需求（无 embedding 通道，也没有"按相似度召回"的功能），
+因此不建向量表、不接 embedding 服务 —— 留出接入点而不是先堆空壳：
+
+- SQLite：`COPILOT_SQLITE_EXTENSIONS=/path/to/vec0.dylib` 即可加载 sqlite-vec
+  （`node:sqlite` 的 `loadExtension`，执行器已支持；加载失败只记日志不影响启动）。
+- PostgreSQL：可启用 `pgvector`，在 `db/dialect.ts` 加一个距离函数钩子，
+  仓储照旧一份实现。
+
+真要做时补：embedding 通道 + 一张 `agent_embedding(owner_kind, owner_id, model, dim, vector)`
++ 一次 kNN 查询，不必改动现有表结构。
+
 业务状态是确定的（审批确定、状态确定），`Application State Machine + PostgreSQL` 足够。
 
 也明确不做的三件事：

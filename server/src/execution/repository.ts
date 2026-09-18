@@ -1,3 +1,4 @@
+import type { DbBackend } from '../db/dialect.js';
 import type {
   ExecutionEvent,
   ExecutionFilter,
@@ -7,9 +8,9 @@ import type {
 /**
  * Execution 持久化抽象。
  *
- *   api/routes → ExecutionService → ExecutionRepository → PostgreSQL | Memory
+ *   api/routes → ExecutionService → ExecutionRepository → SQLite | PostgreSQL | Memory
  *
- * 业务层只认接口：本地开发/单元测试用内存实现，生产用 PostgreSQL，代码零改动。
+ * 业务层只认接口：本地开发/单元测试用内存实现，运行期默认 SQLite、可切 PostgreSQL，代码零改动。
  * 注意 durable state（status / human task / approval / event）与进程内缓存
  * （active execution 映射、usage 累加器、pending tool call 栈）是两回事：
  * 后者可以是内存，前者必须落库。
@@ -20,7 +21,8 @@ export interface ExecutionStats {
   running: number;
   waiting: number;
   toolCalls: number;
-  backend: 'postgres' | 'memory';
+  /** 'memory' 只在强制内存后端时出现 */
+  backend: DbBackend | 'memory';
 }
 
 export interface ExecutionRepository {

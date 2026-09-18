@@ -4,7 +4,7 @@ import type { EventRepository, ExecutionRepository, ExecutionStats } from './rep
 import type { ExecutionEvent, ExecutionFilter, ExecutionRecord } from './types.js';
 
 /**
- * 内存实现：单副本本地开发/单测用。
+ * 内存实现：单测与 `COPILOT_STATE_BACKEND=memory`（不落盘的临时验证）用。
  * 记录按插入顺序做 LRU 淘汰（COPILOT_MAX_TRACKED_EXECUTIONS），事件环同理。
  */
 

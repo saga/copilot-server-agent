@@ -58,11 +58,13 @@ test('执行审计相关数值配置可覆盖', () => {
   assert.equal(cfg.maxToolCallsPerExecution, 5);
 });
 
-test('DATABASE_URL 留空 = 内存实现', () => {
+test('DATABASE_URL 留空 = 默认走 SQLite', () => {
   const r = loadConfig({ DATABASE_URL: '' });
   assert.equal(r.code, 0, r.stderr);
   const cfg = JSON.parse(r.stdout.trim().split('\n').at(-1)!);
   assert.equal(cfg.databaseUrl, undefined);
+  assert.equal(cfg.stateBackend, 'auto');
+  assert.match(cfg.sqlitePath, /agent\.db$/);
 });
 
 test('DATABASE_URL 合法连接串被保留', () => {
@@ -79,4 +81,26 @@ test('DATABASE_URL 非法（占位值 / 错 scheme）直接抛错', () => {
     assert.notEqual(r.code, 0, `"${bad}" 应当启动失败`);
     assert.match(r.stderr, /DATABASE_URL 非法/);
   }
+});
+
+test('SQLite 路径与扩展可覆盖', () => {
+  const r = loadConfig({
+    DATABASE_URL: '',
+    COPILOT_DB_PATH: '/var/lib/copilot/agent.db',
+    COPILOT_SQLITE_EXTENSIONS: '/opt/vec0.dylib, /opt/other.dylib',
+  });
+  assert.equal(r.code, 0, r.stderr);
+  const cfg = JSON.parse(r.stdout.trim().split('\n').at(-1)!);
+  assert.equal(cfg.sqlitePath, '/var/lib/copilot/agent.db');
+  assert.deepEqual(cfg.sqliteExtensions, ['/opt/vec0.dylib', '/opt/other.dylib']);
+});
+
+test('COPILOT_STATE_BACKEND 非法值启动即失败', () => {
+  const ok = loadConfig({ COPILOT_STATE_BACKEND: 'memory' });
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(JSON.parse(ok.stdout.trim().split('\n').at(-1)!).stateBackend, 'memory');
+
+  const bad = loadConfig({ COPILOT_STATE_BACKEND: 'redis' });
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stderr, /COPILOT_STATE_BACKEND 非法/);
 });

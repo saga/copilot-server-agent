@@ -1,5 +1,6 @@
 # 单 Pod sidecar：API + headless runtime 同 Pod 经 localhost 通信
-# replicas 固定 1：session 锁与 session 对象都是进程内的，多副本需要分布式锁 + 共享 Session Registry
+# replicas 固定 1：默认后端是 SQLite（单文件单写者，多副本会各写各的文件），
+# 且 session 锁与 session 对象都是进程内的 —— 多副本同时需要 PostgreSQL + 分布式锁
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -39,9 +40,10 @@ spec:
             # 每 session 独立 workspace（独立 PVC，Pod 重启不丢）
             - name: COPILOT_WORKSPACE_ROOT
               value: "/workspaces"
-            # Session Registry：归属持久化（重启后不退化成“谁先访问谁认领”）
-            - name: COPILOT_REGISTRY_PATH
-              value: "/var/lib/copilot/session-registry.json"
+            # durable state（execution / human task / approval / 归属）落 SQLite 单文件
+            # 必须在持久卷上：Pod 重启后审批中的任务才不会丢
+            - name: COPILOT_DB_PATH
+              value: "/var/lib/copilot/agent.db"
             # 身份头只有在网关/IAP 会剥离客户端自带头时才可开启
             - name: COPILOT_TRUST_IDENTITY_HEADERS
               value: "false"
@@ -67,8 +69,9 @@ spec:
                 secretKeyRef:
                   name: copilot-server-agent
                   key: github-token
-            # Durable state：配了才跨重启存活（execution / human task / approval / event / ownership）
-            # 不配则走内存实现，审批中的任务会在 Pod 重启后丢失
+            # 可选：配了才切 PostgreSQL（多副本 / 集中备份）；不配则用上面的 SQLite
+            # 用 PostgreSQL 前先应用迁移：
+            #   psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:

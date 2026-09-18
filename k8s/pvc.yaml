@@ -2,7 +2,7 @@
 # Kubernetes 文档明确提示 subPath 方案不适合生产；拆卷后挂载点就是卷根，权限与扩容都更干净
 ---
 # Runtime 会话持久化（/var/lib/copilot/session-state/<sessionId>）
-# 同时存放 Session Registry（COPILOT_REGISTRY_PATH），API 容器也挂这份卷
+# 同时存放 durable state 库文件（COPILOT_DB_PATH=/var/lib/copilot/agent.db，默认 SQLite），API 容器也挂这份卷
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

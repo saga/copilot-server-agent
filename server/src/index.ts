@@ -7,7 +7,7 @@ import { errorHandler } from './middleware/errorHandler.js';
 import { sessionService } from './services/session-service.js';
 import { humanTaskService } from './wiring.js';
 import { startTaskSweeper } from './services/task-sweeper.js';
-import { closeSql } from './db/pool.js';
+import { closeDb } from './db/connection.js';
 import { isShuttingDown, markShuttingDown } from './shutdown.js';
 
 const app = express();
@@ -48,7 +48,7 @@ async function shutdown(signal: string) {
       server.close(() => resolve());
     });
     await sessionService.stop();
-    await closeSql();
+    await closeDb();
   } finally {
     process.exit(0);
   }
