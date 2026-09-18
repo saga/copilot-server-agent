@@ -35,6 +35,20 @@ function parseBashPolicy(raw: string): BashPolicy {
   throw new Error(`COPILOT_BASH_POLICY 非法："${raw}"，可选：${BASH_POLICIES.join(' | ')}`);
 }
 
+/**
+ * Durable state 连接的 scheme 校验。
+ * 留空=内存实现。一旦给了值就当作生产连接串：占位值/拼错的 scheme 会让服务切到 PG 模式
+ * 却连不上，启动即失败比“上线后审批全 500”好排查。
+ */
+function parseDatabaseUrl(raw: string): string | undefined {
+  const v = raw.trim();
+  if (!v) return undefined;
+  if (!/^postgres(ql)?:\/\//i.test(v)) {
+    throw new Error(`DATABASE_URL 非法：必须以 postgres:// 或 postgresql:// 开头（留空=内存实现）`);
+  }
+  return v;
+}
+
 const homeDir = env('COPILOT_HOME', '') || path.join(os.homedir(), '.copilot');
 
 export const config = {
@@ -82,7 +96,7 @@ export const config = {
   adminToken: env('COPILOT_ADMIN_TOKEN', '') || undefined,
   // --- Durable state：execution / human task / approval / event / session ownership 的持久真相源 ---
   // 留空=内存实现（单副本、重启即丢，仅适合本地开发）；生产配 PostgreSQL 连接串
-  databaseUrl: env('DATABASE_URL', '') || undefined,
+  databaseUrl: parseDatabaseUrl(env('DATABASE_URL', '')),
   /** 全进程同时运行的 agent turn 上限（0=不限；防止 N 个用户同时烧满 runtime CPU） */
   maxConcurrentExecutions: Number(env('COPILOT_MAX_CONCURRENT_EXECUTIONS', '0')) || 0,
   /** Human Task 默认 TTL（秒；0=不过期）。到期 OPEN → EXPIRED，execution 随之 EXPIRED */

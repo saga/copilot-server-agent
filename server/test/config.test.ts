@@ -57,3 +57,26 @@ test('执行审计相关数值配置可覆盖', () => {
   assert.equal(cfg.maxTrackedExecutions, 10);
   assert.equal(cfg.maxToolCallsPerExecution, 5);
 });
+
+test('DATABASE_URL 留空 = 内存实现', () => {
+  const r = loadConfig({ DATABASE_URL: '' });
+  assert.equal(r.code, 0, r.stderr);
+  const cfg = JSON.parse(r.stdout.trim().split('\n').at(-1)!);
+  assert.equal(cfg.databaseUrl, undefined);
+});
+
+test('DATABASE_URL 合法连接串被保留', () => {
+  const dsn = 'postgresql://u:p@db:5432/copilot';
+  const r = loadConfig({ DATABASE_URL: dsn });
+  assert.equal(r.code, 0, r.stderr);
+  const cfg = JSON.parse(r.stdout.trim().split('\n').at(-1)!);
+  assert.equal(cfg.databaseUrl, dsn);
+});
+
+test('DATABASE_URL 非法（占位值 / 错 scheme）直接抛错', () => {
+  for (const bad of ['REPLACE_ME', 'mysql://u:p@db:3306/x', 'db:5432/copilot']) {
+    const r = loadConfig({ DATABASE_URL: bad });
+    assert.notEqual(r.code, 0, `"${bad}" 应当启动失败`);
+    assert.match(r.stderr, /DATABASE_URL 非法/);
+  }
+});

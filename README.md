@@ -206,7 +206,7 @@ agent 侧入口（可选）：`scripts/governance-mcp.mjs` 是 stdio MCP server�
 | `COPILOT_EVIDENCE_MAX_CHARS` | `2000` | 单条 tool 参数/结果预览的最大字符数（超出只记长度） |
 | `COPILOT_MAX_TRACKED_EXECUTIONS` | `200` | 内存模式下保留的 execution 条数 |
 | `COPILOT_MAX_TOOL_CALLS` | `100` | 单个 execution 最多记多少条 tool call |
-| `DATABASE_URL` | 空 | 留空=内存实现（重启即丢）；配置后 execution/human task/approval/event/ownership 全部落 PostgreSQL |
+| `DATABASE_URL` | 空 | 留空=内存实现（重启即丢）；配置后 execution/human task/approval/event/ownership 全部落 PostgreSQL。非空时必须是 `postgres://` / `postgresql://`，否则启动即失败 |
 | `COPILOT_MAX_CONCURRENT_EXECUTIONS` | `0` | 全进程同时运行的 agent turn 上限（`0`=不限） |
 | `COPILOT_HUMAN_TASK_TTL` | `86400` | Human Task 默认 TTL（秒，`0`=不过期）；到期 `OPEN → EXPIRED` |
 | `COPILOT_HUMAN_TASK_SWEEP` | `60` | 过期扫描间隔（秒） |
