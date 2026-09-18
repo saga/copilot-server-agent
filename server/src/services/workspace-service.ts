@@ -4,13 +4,13 @@ import path from 'node:path';
 import { config } from '../config.js';
 
 /**
- * Session 级 workspace 管理（Level 1 并发隔离）。
+ * Session 级 workspace 管理（并发隔离：不同 session 落在不同目录）。
  *
  * - 1 session = 1 workspace 目录，路径是 sessionId 的确定性函数
  *   （sha256 截断），重启/换 Pod 后 resume 仍回到同一目录，无需额外映射表
  * - 目录在 create/resume 时 `mkdir -p` 确保存在；彻底删除时才清理
- * - 注意：workingDirectory 是软隔离（默认 cwd），不是 OS sandbox；
- *   强隔离（不可信代码）需要 per-request container，见下一阶段
+ * - workingDirectory 是软隔离（默认 cwd），不是 OS sandbox：写路径由 tool-policy 的
+ *   workspace 守卫兜底，不可信代码要硬隔离得上 per-request container
  */
 export class WorkspaceService {
   private readonly rootDir: string;

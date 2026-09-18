@@ -189,7 +189,7 @@ class SessionService {
   private starting: Promise<CopilotClient> | null = null;
   private sessions = new Map<string, CopilotSession>();
   private owners = new Map<string, SessionRecord>();
-  /** 单进程 session 并发锁：同一 session 的 agent turn 串行化（多副本阶段升级为分布式锁） */
+  /** session 并发锁：同一 session 的 agent turn 串行化（进程内实现；多副本部署需换分布式锁） */
   private sessionLocks = new Map<string, Promise<unknown>>();
   /** attach 专用锁：resume 只允许一个 request 真正执行（与 chat lock 分开，避免互相阻塞） */
   private attachLocks = new Map<string, Promise<unknown>>();
@@ -503,7 +503,7 @@ class SessionService {
     });
   }
 
-  /** 同一 session 的 agent turn 串行化（单进程；多副本阶段升级为分布式锁） */
+  /** 同一 session 的 agent turn 串行化（进程内锁；多副本部署需换分布式锁） */
   async withSessionLock<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
     const previous = this.sessionLocks.get(sessionId) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(fn);

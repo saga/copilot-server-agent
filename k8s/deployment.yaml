@@ -1,5 +1,5 @@
-# 第一阶段：单 Pod sidecar（API + headless runtime 同 Pod 经 localhost 通信）
-# replicas 固定 1（sessions 仍是进程内存；多副本需要 Session Registry + 分布式锁，见下一阶段）
+# 单 Pod sidecar：API + headless runtime 同 Pod 经 localhost 通信
+# replicas 固定 1：session 锁与 session 对象都是进程内的，多副本需要分布式锁 + 共享 Session Registry
 apiVersion: apps/v1
 kind: Deployment
 metadata:

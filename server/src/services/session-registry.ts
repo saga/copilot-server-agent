@@ -15,8 +15,8 @@ export interface SessionOwner {
  *   这是安全问题（见官方 multi-tenancy：应用必须自己维护 session ownership）
  * - 官方多租户文档要求 resume/delete 前做访问控制；Copilot session id 本身不构成边界
  *
- * 第一版落单文件（JSON，原子写 + 串行化写入），生产应为 PostgreSQL（表结构见 README）。
- * 接口按“以后换 DB 也不改调用方”设计：全部 async。
+ * 当前实现：单文件 JSON（原子写 + 串行化写入）。适合单副本部署；生产多副本换 PostgreSQL，
+ * 表结构见 README。接口全部 async，换存储不需要改调用方。
  */
 
 export interface RegistryRecord {
