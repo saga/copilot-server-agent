@@ -207,18 +207,22 @@ export const api = {
     }).then(json<{ name: string | null } & McpTestResult>);
   },
 
-  /** 非流式：一问一答 */
-  chat(sessionId: string, prompt: string, model?: string): Promise<{ sessionId: string; content: string }> {
+  /** 非流式：一问一答（executionId 可用于 GET /api/executions/:id 查审计与 usage） */
+  chat(
+    sessionId: string,
+    prompt: string,
+    model?: string,
+  ): Promise<{ sessionId: string; executionId: string; content: string }> {
     return fetch(`${API_BASE}/api/sessions/${sessionId}/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt, streaming: false, model }),
-    }).then(json<{ sessionId: string; content: string }>);
+    }).then(json<{ sessionId: string; executionId: string; content: string }>);
   },
 
   /**
    * 流式：SSE，回调 onDelta 增量更新。
-   * 后端事件：delta {delta} / message {content} / subagent {全量事件} / done / error
+   * 后端事件：execution {executionId} / delta {delta} / message {content} / subagent {全量事件} / done / error
    */
   chatStream(
     sessionId: string,
@@ -226,6 +230,7 @@ export const api = {
     callbacks: {
       onDelta: (d: string) => void;
       onSubagent?: (e: SubagentEvent) => void;
+      onExecution?: (executionId: string) => void;
       onDone?: () => void;
       onError?: (e: Error) => void;
     },
@@ -253,12 +258,13 @@ export const api = {
             const dataMatch = frame.match(/^data:\s*(.+)$/m);
             if (!eventMatch || !dataMatch) continue;
             const event = eventMatch[1].trim();
-            let data: { delta?: string; content?: string; error?: string };
+            let data: { delta?: string; content?: string; error?: string; executionId?: string };
             try {
               data = JSON.parse(dataMatch[1]);
             } catch {
               continue;
             }
+            if (event === 'execution' && data.executionId) callbacks.onExecution?.(data.executionId);
             if (event === 'delta' && data.delta) callbacks.onDelta(data.delta);
             if (event === 'message' && data.content) callbacks.onDelta(data.content);
             if (event === 'subagent') {

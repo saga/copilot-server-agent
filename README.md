@@ -30,12 +30,14 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | GET | `/api/mcp` | MCP 预设与内联开关（只含元信息，密钥不返回） |
 | POST | `/api/mcp/test` `{ name? , server? }`（二选一） | MCP 连通性自检（不建会话、不执行命令；local 查可执行文件，http 发 8s 超时 GET） |
 | GET | `/api/debug` | 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime） |
-| GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计） |
+| GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计；带 `executionId`） |
+| GET | `/api/executions` `?sessionId=&limit=` | 最近 execution 记录（usage + tool 证据）与统计 |
+| GET | `/api/executions/:id` | 单条 execution（含 `toolCalls` / `usage` / 终态） |
 | POST | `/api/sessions` `{ model?, sessionId?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers?, hooks?, sessionContext?, agentStopChecklist? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话） |
 | GET | `/api/sessions` | **当前调用方**的会话（按 Session Registry 归属过滤；刚建未对话的会话 runtime 尚未落盘，可能不在列表） |
 | GET | `/api/sessions/:id` | 单个会话元信息（越权 `403`） |
 | POST | `/api/sessions/:id/resume` `{ 与创建相同的重配项 }` | 恢复会话 → `{ sessionId, resumed }`（BYOK 凭证服务端自动重传；越权 `403`） |
-| POST | `/api/sessions/:id/chat` `{ prompt, streaming?, model? }` | `streaming:false` 返回 `{ content }`；`true` 返回 SSE（`delta/message/subagent/done/error`）。同一 session 的 turn 串行；客户端断开即 `abort` 当前 turn |
+| POST | `/api/sessions/:id/chat` `{ prompt, streaming?, model? }` | 每次请求 = 一个 execution。`streaming:false` 返回 `{ sessionId, executionId, content, usage }`；`true` 返回 SSE（`execution/delta/message/subagent/done/error`）。同一 session 的 turn 串行；客户端断开即 `abort` 当前 turn，execution 记 `cancelled` |
 | DELETE | `/api/sessions/:id` | 默认断开内存附着（保留磁盘，可 resume）；`?permanent=true` 彻底删除，不可恢复。两者都排队在当前 agent turn 之后执行 |
 
 前端示例见 `client/src/lib/api.ts`（`api.health/createSession/chat/chatStream`）和 `client/src/components/Chat.tsx`。
@@ -85,6 +87,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 | Session Registry | `server/src/services/session-registry.ts`（持久 JSON，生产换 PostgreSQL） | 重启后归属不丢，杜绝“谁先访问谁认领” |
 | 工具授权 | `server/src/services/tool-policy.ts` | 取代 `approveAll`：write 限 workspace、bash 按策略、MCP 按会话启用名单、URL 过 SSRF + 域名 allowlist |
 | 执行前守卫 | `onPreToolUse`（强制 hook，请求关不掉） | 写类工具路径必须在 session workspace |
+| execution | `server/src/execution/` | session ≠ execution：每次 chat 一个 `executionId`，usage/工具证据/取消/终态全挂在它上面 |
 
 要点：
 
@@ -107,6 +110,42 @@ create table agent_sessions (
 );
 ```
 
+## Execution Record（执行审计）
+
+一次 chat = 一个 execution。session 会有很多 turn，所以审计不能只挂 `sessionId`：
+
+```text
+session ── execution #1 ── LLM ── tool ── tool
+       └─ execution #2 ── LLM ── tool（被守卫 deny）
+```
+
+`GET /api/executions/:id` 返回：
+
+```jsonc
+{
+  "executionId": "ex_…", "sessionId": "…", "tenantId": "…", "userId": "…",
+  "startedAt": "…", "completedAt": "…", "durationMs": 4646,
+  "status": "completed",        // running | completed | failed | cancelled
+  "promptPreview": "\"只回复 OK\"",
+  "usage": { "inputTokens": 4128, "outputTokens": 5, "cacheReadTokens": 0,
+             "cacheWriteTokens": 0, "reasoningTokens": 0, "durationMs": 1473,
+             "llmCalls": 1, "models": ["…"], "contextWindow": 128000, "cost": 1 },
+  "toolCalls": [
+    { "toolCallId": "ex_…-t1", "toolName": "bash", "decision": "allow",
+      "arguments": "{\"command\":\"…\"}", "result": "…", "durationMs": 47, "isError": false }
+  ]
+}
+```
+
+| 组成 | 位置 | 说明 |
+|------|------|------|
+| ExecutionStore | `server/src/execution/store.ts` | 进程内 LRU 环（`COPILOT_MAX_TRACKED_EXECUTIONS`，重启清空；要长期审计把终态记录外发即可） |
+| Usage | `server/src/execution/usage.ts` | **execution-local** 累加器：并发 turn 不串数据。监听 `assistant.usage`（token/耗时/模型）+ `session.usage_info`（上下文窗口） |
+| 工具证据 | `server/src/services/tool-evidence.ts` | `onPreToolUse` 开条（toolCallId/参数/守卫裁决）→ `onPostToolUse` / `onPostToolUseFailure` 收口（结果/错误/耗时） |
+| 脱敏截断 | `server/src/execution/redact.ts` | 参数与结果先 `redact`（token/api_key/authorization/password/secret… 按 key 与值形态）再 `truncate`（只报长度）。tool 结果可能极大（SQL/PDF/网页），不能直接进日志 |
+
+审计链：`request → execution → 策略裁决 → 工具执行 → 结果`，hook 事件环（`GET /api/hooks`）里的每条都带 `executionId`。
+
 ## 环境变量（安全相关）
 
 | 变量 | 默认 | 说明 |
@@ -116,12 +155,16 @@ create table agent_sessions (
 | `COPILOT_BASH_POLICY` | `workspace` | `workspace`=命令涉及路径须在 workspace；`allow`=放行；`deny`=禁止 bash |
 | `COPILOT_WARMUP` | `true` | 启动时后台预热 runtime（首屏徽章与首个会话不必等 CLI 拉起）；`false`=纯懒加载 |
 | `COPILOT_URL_ALLOWLIST` | 空 | 允许访问的域名（逗号分隔；空=任意公网，仍过 SSRF 检查） |
+| `COPILOT_EVIDENCE_MAX_CHARS` | `2000` | 单条 tool 参数/结果预览的最大字符数（超出只记长度） |
+| `COPILOT_MAX_TRACKED_EXECUTIONS` | `200` | 内存保留的 execution 条数 |
+| `COPILOT_MAX_TOOL_CALLS` | `100` | 单个 execution 最多记多少条 tool call |
 
 ## 版本锁定与自检
 
 ```bash
 npm run check:versions     # SDK / runtime / K8s 镜像 tag 四处版本必须一致
 npm run verify:agent-tools # custom agent 工具是否真能调用（只认 tool.execution_start）
+npm run test               # execution 审计（脱敏/usage/tool 证据）+ 配置 smoke（非法值必须启动失败）
 ```
 
 SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移会触发协议不兼容，且本服务依赖若干 SDK workaround。`verify:agent-tools` 对应 SDK issue #2356 —— 只看 `subagent.selected` 不够，必须看到 `tool.execution_start`。
@@ -140,7 +183,7 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 参考官方 debugging 文档：
 
 - **日志**：`COPILOT_LOG_LEVEL`（none/error/warning/info/debug/all，留空=SDK 默认，非法值启动即报错）、`COPILOT_LOG_DIR`（透传 `--log-dir` 给 CLI）、`COPILOT_CLI_PATH`（CLI 不在 PATH 时指定完整路径，对应文档“CLI not found”一节）。
-- **诊断包**：`GET /api/debug` 一次返回排障清单——Node/平台/SDK 版本、当前通道、脱敏配置（密钥永不出现）、runtime 状态（`ping` 延迟、CLI 版本 + 协议版本、认证状态）、会话计数（内存附着/磁盘）、hooks 与 MCP 预设数。会按需启动 runtime，CLI 缺失/未认证等问题直接暴露在包里。
+- **诊断包**：`GET /api/debug` 一次返回排障清单——Node/平台/SDK 版本、当前通道、脱敏配置（密钥永不出现）、runtime 状态（`ping` 延迟、CLI 版本 + 协议版本、认证状态）、会话计数（内存附着/磁盘）、hooks 与 MCP 预设数、execution 计数（追踪数/运行中/tool 调用数）。会按需启动 runtime，CLI 缺失/未认证等问题直接暴露在包里。
 - **MCP 自检**：`POST /api/mcp/test`（`{ name }` 测预设，或 `{ server }` 测内联配置，内联同样受安全门约束）——local 只验证可执行文件可找到（不执行），http 发一次 8s 超时 GET（任何 HTTP 响应即算可达，MCP 端点对普通 GET 常回 4xx 属正常）。前端「调试」面板每个预设都有连通测试按钮。
 
 ## 服务端结构
@@ -148,6 +191,8 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 - `server/src/services/session-service.ts` — `SessionService` 单例（Client 生命周期 + 会话管理 + attach/chat/lifecycle 三把锁 + 诊断包）
 - `server/src/services/session-registry.ts` — 持久归属表（重启不丢；生产换 PostgreSQL）
 - `server/src/services/tool-policy.ts` — 工具授权 policy + `onPreToolUse` workspace 守卫
+- `server/src/services/tool-evidence.ts` — 工具证据 hook（toolCallId / 裁决 / 耗时 / 脱敏结果）
+- `server/src/execution/` — execution 记录（`store.ts`）、LLM usage 累加器（`usage.ts`）、脱敏截断（`redact.ts`）
 - `server/src/services/workspace-service.ts` — session workspace（路径是 sessionId 的确定性哈希）
 - `server/src/routes/api.ts` — `apiRouter`（全部 `/api/*` 路由）
 

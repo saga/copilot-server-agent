@@ -57,6 +57,8 @@ export function Chat() {
   const [preSelect, setPreSelect] = useState('');
   const [useSkills, setUseSkills] = useState(true);
   const [activity, setActivity] = useState<string[]>([]);
+  // 最近一次 execution（审计/usage 查询用：GET /api/executions/:id）
+  const [executionId, setExecutionId] = useState<string | null>(null);
   // 会话持久化：自定义 ID + 会话列表
   const [customId, setCustomId] = useState('');
   const [sessions, setSessions] = useState<SessionMeta[]>([]);
@@ -268,6 +270,7 @@ export function Chat() {
               const line = describeSubagent(e);
               if (line) setActivity((a) => [...a.slice(-19), line]);
             },
+            onExecution: (id) => setExecutionId(id),
             onDone: () => setBusy(false),
             onError: (e) => {
               setError(e.message);
@@ -277,7 +280,8 @@ export function Chat() {
           model || undefined,
         );
       } else {
-        const { content } = await api.chat(id, prompt, model || undefined);
+        const { content, executionId: exId } = await api.chat(id, prompt, model || undefined);
+        setExecutionId(exId ?? null);
         setMessages((m) => [...m, { role: 'assistant', content }]);
         setBusy(false);
         scrollBottom();
@@ -591,6 +595,12 @@ export function Chat() {
           {activity.map((line, i) => (
             <div key={i}>{line}</div>
           ))}
+        </div>
+      )}
+
+      {executionId && (
+        <div className="activity" title="本次 turn 的审计记录：GET /api/executions/{id}">
+          execution: {executionId}
         </div>
       )}
 
