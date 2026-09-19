@@ -20,14 +20,13 @@ import { loadSkill, skillSearchDirs, BUILTIN_SKILL_DIR } from '../src/skills/ind
 const ALL_REGISTERED = {
   hasGate: () => true,
   hasReview: () => true,
-  hasAction: () => true,
+  hasCommand: () => true,
   hasOutput: () => true,
 };
 
 const lint = (md: string, extra: Parameters<typeof lintSkillFlow>[1] = {}) =>
   lintSkillFlow(md, {
     registry: ALL_REGISTERED,
-    hasSkill: () => true,
     hasRole: () => true,
     ...extra,
   });
@@ -39,7 +38,7 @@ const VALID = flow(
   '',
   'start -> work',
   '',
-  '## @agent work',
+  '## @task work',
   '',
   'output: non-empty',
   '',
@@ -85,7 +84,7 @@ test('lint：问题按行号排序（输出要能顺着文件往下读）', () =
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       'output: non-empty',
       '',
@@ -111,7 +110,7 @@ test('lint：warning 不阻断（ok 仍为 true），但会出现在 issues 里'
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       'output: non-empty',
       '',
@@ -138,7 +137,7 @@ test('lint：结构错误存在时**不报图的问题**（避免报出误导性
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       'output: non-empty',
       '',
@@ -165,7 +164,7 @@ test('lint：走进没有出口的环会被报出来（结构没问题，问题�
       '',
       'start -> a',
       '',
-      '## @agent a',
+      '## @task a',
       '',
       'output: non-empty',
       '',
@@ -191,7 +190,6 @@ test('lint：用**生产同一份**注册表跑内置示例技能（lint 通过 
   const r = lintSkillFlow(skill!.markdown, {
     registry: flowRegistryLookup,
     hasRole: businessRoleLookup.hasRole,
-    hasSkill: (name) => Boolean(loadSkill(name, skillSearchDirs())),
   });
   assert.equal(r.skipped, false);
   assert.equal(
@@ -204,9 +202,8 @@ test('lint：用**生产同一份**注册表跑内置示例技能（lint 通过 
 test('lint：注册表缺项会被报出来（与服务端的判定一致）', () => {
   const skill = loadSkill('investment-research', [BUILTIN_SKILL_DIR])!;
   const r = lintSkillFlow(skill.markdown, {
-    registry: { hasGate: () => false, hasReview: () => false, hasAction: () => false },
+    registry: { hasGate: () => false, hasReview: () => false, hasCommand: () => false },
     hasRole: () => true,
-    hasSkill: () => true,
   });
   assert.equal(r.ok, false);
   assert.ok(r.issues.some((i) => i.code.startsWith('registry-missing-')));

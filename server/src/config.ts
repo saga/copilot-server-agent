@@ -124,19 +124,19 @@ export const config = {
    */
   businessRolesJson: env('COPILOT_BUSINESS_ROLES', ''),
   /**
-   * Skill Flow 的 `@agent` 节点允许使用的工具权限类别（逗号分隔，见 workflow/capability.ts）。
+   * Skill Flow 的 `@task` 节点允许使用的工具权限类别（逗号分隔，见 workflow/capability.ts）。
    *
    * 默认 `read,write,url`。**`mcp` 与 `shell` 写在这里也不生效** —— 它们是代码里的
-   * 硬禁止（见 `WORKFLOW_AGENT_ALLOWED_KINDS`）：那两样正是 agent 绕开 `@action`
+   * 硬禁止（见 `WORKFLOW_AGENT_ALLOWED_KINDS`）：那两样正是 agent 绕开 `@command`
    * 审批、直接对外产生业务副作用的路径（调 MCP 发报告、用 shell 打内部接口）。
    * 一条环境变量不该能取消流程的授权模型，所以这条配置只能在 read/write/url 之内选；
-   * SKILL.md 的 `@agent tools:` 只能在它之上再收窄。
+   * SKILL.md 的 `@task tools:` 只能在它之上再收窄。
    */
   workflowAgentTools: env('COPILOT_WORKFLOW_AGENT_TOOLS', 'read,write,url'),
   /**
-   * 是否强制每个 `@agent` 节点声明完成契约（`output:`）。
+   * 是否强制每个 `@task` 节点声明完成契约（`output:`）。
    *
-   * 默认**开**：没有契约时 `@agent success` 只等于"这次 turn 没抛异常"——
+   * 默认**开**：没有契约时 `@task success` 只等于"这次 turn 没抛异常"——
    * 模型回一句"抱歉，我无法完成"同样是 success，流程带着一份空结论一路走到发布审批。
    * 契约是服务端注册的确定性函数，不让模型自评。
    *

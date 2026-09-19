@@ -24,7 +24,7 @@ export type ExecutionStatus =
   | 'expired'
   /**
    * 进程在 turn 中途退出（Pod 重启/被 kill）。**终态，且刻意不自动重试**：
-   * agent 可能已经执行过业务动作（下单、提交表决），自动重跑会重复提交。
+   * agent 可能已经执行过业务命令（下单、提交表决），自动重跑会重复提交。
    * 是否重跑由人工/运维决定。
    */
   | 'interrupted';
@@ -75,20 +75,20 @@ export type ExecutionKind = 'interactive' | 'job' | 'workflow';
 /** execution 因为什么停下来（waiting_* 状态的语义补充） */
 export type WaitReason = 'input' | 'approval';
 
-export interface ActionTarget {
+export interface CommandTarget {
   type: string;
   id: string;
 }
 
 /**
- * 业务动作意图（审批对象）。
+ * 业务命令意图（审批对象）。
  *
- * 审批必须绑定到“批准了什么”：actionType + target + parameters + 发起人，
- * 再经 hashAction() 得到 actionHash，执行前复核——防止“批准 10,000 股，执行 100,000 股”。
+ * 审批必须绑定到“批准了什么”：commandType + target + parameters + 发起人，
+ * 再经 hashCommand() 得到 commandHash，执行前复核——防止“批准 10,000 股，执行 100,000 股”。
  */
-export interface ActionIntent {
-  actionType: string;
-  target: ActionTarget;
+export interface CommandIntent {
+  commandType: string;
+  target: CommandTarget;
   parameters: Record<string, unknown>;
   reason?: string;
   requestedBy: { userId: string; tenantId: string };
@@ -153,7 +153,7 @@ export interface ExecutionRecord {
    *
    * 版本号让写入变成条件更新：`... where execution_id = ? and workflow_version = ?`，
    * 只有拿到当前版本的那个写者能落地，其余拿到冲突并停止推进。
-   * 与 `resource_version` 无关 —— 那个是**动作数据**的版本（审批复核用），不是这行的版本。
+   * 与 `resource_version` 无关 —— 那个是**命令数据**的版本（审批复核用），不是这行的版本。
    */
   workflowVersion?: number;
 
@@ -169,9 +169,9 @@ export interface ExecutionRecord {
   model?: string;
   streaming: boolean;
 
-  /** 高风险动作：agent 只提 intent，server 决定是否需要审批并负责最终执行 */
-  actionIntent?: ActionIntent;
-  actionHash?: string;
+  /** 高风险命令：agent 只提 intent，server 决定是否需要审批并负责最终执行 */
+  commandIntent?: CommandIntent;
+  commandHash?: string;
   /** 意图提出时依据的数据版本；执行前与 resourceVersion 现算值比对 */
   resourceVersion?: string;
   approvedResourceVersion?: string;
@@ -216,9 +216,9 @@ export const EXECUTION_EVENT_TYPES = {
   agentStarted: 'agent.started',
   toolCallStarted: 'agent.tool_call.started',
   toolCallCompleted: 'agent.tool_call.completed',
-  actionProposed: 'agent.proposed_action',
+  commandProposed: 'agent.proposed_command',
   approvalRequired: 'policy.approval_required',
-  actionDenied: 'policy.action_denied',
+  commandDenied: 'policy.command_denied',
   humanTaskCreated: 'human_task.created',
   waitingForApproval: 'execution.waiting_for_approval',
   waitingForInput: 'execution.waiting_for_input',
@@ -228,11 +228,11 @@ export const EXECUTION_EVENT_TYPES = {
   taskDelegated: 'human_task.delegated',
   taskExpired: 'human_task.expired',
   resuming: 'execution.resuming',
-  actionHashVerified: 'action.hash_verified',
-  actionHashMismatch: 'action.hash_mismatch',
-  resourceVersionMismatch: 'action.resource_version_mismatch',
-  authorizationChecked: 'action.authorization.checked',
-  actionExecuted: 'action.executed',
+  commandHashVerified: 'command.hash_verified',
+  commandHashMismatch: 'command.hash_mismatch',
+  resourceVersionMismatch: 'command.resource_version_mismatch',
+  authorizationChecked: 'command.authorization.checked',
+  commandExecuted: 'command.executed',
   completed: 'execution.completed',
   failed: 'execution.failed',
   cancelled: 'execution.cancelled',
@@ -244,7 +244,7 @@ export const EXECUTION_EVENT_TYPES = {
   // --- Skill Flow（kind = 'workflow'）：节点级时间线 ---
   // 审计链会变成：workflow.step.started → agent.started → agent.tool_call.completed
   //   → workflow.step.completed(outcome) → workflow.waiting → human_task.created
-  //   → approval.submitted → workflow.resumed → action.executed → workflow.completed
+  //   → approval.submitted → workflow.resumed → command.executed → workflow.completed
   workflowStarted: 'workflow.started',
   workflowStepStarted: 'workflow.step.started',
   workflowStepCompleted: 'workflow.step.completed',
@@ -286,3 +286,28 @@ export const EXECUTION_EVENT_TYPES = {
   workflowCompleted: 'workflow.completed',
   workflowFailed: 'workflow.failed',
 } as const;
+
+/**
+ * 改名兼容层：`action.*` → `command.*`。
+ *
+ * 事件类型是**落在审计表里**的字符串，历史行不会跟着代码改名。少了这张表，
+ * 同一条逻辑事件在时间线上就有两个名字 —— 运维按 `command.executed` 查会漏掉
+ * 改名之前的全部记录，而这恰恰是金融流程最需要能查的那一段。
+ *
+ * 只在**读**的时候归一化（见 `canonicalEventType`）：写永远只写新名字。
+ * 这样新旧数据能一起被同一套查询看见，也不会让这张表随时间越滚越大。
+ */
+const LEGACY_EVENT_TYPE_ALIASES: Record<string, string> = {
+  'agent.proposed_action': 'agent.proposed_command',
+  'policy.action_denied': 'policy.command_denied',
+  'action.hash_verified': 'command.hash_verified',
+  'action.hash_mismatch': 'command.hash_mismatch',
+  'action.resource_version_mismatch': 'command.resource_version_mismatch',
+  'action.authorization.checked': 'command.authorization.checked',
+  'action.executed': 'command.executed',
+};
+
+/** 把历史事件名归一化成当前名字；已经是新名字（或从未改过名）的原样返回 */
+export function canonicalEventType(type: string): string {
+  return LEGACY_EVENT_TYPE_ALIASES[type] ?? type;
+}

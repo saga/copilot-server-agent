@@ -187,13 +187,30 @@ export const addParticipantSchema = z.object({
   role: z.enum(['member', 'observer']).optional().default('member'),
 });
 
-export const actionSchema = z.object({
-  actionType: z.string().min(1),
-  target: z.object({ type: z.string().min(1), id: z.string().min(1) }),
-  parameters: z.record(z.string(), z.unknown()).optional().default({}),
-  reason: z.string().optional(),
-  resourceVersion: z.string().optional(),
-});
+/**
+ * 提业务命令的请求体。
+ *
+ * **兼容层**：改名之前字段叫 `actionType`，现在叫 `commandType`。
+ * 两个都收（`commandType` 优先），因为调用方可能还没跟着升级 —— 但**只发新名字**。
+ * 不做 `z.union` 是因为需要在解析后把结果归一化成单一形状，下游只认 `commandType`。
+ */
+export const commandSchema = z
+  .object({
+    commandType: z.string().min(1).optional(),
+    /** @deprecated 改名前的字段名，等价于 `commandType` */
+    actionType: z.string().min(1).optional(),
+    target: z.object({ type: z.string().min(1), id: z.string().min(1) }),
+    parameters: z.record(z.string(), z.unknown()).optional().default({}),
+    reason: z.string().optional(),
+    resourceVersion: z.string().optional(),
+  })
+  .transform(({ actionType, ...rest }) => ({
+    ...rest,
+    commandType: rest.commandType ?? actionType ?? '',
+  }))
+  .refine((v) => v.commandType.length > 0, {
+    message: 'commandType 不能为空（旧字段名 actionType 也可以）',
+  });
 
 /** 内联 MCP 里 cwd 是 workingDirectory 的别名，统一映射成 SDK 字段 */
 export function normalizeInlineMcp(

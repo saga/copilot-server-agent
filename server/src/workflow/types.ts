@@ -9,7 +9,7 @@
  *        ↓  语义校验（注册表 / 角色 / 分支契约 / 属性只能更严）
  *   FlowDefinition     系统确认这是什么、允许执行什么（本文件）
  *        ↓  控制流分析（可达性 / 能否到达终态）—— skills/flow-analyzer.ts
- *   WorkflowRunner     状态怎么推进 —— 复用现有 Execution / HumanTask / Action 体系
+ *   WorkflowRunner     状态怎么推进 —— 复用现有 Execution / HumanTask / Command 体系
  *
  * 为什么不合成一层：`FlowAst` 必须能携带**不合法的内容**（`strategy: all`、指向不存在
  * 节点的 route），否则"你写的第 12 行不合法"这种带行号的报错就无从生成；而
@@ -21,24 +21,29 @@
  *
  * 节点只有 6 种，没有 parallel / timer / subprocess / expression：
  *
- *   @agent     跑一次 agent turn（走 Copilot session）—— 旧名 @subagent，语义相同
+ *   @task      执行一个受约束的 **AI 工作单元**（由配置的 Agent Runtime 跑）
  *   @gate      确定性判断（走服务端注册的 gate，LLM 不决定合规边界）
  *   @review    人工审核（复用 HumanTask + ApprovalPolicy）
- *   @action    业务动作（复用 ActionService：策略 → 审批 → hash/版本复核 → executor）
+ *   @command   业务命令：受控的业务状态变更（复用 CommandService：策略 → 审批 → hash/版本复核 → executor）
  *   @stop      失败/拒绝终态
  *   @end       成功终态
+ *
+ * `@task` 这个名字是刻意的：**Agent 不是 Workflow 的一级概念**，它只是 `@task` 的执行实现。
+ * 所以节点 id 是一个纯标签，既不是技能名、也不代表"起一个 subagent"——
+ * 换 Copilot SDK / OpenAI Agents SDK / DeepAgents / LangGraph 都不影响这一层。
+ * （v1 用过 `@agent`，它的前身叫 `@subagent`；两个旧名都已移除，不做别名。）
  *
  * 权限、角色、审批策略**不写在 SKILL.md 里**：节点只声明"这里需要 compliance-review"，
  * 由服务端 registry 决定谁有资格（与"LLM 不能定义 enterprise security boundary"一致）。
  */
 
-export type FlowNodeType = 'agent' | 'gate' | 'review' | 'action' | 'stop' | 'end';
+export type FlowNodeType = 'task' | 'gate' | 'review' | 'command' | 'stop' | 'end';
 
 /** 解析期出现的块类型，比节点多一个 `@flow`（流程入口） */
 export type FlowBlockType = FlowNodeType | 'flow';
 
 export interface FlowRoute {
-  /** 出口名：agent/action 用 success|fail；gate 用 gate 自己返回的 outcome；review 用 approve|reject */
+  /** 出口名：task/command 用 success|fail；gate 用 gate 自己返回的 outcome；review 用 approve|reject */
   on: string;
   /** 目标节点 id */
   to: string;
@@ -49,7 +54,7 @@ export interface FlowNode {
   type: FlowNodeType;
   /** 节点正文（原样保留 Markdown，不做 LLM 解析）。**已剥掉开头的保留属性行** */
   body: string;
-  /** 保留属性（只有 @review / @action 有；由校验器校验并归一化） */
+  /** 保留属性（只有 @review / @command 有；由校验器校验并归一化） */
   attrs: FlowNodeAttrs;
   routes: FlowRoute[];
   /** `## @xxx` 所在行（1-based）；报错指给用户看的那一行 */
@@ -72,7 +77,7 @@ export interface FlowDefinition {
  *
  *   pending   还没开始 —— 可以安全执行
  *   running   已经开始 —— 进程在这里退出的话，无法确认它是否已经完成
- *   waiting   停在等人工任务（review / action 审批）
+ *   waiting   停在等人工任务（review / command 审批）
  *   completed 终态节点（@stop / @end）已收尾
  *
  * 缺省（老数据）按 `pending` 处理。
@@ -86,7 +91,7 @@ export type WorkflowStepStatus = 'pending' | 'running' | 'waiting' | 'completed'
  * 等的是哪个任务"。否则 execution = waiting_for_approval 但没人知道等的是哪一步。
  */
 export interface WorkflowState {
-  /** 技能名（= 节点 `@agent <skill>` 的名字） */
+  /** 承载这条流程的技能名（技能目录里的目录名，不是节点 id） */
   skill: string;
   flow: string;
   /**
@@ -101,30 +106,30 @@ export interface WorkflowState {
   stepStatus?: WorkflowStepStatus;
   /** 已执行步数（上限见 MAX_FLOW_STEPS） */
   steps: number;
-  /** 正等着的人工任务（review / action 审批） */
+  /** 正等着的人工任务（review / command 审批） */
   waitingTaskId?: string;
   /** 最近一个节点的出口名，便于审计与排障 */
   lastOutcome?: string;
-  /** 最近一个 @agent 的输出（截断），供后续 gate/action 判断依据 */
+  /** 最近一个 @task 的输出（截断），供后续 gate/command 判断依据 */
   lastOutput?: string;
 }
 
 /**
- * 传给 gate / action 的上下文。
+ * 传给 gate / command 的上下文。
  * 没有 variables / expressions：只有这一层的执行信息。
  */
 export interface FlowContext {
   executionId: string;
   sessionId: string;
   tenantId: string;
-  /** 发起人（构建 ActionIntent 的 requestedBy 用；不是会话 owner） */
+  /** 发起人（构建 CommandIntent 的 requestedBy 用；不是会话 owner） */
   initiatorId: string;
   skill: string;
   flow: string;
   nodeId: string;
   /** execution 建立时带的 input（如 { securityId } ） */
   input?: unknown;
-  /** 上一个 @agent 的输出（截断后） */
+  /** 上一个 @task 的输出（截断后） */
   lastOutput?: string;
 }
 
@@ -171,19 +176,19 @@ export function hasBlockingIssue(issues: readonly FlowIssue[]): boolean {
 /**
  * 运行时出口词汇表 —— 校验器与 runner 共用这一份，避免两边各写一份字面量后漂移。
  *
- *   @agent / @action     只会给出 success | fail（跑成功或跑失败）
+ *   @task / @command    只会给出 success | fail（跑成功或跑失败）
  *   @review              只会给出 approve | reject（打回重做=把 reject 的 route 指回上一步）
  *   @gate                出口由服务端注册的实现决定 —— 见 FlowGate.outcomes（静态可校验）
  *   @stop / @end         终态，没有出口
  */
 export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
-  agent: ['success', 'fail'],
+  task: ['success', 'fail'],
   // gate 没有固定词汇表：出口名由注册的实现声明（registry.gateOutcomes），
   // 所以这里给空数组，校验器改走注册表那条路径 —— 硬编码 pass/fail 会把
   // "again / review / escalate" 这类合法出口误判成缺 route。
   gate: [],
   review: ['approve', 'reject'],
-  action: ['success', 'fail'],
+  command: ['success', 'fail'],
   stop: [],
   end: [],
 };
@@ -192,8 +197,8 @@ export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
  * 节点正文最前面允许出现的**保留属性**（`name: value` 行）。
  *
  *   @review   role / strategy / required / exclude   —— 谁能批、要几票、发起人能否自批
- *   @action   role                                   —— 把动作审批资格收窄到某个业务角色
- *   @agent    output / tools                         —— 完成契约 / 能力边界
+ *   @command  role                                   —— 把命令审批资格收窄到某个业务角色
+ *   @task     output / tools                         —— 完成契约 / 能力边界
  *
  * 一条贯穿全部属性的规则：**属性只能比服务端更严**（见 flow-validator 的 `attr-widens`）。
  * SKILL.md 是会被 LLM 读到、也会被人随手改的文件，不能靠它扩大授权面或放宽能力边界。
@@ -202,10 +207,10 @@ export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
  * 写什么都改变不了它 —— 能写的东西只有"看起来有影响"的假象。
  */
 export const NODE_ATTRS: Record<FlowNodeType, readonly string[]> = {
-  agent: ['output', 'tools'],
+  task: ['output', 'tools'],
   gate: [],
   review: ['role', 'strategy', 'required', 'exclude'],
-  action: ['role'],
+  command: ['role'],
   stop: [],
   end: [],
 };
@@ -213,7 +218,7 @@ export const NODE_ATTRS: Record<FlowNodeType, readonly string[]> = {
 /**
  * 权限类别 —— 与 SDK `PermissionRequest.kind` 对齐的**白名单**子集。
  *
- * 只列 @agent 节点可能被允许的类别：SDK 里还有 memory / custom-tool / extension 等，
+ * 只列 @task 节点可能被允许的类别：SDK 里还有 memory / custom-tool / extension 等，
  * 它们**不在白名单里**，因此永远无法通过能力边界（默认拒绝，与 tool-policy 一致）。
  */
 export type FlowPermissionKind = 'read' | 'write' | 'shell' | 'mcp' | 'url';
@@ -231,12 +236,16 @@ export function isFlowPermissionKind(value: string): value is FlowPermissionKind
 }
 
 /**
- * workflow `@agent` **永远**允许的权限类别，也就是它的硬上限。
+ * `@task` 节点**永远**允许的权限类别，也就是它的硬上限。
+ *
+ * 名字里的 "AGENT" 指的是 **Agent Runtime**（`@task` 的执行实现），不是已移除的
+ * `@agent` 块关键字；`COPILOT_WORKFLOW_AGENT_TOOLS` 这个环境变量名沿用不改，
+ * 免得已经部署的配置在升级后静默失配。
  *
  * 这是代码里的不变式，不是配置：`COPILOT_WORKFLOW_AGENT_TOOLS` 只能从中挑选，
  * 挑不出 `mcp` / `shell`；`resolveAgentTools()` 也会再过滤一遍（fail-closed 的最后一道）。
  *
- * 为什么必须是硬编码而不是"配置默认值"：`mcp` / `shell` 是 agent **绕开 `@action`
+ * 为什么必须是硬编码而不是"配置默认值"：`mcp` / `shell` 是 agent **绕开 `@command`
  * 审批直接对外产生业务副作用**的两条路（调 MCP server 把报告发出去、用 shell curl
  * 一个内部下单接口）。把它们做成配置默认值等于说"一个环境变量就能取消整条流程的
  * 授权模型"—— 而 SKILL.md、审批记录、审计链上都不会留下任何痕迹。
@@ -325,18 +334,18 @@ export interface FlowNodeAttrs {
    */
   exclude?: 'initiator' | 'none';
   /**
-   * `@agent` 的完成契约 id（服务端注册，见 registry 的 FlowOutput）。
+   * `@task` 的完成契约 id（服务端注册，见 registry 的 FlowOutput）。
    *
-   * 它解决的问题：`@agent success` 只代表"这次 turn 没抛异常"，不代表业务上做完了。
+   * 它解决的问题：`@task success` 只代表"这次 turn 没抛异常"，不代表业务上做完了。
    * 有了契约，节点返回 success 之前必须先过服务端注册的确定性校验 —— 不让 LLM 自评。
    */
   output?: string;
   /**
-   * `@agent` 允许的权限类别（`read,write`）。
+   * `@task` 允许的权限类别（`read,write`）。
    *
    * 与 `role:` 同理，**只能比服务端上限更严**（上限见 config.workflowAgentTools）：
    * 默认上限是 read/write/url —— 也就是"能读能写工作区文件，但**碰不到 MCP 与 shell**"，
-   * 因为那两样正是绕开 `@action` 审批直接产生业务副作用的路径。
+   * 因为那两样正是绕开 `@command` 审批直接产生业务副作用的路径。
    */
   tools?: FlowPermissionKind[];
 }

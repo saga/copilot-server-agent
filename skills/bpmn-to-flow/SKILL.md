@@ -35,10 +35,10 @@ Skill Flow 描述 Agent-enabled business workflow。
 
 ```text
 @flow
-@agent
+@task
 @gate
 @review
-@action
+@command
 @stop
 @end
 ```
@@ -284,7 +284,7 @@ UserTask 表示：
 
 * 人工执行一个确定性操作
 
-则可以提出 `@action` 候选，但必须记录为：
+则可以提出 `@command` 候选，但必须记录为：
 
 ```text
 NEEDS_REVIEW
@@ -296,7 +296,7 @@ NEEDS_REVIEW
 
 # ServiceTask
 
-ServiceTask 不允许机械转换成 `@agent`。
+ServiceTask 不允许机械转换成 `@task`。
 
 必须根据语义分类：
 
@@ -314,7 +314,7 @@ Generate report
 转换：
 
 ```md
-## @agent <node-id>
+## @task <node-id>
 ```
 
 ### Deterministic Decision
@@ -349,7 +349,7 @@ Update master data
 转换：
 
 ```md
-## @action <node-id>
+## @command <node-id>
 ```
 
 ### External / Unknown Service
@@ -616,7 +616,7 @@ NEEDS_REVIEW
 NEEDS_REVIEW
 ```
 
-不要自动模拟为普通 `@agent`。
+不要自动模拟为普通 `@task`。
 
 未来可以映射为独立 Skill / Flow invocation。
 
@@ -910,12 +910,12 @@ NEEDS_REVIEW
 
 ---
 
-# @agent Mapping
+# @task Mapping
 
 只有具备明显 AI / analysis / research / generation 语义的 BPMN Task 才建议转换成：
 
 ```md
-## @agent <node-id>
+## @task <node-id>
 
 output: <contract>
 
@@ -936,7 +936,7 @@ Generate report
 
 ---
 
-# @agent Completion Contract
+# @task Completion Contract
 
 如果能够确定输出类型：
 
@@ -970,7 +970,7 @@ NEEDS_REVIEW
 
 ---
 
-# @agent Tools
+# @task Tools
 
 不要从 BPMN 自动推导：
 
@@ -990,12 +990,12 @@ Agent 能力由服务端配置和现有 Tool Policy 决定。
 
 ---
 
-# @action Mapping
+# @command Mapping
 
 具有业务副作用的节点优先转换为：
 
 ```md
-## @action <node-id>
+## @command <node-id>
 
 <description>
 
@@ -1013,17 +1013,17 @@ Send external notification
 Create transaction
 ```
 
-如果能找到对应的 FlowAction Registry：
+如果能找到对应的 FlowCommand Registry：
 
 ```text
-BPMN action
+BPMN command
      ↓
-FlowAction
+FlowCommand
 ```
 
 可以自动转换。
 
-如果不存在对应的注册 Action：
+如果不存在对应的注册 Command：
 
 ```text
 NEEDS_REVIEW
@@ -1033,7 +1033,7 @@ NEEDS_REVIEW
 
 ---
 
-# @action Role
+# @command Role
 
 如果 BPMN 明确要求特定角色执行或批准 Action：
 
@@ -1041,7 +1041,7 @@ NEEDS_REVIEW
 role: <business-role>
 ```
 
-但该 Role 必须已经存在于服务端注册的 ActionPolicy。
+但该 Role 必须已经存在于服务端注册的 CommandPolicy。
 
 如果不存在：
 
@@ -1066,11 +1066,11 @@ NEEDS_REVIEW
 
 明确的业务副作用
         ↓
-@action
+@command
 
 明确的 AI / analysis 工作
         ↓
-@agent
+@task
 ```
 
 不要因为任务名称出现：
@@ -1295,10 +1295,10 @@ BPMN 中要求人工角色的任务不能丢失 Role Mapping。
 
 ```text
 @flow
-@agent
+@task
 @gate
 @review
-@action
+@command
 @stop
 @end
 ```
@@ -1313,9 +1313,9 @@ BPMN 中要求人工角色的任务不能丢失 Role Mapping。
 * 非 terminal node 必须有 route
 * route outcome 不得重复
 * 所有节点从 start 可达
-* `@agent` 只能使用 `success / fail`
+* `@task` 只能使用 `success / fail`
 * `@review` 只能使用 `approve / reject`
-* `@action` 只能使用 `success / fail`
+* `@command` 只能使用 `success / fail`
 * `@gate` 必须使用注册表声明的 outcomes
 * `role` 必须是 Business Role
 * `output` 必须是已注册 FlowOutput
@@ -1331,7 +1331,7 @@ BPMN 中要求人工角色的任务不能丢失 Role Mapping。
 ```text
 FlowGate
 FlowReview
-FlowAction
+FlowCommand
 FlowOutput
 BusinessRole
 ```
@@ -1463,7 +1463,7 @@ Gateway
 
 start -> investment-analysis
 
-## @agent investment-analysis
+## @task investment-analysis
 
 output: investment.analysis
 
@@ -1498,7 +1498,7 @@ role: investment.committee.member
 - approve -> publish
 - reject -> investment-rejected
 
-## @action publish
+## @command publish
 
 发布已经批准的研究结果。
 

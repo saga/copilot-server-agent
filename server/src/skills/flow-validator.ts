@@ -21,7 +21,7 @@ import {
  * 输入是"作者写了什么"，输出是"系统确认这是什么、允许执行什么"。中间这一步是
  * 整条流水线里唯一做**授权判断**的地方，所以它也是唯一需要注册表的层。
  *
- * 只做 14 件事：
+ * 只做 13 件事：
  *   1. 恰好一个 @flow（v1 一个技能一条流程）
  *   2. @flow 声明了 start，且 start 不重复
  *   3. 节点 id 唯一
@@ -29,7 +29,7 @@ import {
  *   5. @end / @stop 不允许再 route
  *   6. 非终态节点必须至少有一条 route
  *   7. **出口必须是该节点类型的封闭集合**（`node-unknown-outcome`）：
- *      `@agent` / `@action` 只有 success / fail，`@review` 只有 approve / reject。
+ *      `@task` / `@command` 只有 success / fail，`@review` 只有 approve / reject。
  *      多写一个出口（`- retry -> retry`）是一条**永远不会走到的假分支**，而分析器
  *      会把它当真 —— 它可能让一个本该报错的流程看起来可达。
  *   8. **同一个出口不能有两条 route**（`route-outcome-duplicate`，error）；
@@ -42,8 +42,8 @@ import {
  *  12. **`strategy: ALL` 必须真的全员**：生效票数 < 生效角色数 → `review-all-required`
  *      （`ALL + required: 1` 只是名字叫 ALL 的 ANY，审计链上却写着 ALL）
  *  13. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
- *  14. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
- *      `mcp` / `shell` 永久禁止（`agent-tools-forbidden`），其余只能比服务端上限更严
+ *  14. **@task 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
+ *      `mcp` / `shell` 永久禁止（`task-tools-forbidden`），其余只能比服务端上限更严
  *
  * 所有与 route 有关的问题都指向 **route 自己那一行**（AST 带行号），不是节点标题行 ——
  * 一个 20 行的节点里让你自己找哪一行有问题，等于没报。
@@ -53,15 +53,19 @@ import {
  * 不回答"这张图长什么样" —— 两件事的变化原因不同（前者跟着授权模型走，
  * 后者跟着业务建模需求走），混在一起会让每条新检查都要重新理解整张图。
  *
- * `@agent <skill>` 指向的技能是否存在由调用方补校验（校验器不认识技能目录）；
- * `role:` 指向的业务角色是否已登记同理（见 `opts.hasRole`）。
+ * **刻意不检查 `@task <id>` 的 id 是不是某个技能名**：`@task` 跑的是当前 session 的
+ * 一次 AI 工作单元，节点 id 只是这张图里的一个标签，不代表"去调用那个技能"。
+ * 早先版本要求 id 必须命中技能目录（`skill-missing`），那是把"节点名"和"技能名"
+ * 绑在一起 —— 一旦想让 `@task research` 只是"研究这一步"，这个约束就自相矛盾。
+ *
+ * `role:` 指向的业务角色是否已登记由调用方补校验（见 `opts.hasRole`）。
  */
 
 export interface FlowRegistryLookup {
   hasGate(name: string): boolean;
   hasReview(name: string): boolean;
-  hasAction(name: string): boolean;
-  /** `@agent output:` 指向的完成契约是否已注册 */
+  hasCommand(name: string): boolean;
+  /** `@task output:` 指向的完成契约是否已注册 */
   hasOutput?(name: string): boolean;
   /**
    * 该 gate 声明的出口名。
@@ -82,20 +86,18 @@ export interface FlowRegistryLookup {
 export interface ValidateSkillFlowOptions {
   /** execution 上声明的 flow 名；与 `@flow` 的 id 不一致时报错 */
   flow?: string;
-  /** 服务端注册表：@gate/@review/@action 必须已登记（否则会在执行到那一步时才知道） */
+  /** 服务端注册表：@gate/@review/@command 必须已登记（否则会在执行到那一步时才知道） */
   registry?: FlowRegistryLookup;
-  /** `@agent <id>` 指向的技能是否存在 */
-  hasSkill?: (name: string) => boolean;
   /** `role:` 指向的业务角色是否已在 RoleRegistry 登记（见 identity/business-roles.ts） */
   hasRole?: (id: string) => boolean;
   /**
-   * `@agent tools:` 的服务端**上限**（见 config.workflowAgentTools）。
+   * `@task tools:` 的服务端**上限**（见 config.workflowAgentTools）。
    *
-   * 属性只能比它更严：默认上限不含 `mcp` 与 `shell`，因为那两样正是绕开 `@action`
+   * 属性只能比它更严：默认上限不含 `mcp` 与 `shell`，因为那两样正是绕开 `@command`
    * 审批直接产生业务副作用的路径。不提供时按"全部允许"处理（只做结构校验的场景）。
    */
   agentTools?: readonly FlowPermissionKind[];
-  /** 是否要求每个 `@agent` 都声明完成契约（见 config.workflowRequireAgentOutput） */
+  /** 是否要求每个 `@task` 都声明完成契约（见 config.workflowRequireAgentOutput） */
   requireAgentOutput?: boolean;
 }
 
@@ -200,7 +202,7 @@ function buildAttrs(input: {
             line: attr.line,
             ...nodeIdField,
             message:
-              `@agent${nodeId ? ` ${nodeId}` : ''} 引用的完成契约 "${id}" 没有在服务端注册` +
+              `@task${nodeId ? ` ${nodeId}` : ''} 引用的完成契约 "${id}" 没有在服务端注册` +
               '（SKILL.md 不能自己定义"什么叫做完了"—— 那是服务端的判定）',
           });
           break;
@@ -504,7 +506,7 @@ export function validateSkillFlow(
       }
       // 6a. 固定出口词汇表的节点类型**不允许"多出来的出口"**。
       //
-      // 少了这一条，`@agent research` 写 `- retry -> retry` 会被放过：运行时 agent 只会
+      // 少了这一条，`@task research` 写 `- retry -> retry` 会被放过：运行时 task 只会
       // 返回 success / fail，那条 route 永远走不到 —— 一条**假分支**。
       // 更坏的是分析器会把这条边当真：它可能让 `retry` 看起来可达，
       // 从而把一个本该报错的流程放行。所以出口集合必须是**严格封闭**的。
@@ -524,7 +526,7 @@ export function validateSkillFlow(
     checkDuplicateOutcomes(astRoutes, issues, { nodeId: node.id, label });
   }
 
-  // 6b. 出口必须写全：@agent/@action 只会有 success|fail，@review 只会有 approve|reject。
+  // 6b. 出口必须写全：@task/@command 只会有 success|fail，@review 只会有 approve|reject。
   // 少写一个出口，运行时那条分支就无处可去 —— 这类问题在执行前就该报出来。
   // @gate 不在这里：它的出口词汇表由注册表声明，走下面 6c 那条路径。
   for (const node of Object.values(nodes)) {
@@ -593,21 +595,13 @@ export function validateSkillFlow(
     const missing =
       (node.type === 'gate' && opts.registry && !opts.registry.hasGate(node.id)) ||
       (node.type === 'review' && opts.registry && !opts.registry.hasReview(node.id)) ||
-      (node.type === 'action' && opts.registry && !opts.registry.hasAction(node.id));
+      (node.type === 'command' && opts.registry && !opts.registry.hasCommand(node.id));
     if (missing) {
       issues.push({
         code: `registry-missing-${node.type}`,
         line: node.headingLine,
         nodeId: node.id,
         message: `${node.type} "${node.id}" 没有在服务端注册（SKILL.md 不能自己定义 ${node.type} 的语义）`,
-      });
-    }
-    if (node.type === 'agent' && opts.hasSkill && !opts.hasSkill(node.id)) {
-      issues.push({
-        code: 'skill-missing',
-        line: node.headingLine,
-        nodeId: node.id,
-        message: `@agent ${node.id} 没有对应的技能（技能目录里没有名为 "${node.id}" 的 SKILL.md）`,
       });
     }
   }
@@ -635,29 +629,29 @@ export function validateSkillFlow(
     }
   }
 
-  // 8c. `@agent tools:`：**硬禁止** + 部署上限。
+  // 8c. `@task tools:`：**硬禁止** + 部署上限。
   //
   // 硬禁止（mcp / shell）与部署配置无关，所以**无条件**检查 —— 它们是 agent 绕开
-  // `@action` 审批、直接对外产生业务副作用的两条路（调 MCP server 发报告、
+  // `@command` 审批、直接对外产生业务副作用的两条路（调 MCP server 发报告、
   // 用 shell curl 内部接口）。SKILL.md 写 `tools: mcp` 就是在要求放宽授权模型，
   // 必须在校验期拦住，而不是"等它落进上限判定、看起来像个配置问题"。
   //
   // 上限（opts.agentTools）是部署侧的（COPILOT_WORKFLOW_AGENT_TOOLS），只在提供时检查。
   for (const node of Object.values(nodes)) {
-    if (node.type !== 'agent' || !node.attrs.tools) continue;
+    if (node.type !== 'task' || !node.attrs.tools) continue;
 
     const forbidden = node.attrs.tools.filter(
       (t) => !WORKFLOW_AGENT_ALLOWED_KINDS.includes(t),
     );
     if (forbidden.length) {
       issues.push({
-        code: 'agent-tools-forbidden',
+        code: 'task-tools-forbidden',
         line: node.headingLine,
         nodeId: node.id,
         message:
-          `@agent ${node.id} 的 tools: ${forbidden.join('、')} 是**永久禁止**的权限类别。` +
+          `@task ${node.id} 的 tools: ${forbidden.join('、')} 是**永久禁止**的权限类别。` +
           'MCP server 与 shell 都是"绕过流程审批直接对外产生副作用"的路径，' +
-          '业务动作只能走流程里声明的 @action 节点（策略 → 审批 → hash/版本复核 → executor）。' +
+          '业务命令只能走流程里声明的 @command 节点（策略 → 审批 → hash/版本复核 → executor）。' +
           `这不是配置项：改 COPILOT_WORKFLOW_AGENT_TOOLS 也不会生效（可用：${WORKFLOW_AGENT_ALLOWED_KINDS.join(' / ')}）`,
       });
       continue;
@@ -668,31 +662,31 @@ export function validateSkillFlow(
     const outside = node.attrs.tools.filter((t) => !ceiling.includes(t));
     if (outside.length) {
       issues.push({
-        code: 'agent-tools-widens',
+        code: 'task-tools-widens',
         line: node.headingLine,
         nodeId: node.id,
         message:
-          `@agent ${node.id} 的 tools: ${outside.join('、')} 超出服务端允许的 ` +
+          `@task ${node.id} 的 tools: ${outside.join('、')} 超出服务端允许的 ` +
           `${ceiling.join(' / ') || '(空)'} —— 能力边界只能收窄。` +
           '要放开请改服务端配置（COPILOT_WORKFLOW_AGENT_TOOLS），不要改 SKILL.md',
       });
     }
   }
 
-  // 8d. 完成契约：开启 requireAgentOutput 时，每个 @agent 都必须声明。
+  // 8d. 完成契约：开启 requireAgentOutput 时，每个 @task 都必须声明。
   // 生产 wiring 默认就是开的（config.workflowRequireAgentOutput 默认 true）——
-  // 没有契约时 `@agent success` 只等于"turn 没抛异常"，模型回一句"我无法完成"也是 success。
+  // 没有契约时 `@task success` 只等于"turn 没抛异常"，模型回一句"我无法完成"也是 success。
   // 这个开关留给"存量 SKILL.md 还没补契约"的迁移期。
   if (opts.requireAgentOutput) {
     for (const node of Object.values(nodes)) {
-      if (node.type !== 'agent' || node.attrs.output) continue;
+      if (node.type !== 'task' || node.attrs.output) continue;
       issues.push({
-        code: 'agent-output-missing',
+        code: 'task-output-missing',
         line: node.headingLine,
         nodeId: node.id,
         message:
-          `@agent ${node.id} 没有声明完成契约（写法：output: <契约 id>，写在正文最前面）。` +
-          '当前部署要求每个 agent 步骤都有服务端可判定的完成条件',
+          `@task ${node.id} 没有声明完成契约（写法：output: <契约 id>，写在正文最前面）。` +
+          '当前部署要求每个 task 步骤都有服务端可判定的完成条件',
       });
     }
   }

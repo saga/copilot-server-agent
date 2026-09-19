@@ -24,6 +24,7 @@ const PG_MIGRATION_FILES = [
   'src/db/migrations/002_collaboration.sql',
   'src/db/migrations/003_workflow.sql',
   'src/db/migrations/004_workflow_single_writer.sql',
+  'src/db/migrations/005_rename_action_to_command.sql',
 ];
 /** 001 是建表那一版，它自己的补列已写进 SQLite 的 CREATE TABLE；增量补列从 002 起比对 */
 const PG_INCREMENTAL_FILES = PG_MIGRATION_FILES.slice(1);
@@ -48,9 +49,13 @@ const EXPECTED_TABLES = [
 ];
 
 const createTableRe = /create table if not exists\s+(\w+)\s*\(([\s\S]*?)\n\);/g;
-/** PG 的补列语句：老库升级路径，列必须本来就在 CREATE TABLE 里 */
-const addColumnRe =
-  /alter table\s+(\w+)\s+add column(?:\s+if not exists)?\s+(\w+)/gi;
+/** 补列语句：`alter table t add column c ...` —— 列必须本来就在 CREATE TABLE 里 */
+const ADD_COLUMN_RE = /alter table\s+(\w+)\s+add column(?:\s+if not exists)?\s+(\w+)/i;
+/** 改名语句：`alter table t rename column a to b` —— 新名必须已在 CREATE TABLE 里，旧名必须不在 */
+const RENAME_COLUMN_RE = /alter table\s+(\w+)\s+rename column\s+(\w+)\s+to\s+(\w+)/i;
+/** 全量扫描用的带 `g` 版本（单条解析请用上面两个不带 `g` 的，避免 lastIndex 状态） */
+const addColumnRe = new RegExp(ADD_COLUMN_RE.source, 'gi');
+const renameColumnRe = new RegExp(RENAME_COLUMN_RE.source, 'gi');
 
 function parseTables(sql: string): Map<string, Set<string>> {
   const tables = new Map<string, Set<string>>();
@@ -68,16 +73,26 @@ function parseTables(sql: string): Map<string, Set<string>> {
   return tables;
 }
 
-/** 行属性读取：r.content_chars / rows[0].task_id / row.action_hash */
+/** 行属性读取：r.content_chars / rows[0].task_id / row.command_hash */
 function rowPropertyReads(source: string): string[] {
   const re = /\b[a-zA-Z_][a-zA-Z0-9]*\.([a-z][a-z0-9]*_[a-z0-9_]+)\b/g;
   return [...new Set([...source.matchAll(re)].map((m) => m[1]!))].sort();
 }
 
-/** 把 `alter table ... add column` 折进表结构：算出 PostgreSQL 的**生效**列集，而非建表语句的列集 */
+/**
+ * 把升级语句折进表结构：算出 PostgreSQL 的**生效**列集，而非建表语句的列集。
+ *
+ * 补列与改名都要应用 —— 只看 CREATE TABLE 的话，改过名的列会算成"两边不一致"。
+ */
 function applyColumnChanges(tables: Map<string, Set<string>>, sql: string): void {
   for (const match of sql.matchAll(addColumnRe)) {
     tables.get(match[1]!)?.add(match[2]!);
+  }
+  for (const match of sql.matchAll(renameColumnRe)) {
+    const cols = tables.get(match[1]!);
+    if (!cols) continue;
+    cols.delete(match[2]!);
+    cols.add(match[3]!);
   }
 }
 
@@ -104,28 +119,50 @@ test('两份 DDL 的表结构逐列一致', () => {
   assert.deepEqual(diffs, [], `两份 DDL 列不一致：\n${diffs.join('\n')}`);
 });
 
-test('补列语句只补 CREATE TABLE 已声明的列', () => {
+/** 把一条升级语句归一化成可比较的键：`t.c`（补列）/ `t.a->b`（改名） */
+function upgradeKey(statement: string): string {
+  const rename = RENAME_COLUMN_RE.exec(statement);
+  if (rename) return `${rename[1]}.${rename[2]}->${rename[3]}`;
+  const add = ADD_COLUMN_RE.exec(statement);
+  if (add) return `${add[1]}.${add[2]}`;
+  throw new Error(`无法解析的升级语句：${statement}`);
+}
+
+test('升级语句与 CREATE TABLE 不漂移', () => {
   const allColumns = new Set([...sqliteTables.values()].flatMap((c) => [...c]));
   const stray: string[] = [];
   for (const statement of SQLITE_COLUMN_UPGRADES) {
-    const parsed = addColumnRe.exec(statement);
-    addColumnRe.lastIndex = 0;
-    assert.ok(parsed, `无法解析的补列语句：${statement}`);
-    const [, table, column] = parsed;
+    const rename = RENAME_COLUMN_RE.exec(statement);
+    if (rename) {
+      const [, table, from, to] = rename;
+      if (!sqliteTables.has(table!)) stray.push(`${table} 不是 SQLite DDL 里的表`);
+      // 改名后的 CREATE TABLE 必须用**新名**，旧名不能还留着 —— 留着就说明只改了升级语句没改建表
+      else if (!allColumns.has(to!)) stray.push(`${table}.${to} 不在 SQLite CREATE TABLE 里（改名后应用新名）`);
+      else if (allColumns.has(from!)) stray.push(`${table}.${from} 还在 SQLite CREATE TABLE 里（改名后旧名不该保留）`);
+      continue;
+    }
+    const add = ADD_COLUMN_RE.exec(statement);
+    assert.ok(add, `无法解析的升级语句：${statement}`);
+    const [, table, column] = add;
     if (!sqliteTables.has(table!)) stray.push(`${table} 不是 SQLite DDL 里的表`);
     else if (!allColumns.has(column!)) stray.push(`${table}.${column} 不在 SQLite CREATE TABLE 里`);
   }
-  assert.deepEqual(stray, [], `补列语句与 DDL 漂移：\n${stray.join('\n')}`);
+  assert.deepEqual(stray, [], `升级语句与 DDL 漂移：\n${stray.join('\n')}`);
 
-  // PostgreSQL 侧走同一个升级路径：增量迁移（002 起）的补列集合必须与 SQLite 的补列集合一致。
+  // PostgreSQL 侧走同一个升级路径：增量迁移（002 起）的补列 + 改名集合必须与 SQLite 的一致。
   // （001 里也有补列语句，那是它自己那版的升级路径，对应列已写进 SQLite 的 CREATE TABLE。）
-  const pgUpgrades = [...pgIncrementalSql.matchAll(addColumnRe)].map((m) => `${m[1]}.${m[2]}`).sort();
-  const liteUpgrades = SQLITE_COLUMN_UPGRADES.map((s) => {
-    const m = addColumnRe.exec(s)!;
-    addColumnRe.lastIndex = 0;
-    return `${m[1]}.${m[2]}`;
-  }).sort();
-  assert.deepEqual(liteUpgrades, pgUpgrades, 'SQLite 补列与 PG 增量迁移的补列集合不一致');
+  const pgUpgrades = [
+    ...pgIncrementalSql.matchAll(addColumnRe),
+    ...pgIncrementalSql.matchAll(renameColumnRe),
+  ]
+    .map((m) => `${m[1]}.${m[2]}${m[3] ? `->${m[3]}` : ''}`)
+    .sort();
+  const liteUpgrades = SQLITE_COLUMN_UPGRADES.map(upgradeKey).sort();
+  assert.deepEqual(
+    liteUpgrades,
+    pgUpgrades,
+    'SQLite 升级语句与 PG 增量迁移的补列/改名集合不一致',
+  );
 });
 
 test('SQL 仓储引用的列在两份 DDL 里都存在', () => {

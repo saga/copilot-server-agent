@@ -54,13 +54,13 @@ export interface FlowDefinitionProvider {
 export interface SkillFileProviderOptions {
   /** 技能搜索目录 */
   dirs: readonly string[];
-  /** 服务端注册表（@gate/@review/@action 必须已登记） */
+  /** 服务端注册表（@gate/@review/@command 必须已登记） */
   registry?: FlowRegistryLookup;
   /** `role:` 指向的业务角色是否已登记 */
   hasRole?: (id: string) => boolean;
-  /** `@agent tools:` 的服务端上限 */
+  /** `@task tools:` 的服务端上限 */
   agentTools?: readonly FlowPermissionKind[];
-  /** 是否要求每个 `@agent` 声明完成契约 */
+  /** 是否要求每个 `@task` 声明完成契约 */
   requireAgentOutput?: boolean;
 }
 
@@ -104,9 +104,9 @@ export class SkillFileDefinitionProvider implements FlowDefinitionProvider {
     const validated = validateSkillFlow(ast, {
       flow: input.flow,
       ...(this.opts.registry ? { registry: this.opts.registry } : {}),
-      // `@agent <id>` 指向的技能是否存在：用与 loadSkill 相同的匹配器，
-      // 避免"校验说存在、加载却找不到"这种两套匹配规则带来的分歧
-      hasSkill: (name) => Boolean(loadSkill(name, [...this.opts.dirs])),
+      // 刻意**不**传 `hasSkill`：`@task <id>` 的 id 只是流程图里的一个标签，
+      // 不代表"去技能目录里找同名技能"。它跑的是当前 session 的一次 AI 工作单元，
+      // 正文就是 prompt —— 见 runner 里 runTask 的说明。
       // `role:` 必须指向已登记的业务角色（RoleRegistry），不是随便一个字符串
       hasRole: this.opts.hasRole ?? businessRoleLookup.hasRole,
       ...(this.opts.agentTools ? { agentTools: this.opts.agentTools } : {}),

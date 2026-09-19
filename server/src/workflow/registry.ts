@@ -1,11 +1,11 @@
-import type { ActionIntent } from '../execution/types.js';
+import type { CommandIntent } from '../execution/types.js';
 import { requiredVotes, type FlowContext, type ReviewBasePolicy } from './types.js';
 
 /**
  * Skill Flow 的四类服务端扩展点。
  *
  * SKILL.md 只写"这里需要一个 compliance gate / investment-review / publish / 完成契约"，
- * **谁有资格、要不要审批、动作怎么做、算不算做完了，全在服务端**：
+ * **谁有资格、要不要审批、命令怎么做、算不算做完了，全在服务端**：
  *
  *   Skill（声明意图） → Registry（决定实现） → 现有 Action/Approval/HumanTask 体系
  *
@@ -73,12 +73,12 @@ export interface FlowReview {
 }
 
 /**
- * `@agent` 的完成契约：**由服务端判定"这一步真的做完了吗"**。
+ * `@task` 的完成契约：**由服务端判定"这一步真的做完了吗"**。
  *
- * 没有它，`@agent success` 只等于"这次 turn 没有抛异常"—— 模型输出一段
+ * 没有它，`@task success` 只等于"这次 turn 没有抛异常"—— 模型输出一段
  * "抱歉我无法完成"同样是 success。让模型自评是没意义的（它总是认为自己完成了）。
  *
- * 所以 `@agent output: <契约>` 之后，runner 会把 turn 的输出交给这里，
+ * 所以 `@task output: <契约>` 之后，runner 会把 turn 的输出交给这里，
  * 只有 `ok: true` 才走 success 出口；否则走 fail（那是**可路由**的出口）。
  */
 export interface FlowOutput {
@@ -88,16 +88,16 @@ export interface FlowOutput {
   validate(ctx: FlowContext & { content: string }): Promise<{ ok: boolean; reason?: string }> | { ok: boolean; reason?: string };
 }
 
-export interface FlowAction {
+export interface FlowCommand {
   name: string;
-  /** 真正的 actionType：必须已登记 ApprovalPolicy + ActionExecutor，否则被 ActionService 拒绝 */
-  actionType: string;
-  buildIntent(ctx: FlowContext): Promise<ActionIntent> | ActionIntent;
+  /** 真正的 commandType：必须已登记 ApprovalPolicy + CommandExecutor，否则被 CommandService 拒绝 */
+  commandType: string;
+  buildIntent(ctx: FlowContext): Promise<CommandIntent> | CommandIntent;
 }
 
 export const flowGates = new Map<string, FlowGate>();
 export const flowReviews = new Map<string, FlowReview>();
-export const flowActions = new Map<string, FlowAction>();
+export const flowCommands = new Map<string, FlowCommand>();
 export const flowOutputs = new Map<string, FlowOutput>();
 
 const norm = (s: string): string => s.toLowerCase();
@@ -179,8 +179,8 @@ export function registerFlowReview(review: FlowReview): void {
   flowReviews.set(key, review);
 }
 
-export function registerFlowAction(action: FlowAction): void {
-  flowActions.set(requireName('action', action.name), action);
+export function registerFlowCommand(action: FlowCommand): void {
+  flowCommands.set(requireName('action', action.name), action);
 }
 
 export function registerFlowOutput(output: FlowOutput): void {
@@ -193,8 +193,8 @@ export function findFlowGate(name: string): FlowGate | undefined {
 export function findFlowReview(name: string): FlowReview | undefined {
   return flowReviews.get(norm(name));
 }
-export function findFlowAction(name: string): FlowAction | undefined {
-  return flowActions.get(norm(name));
+export function findFlowCommand(name: string): FlowCommand | undefined {
+  return flowCommands.get(norm(name));
 }
 export function findFlowOutput(name: string): FlowOutput | undefined {
   return flowOutputs.get(norm(name));
@@ -229,7 +229,7 @@ export function reviewBasePolicy(review: FlowReview): ReviewBasePolicy {
 export const flowRegistryLookup = {
   hasGate: (name: string) => flowGates.has(norm(name)),
   hasReview: (name: string) => flowReviews.has(norm(name)),
-  hasAction: (name: string) => flowActions.has(norm(name)),
+  hasCommand: (name: string) => flowCommands.has(norm(name)),
   hasOutput: (name: string) => flowOutputs.has(norm(name)),
   /** gate 声明的出口（SKILL.md 必须与它一致） */
   gateOutcomes: (name: string): readonly string[] | undefined =>
@@ -302,17 +302,17 @@ registerFlowOutput({
   validate({ content }) {
     return content.trim()
       ? { ok: true }
-      : { ok: false, reason: '@agent 没有产出任何内容（空输出不算完成）' };
+      : { ok: false, reason: '@task 没有产出任何内容（空输出不算完成）' };
   },
 });
 
-registerFlowAction({
+registerFlowCommand({
   name: 'publish',
-  actionType: 'publish_research',
+  commandType: 'publish_research',
   buildIntent(ctx) {
     const input = (ctx.input ?? {}) as { securityId?: string };
     return {
-      actionType: 'publish_research',
+      commandType: 'publish_research',
       target: { type: 'research_report', id: input.securityId ?? ctx.executionId },
       parameters: { flow: ctx.flow, nodeId: ctx.nodeId },
       reason: `skill ${ctx.skill} 的 ${ctx.nodeId} 步骤请求发布研究结论`,

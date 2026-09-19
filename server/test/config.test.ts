@@ -162,7 +162,7 @@ test('COPILOT_BUSINESS_ROLES：把业务角色映射到 Entra group object ID（
 });
 
 /**
- * Skill Flow 的两条 `@agent` 相关配置。
+ * Skill Flow 的两条 `@task` 相关配置。
  *
  * 这里刻意**从配置走到生效集合**（config → parseAgentTools），而不是只断言配置字符串：
  * 真正要证明的是"配置写 mcp 也拿不到 mcp"。只测 `cfg.workflowAgentTools === 'mcp'`
@@ -213,7 +213,7 @@ test('COPILOT_WORKFLOW_AGENT_TOOLS 写 mcp / shell 也不生效（硬禁止，�
   assert.deepEqual(JSON.parse(narrowed.stdout.trim().split('\n').at(-1)!).effective, ['read']);
 });
 
-test('COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT 默认开（没有契约的 @agent 一律校验不过）', () => {
+test('COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT 默认开（没有契约的 @task 一律校验不过）', () => {
   // 注意不能用 `''` 表示"未配置"：config 的 env() 是 `?? fallback`，
   // 空串不是 nullish，会原样生效（`'' === 'true'` = false）—— 那就把默认值测反了
   const byDefault = loadAgentCeiling({});

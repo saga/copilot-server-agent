@@ -36,7 +36,7 @@ start -> work
 
 ---
 
-## @agent work
+## @task work
 
 干活的说明。
 
@@ -64,7 +64,7 @@ test('解析：frontmatter / 普通 section 不干扰，节点与路由都取到
   assert.deepEqual(ast.issues, []);
   assert.deepEqual(
     ast.nodes.map((n) => `${n.type}:${n.id}`),
-    ['agent:work', 'gate:check', 'stop:failed', 'end:done'],
+    ['task:work', 'gate:check', 'stop:failed', 'end:done'],
   );
   assert.equal(ast.flows.length, 1, '@flow 单独成一个数组（作者可能写 0 个或 2 个）');
   assert.equal(ast.flows[0]!.id, 'demo');
@@ -112,7 +112,7 @@ test('解析：代码块里的 `->` 不算路由（否则示例代码会把流�
     '',
     'start -> work',
     '',
-    '## @agent work',
+    '## @task work',
     '',
     '示例（不是路由）：',
     '',
@@ -176,16 +176,50 @@ test('解析：SKILL.md 里没有 @block 时返回空 AST（普通技能仍然�
 });
 
 test('解析：带 `- ` 前缀的 start 也认（列表写法与裸行写法等价）', () => {
-  const md = ['## @flow demo', '', '- start -> work', '', '## @agent work', '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
+  const md = ['## @flow demo', '', '- start -> work', '', '## @task work', '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
   const ast = parseSkillFlow(md);
   assert.equal(ast.flows[0]!.start, 'work');
 });
 
-test('解析：`@subagent` 是 `@agent` 的旧名，解析成同一个节点类型（不报错、不重复）', () => {
-  const md = ['## @flow demo', '', 'start -> work', '', '## @subagent work', '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
+test('解析：`@subagent` / `@agent` 都已移除 —— 写了就报 `block-unknown-type`', () => {
+  // 这条是有意做成"硬改名"的：@agent 这个名字会让人把它读成"起一个 subagent"，
+  // 而它实际只是"跑一个受约束的 AI 工作单元"。留着别名等于把那个误读留在 DSL 里。
+  for (const legacy of ['@agent', '@subagent']) {
+    const md = ['## @flow demo', '', 'start -> work', '', `## ${legacy} work`, '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
+    const ast = parseSkillFlow(md);
+    const hit = ast.issues.find((i) => i.code === 'block-unknown-type');
+    assert.ok(hit, `${legacy} 必须报错，而不是被静默归一化成 task`);
+    assert.match(hit!.message, /@task/, '报错要说清现在该写什么');
+    assert.deepEqual(
+      ast.nodes.map((n) => n.id),
+      ['done'],
+      '认不出来的块不进 AST —— 只剩后面那个 @end',
+    );
+  }
+});
+
+test('解析：`@action` 已硬改名为 `@command` —— 写了旧名就报 `block-unknown-type`', () => {
+  // 同 `@agent` → `@task`：`action` 是个"什么都能叫"的上位词，留着别名等于把误读留在 DSL 里。
+  const md = [
+    '## @flow demo',
+    '',
+    'start -> publish',
+    '',
+    '## @action publish',
+    '',
+    '发布。',
+    '',
+    '- success -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  ].join('\n');
   const ast = parseSkillFlow(md);
-  assert.deepEqual(ast.issues, [], '旧名不该让已经写好的 SKILL.md 校验失败');
-  assert.equal(ast.nodes[0]!.type, 'agent', '别名归一化成 agent，下游只认一种');
+  const hit = ast.issues.find((i) => i.code === 'block-unknown-type');
+  assert.ok(hit, '`@action` 必须报错，而不是被静默归一化成 command');
+  assert.match(hit!.message, /@command/, '报错要说清现在该写什么');
+  assert.deepEqual(ast.nodes.map((n) => n.id), ['done'], '认不出来的块不进 AST —— 只剩后面那个 @end');
 });
 
 test('解析：保留属性从正文里剥掉（否则 `role: x` 会变成描述甚至 prompt）', () => {
@@ -239,27 +273,27 @@ test('解析：属性值保持原样（`strategy: all` 也要能被记下来交�
   );
 });
 
-test('解析：`@action` 只支持 role（写别的属性会被指出来）', () => {
-  const md = ['## @flow demo', '', 'start -> pub', '', '## @action pub', '', 'role: operations', '', '发布。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n');
+test('解析：`@command` 只支持 role（写别的属性会被指出来）', () => {
+  const md = ['## @flow demo', '', 'start -> pub', '', '## @command pub', '', 'role: operations', '', '发布。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n');
   const ast = parseSkillFlow(md);
   assert.deepEqual(ast.issues, []);
   const pub = ast.nodes.find((n) => n.id === 'pub')!;
   assert.deepEqual(pub.attrs.map((a) => `${a.name}=${a.value}`), ['role=operations']);
 
   const withStrategy = parseSkillFlow(
-    ['## @flow demo', '', 'start -> pub', '', '## @action pub', '', 'role: operations', 'strategy: ANY', '', '发布。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n'),
+    ['## @flow demo', '', 'start -> pub', '', '## @command pub', '', 'role: operations', 'strategy: ANY', '', '发布。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n'),
   );
   const hit = withStrategy.issues.find((i) => i.code === 'block-attr-unsupported');
-  assert.ok(hit, '@action 上写 strategy 必须报错，不能静默忽略');
+  assert.ok(hit, '@command 上写 strategy 必须报错，不能静默忽略');
   assert.match(hit!.message, /strategy/);
 });
 
-test('解析：`@agent` 上写 role 报错（正文是 prompt，不是权限声明的地方）', () => {
-  const md = ['## @flow demo', '', 'start -> work', '', '## @agent work', '', 'role: investment.analyst', '', '做研究。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n');
+test('解析：`@task` 上写 role 报错（正文是 prompt，不是权限声明的地方）', () => {
+  const md = ['## @flow demo', '', 'start -> work', '', '## @task work', '', 'role: investment.analyst', '', '做研究。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n');
   const ast = parseSkillFlow(md);
   const hit = ast.issues.find((i) => i.code === 'block-attr-unsupported');
-  assert.ok(hit, '@agent 不支持 role —— 静默当 prompt 才是最坏的结果');
-  assert.match(hit!.message, /@agent work/);
+  assert.ok(hit, '@task 不支持 role —— 静默当 prompt 才是最坏的结果');
+  assert.match(hit!.message, /@task work/);
 });
 
 test('解析：属性必须写在正文最前面（`Note: ...` 开头的正文不会被误判成属性）', () => {

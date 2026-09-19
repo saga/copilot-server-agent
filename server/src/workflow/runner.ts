@@ -37,9 +37,9 @@ import {
  * 一个节点"具体怎么执行"在 `runtime.ts`，流程定义"从哪来"在 `definition-provider.ts`。
  * 底下三层全部复用现有体系：
  *
- *   @agent  → runExecutionTurn（同一个 Copilot session / model / tool policy）
+ *   @task   → runExecutionTurn（同一个 Copilot session / model / tool policy）
  *   @review → HumanTaskService（同一套 My Tasks / 委派 / SoD / 租户隔离 / 审计）
- *   @action → ExecutionService.proposeAction（同一套策略 → 审批 → hash/版本复核 → executor）
+ *   @command → ExecutionService.proposeCommand（同一套策略 → 审批 → hash/版本复核 → executor）
  *
  * 两步之间的"状态"就是 `agent_execution.workflow_state` 里的一个节点 id 加上它的执行状态。
  *
@@ -56,11 +56,11 @@ import {
  *
  * 这样 crash 恢复才能明确回答"publish 已经开始过，但它完成了没有？"。
  *
- * 恢复策略见 `admitInterruptedStep()`：`@agent` / `@gate` 是纯计算，允许重放；
- * `@action` 有真实副作用，**不自动重放**，落 failed 交人工核对（幂等键只能防重复提交，
+ * 恢复策略见 `admitInterruptedStep()`：`@task` / `@gate` 是纯计算，允许重放；
+ * `@command` 有真实副作用，**不自动重放**，落 failed 交人工核对（幂等键只能防重复提交，
  * 防不了"外部系统已经生效但本地没记上"）。
  *
- * ## 进入等待态的顺序（`@review` / `@action`）
+ * ## 进入等待态的顺序（`@review` / `@command`）
  *
  * 三步，顺序不能换：
  *
@@ -108,7 +108,7 @@ export interface WorkflowRunnerDeps {
   definitions?: FlowDefinitionProvider;
   /** 节点执行器（默认：复用 runExecutionTurn / HumanTaskService / ExecutionService） */
   runtime?: FlowNodeRuntime;
-  /** `@agent` 能力上限（默认取 config.workflowAgentTools） */
+  /** `@task` 能力上限（默认取 config.workflowAgentTools） */
   agentTools?: readonly FlowPermissionKind[];
 }
 
@@ -127,19 +127,19 @@ export interface PreparedFlow {
   definition: FlowDefinition;
 }
 
-/** `@agent` 输出落进 workflow_state 的截断长度（它只是下一步的判断依据，不是证据仓库） */
+/** `@task` 输出落进 workflow_state 的截断长度（它只是下一步的判断依据，不是证据仓库） */
 const OUTPUT_MAX_CHARS = 4000;
 
 /**
  * 允许"重放"的节点类型：纯计算，重跑只是多花一次算力，不会留下副作用。
  *
- * `@action` **刻意不在里面**：它可能已经把动作做出去了，重放等于重复提交。
+ * `@command` **刻意不在里面**：它可能已经把命令做出去了，重放等于重复提交。
  *
  * `@review` 同样不在里面：它的产物是一条人工任务，而"任务建没建出来"没法从 durable
  * 状态判断（`waitingTaskId` 是建完之后才写的）。重放会建出第二条一样的待办，
  * 审核人无从分辨哪条作数。见 `admitInterruptedStep()`。
  */
-const REPLAY_SAFE_NODE_TYPES: ReadonlySet<FlowNodeType> = new Set<FlowNodeType>(['agent', 'gate']);
+const REPLAY_SAFE_NODE_TYPES: ReadonlySet<FlowNodeType> = new Set<FlowNodeType>(['task', 'gate']);
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -238,7 +238,7 @@ export function reviewPolicyFor(
   return {
     policy: {
       policyId: `workflow-review:${node.id}`,
-      actionType: `workflow.review.${node.id}`,
+      commandType: `workflow.review.${node.id}`,
       strategy,
       requiredCount,
       eligibleRoles: roles,
@@ -313,7 +313,7 @@ export class WorkflowRunner {
    * `transition()` / registry 抛出来的意外错误会留下一个永远 `running` 的 execution ——
    * 它占着队列、挡住取消、也没人知道该不该重跑。
    *
-   * 注意 `runtime.runGate()` / `runtime.runAction()` 自己 catch 了节点内的失败
+   * 注意 `runtime.runGate()` / `runtime.runCommand()` 自己 catch 了节点内的失败
    * （那是**可路由**的出口），所以这里兜住的是真正未预期的异常，
    * 测试里不容易碰到 —— 正因为不容易碰到才必须写。
    */
@@ -365,7 +365,7 @@ export class WorkflowRunner {
    * 崩溃可能停在第二步与第三步之间，留下 `stepStatus = waiting` + `execution = running`。
    * 那是一个**可判定**的状态（任务已经建出来了，只是没接上），但只有主动对账才能把它接上：
    * 不管它的话，`/run` 会把那个节点**再执行一遍** —— 同一个 review 建出第二条人工任务
-   * （第一条还挂在审核人的"我的任务"里），或者同一个动作被再次提交。
+   * （第一条还挂在审核人的"我的任务"里），或者同一个命令被再次提交。
    *
    * 反过来的顺序（先 transition 再落 workflow）就没法对账了：`execution =
    * waiting_for_approval` + `workflow.stepStatus = running` 时，"在等人工"与
@@ -457,7 +457,7 @@ export class WorkflowRunner {
    * 按 executionId 串行化推进。
    *
    * CAS 已经保证"两个写者不会互相覆盖"，但**同一个进程里**两个推进者交错执行仍然会
-   * 各自跑一遍节点（重复的 agent turn、重复的动作意图），所以在进程内再串一道。
+   * 各自跑一遍节点（重复的 agent turn、重复的命令意图），所以在进程内再串一道。
    *
    * 用 promise 链而不是"忙就丢弃"：人工任务回调与恢复推进都可能排在对方后面，
    * 丢掉一条就等于丢掉一次续跑，流程会停在原地。
@@ -481,8 +481,8 @@ export class WorkflowRunner {
    *
    * 这是 `stepStatus` 存在的全部意义：只有它能把"这一步已经开始过"和"这一步还没跑"区分开。
    *
-   *   @agent / @gate  纯计算 → 记一条审计后直接重跑
-   *   @review / @action  已经开始过 → **不重放**，落 failed 交人工核对
+   *   @task / @gate  纯计算 → 记一条审计后直接重跑
+   *   @review / @command  已经开始过 → **不重放**，落 failed 交人工核对
    *
    * `@review` 也归到"不重放"：它的执行结果是一条人工任务，而任务一旦建出来就没法从
    * durable 状态里看出来（`waitingTaskId` 是在建完之后才写的）。重放会建出第二条任务，
@@ -508,7 +508,7 @@ export class WorkflowRunner {
       node.type === 'review'
         ? '请先检查"我的任务"里是否已经有一条对应这个节点的人工任务：有就人工处理它，' +
           '没有（或已过期）再重新发起'
-        : '请人工核对外部系统是否已生效（幂等键 action:<executionId>:<actionHash>），' +
+        : '请人工核对外部系统是否已生效（幂等键 action:<executionId>:<commandHash>），' +
           '确认后再决定是否重新发起';
     await this.failWorkflow(
       executionId,
@@ -521,7 +521,7 @@ export class WorkflowRunner {
 
   /**
    * 人工任务收敛后的续跑。由 wiring 的 dispatcher 按 `payload.workflow` 路由进来
-   * （没有 workflow 标记的任务仍走 ExecutionService.onHumanTaskResolved，原有动作审批不受影响）。
+   * （没有 workflow 标记的任务仍走 ExecutionService.onHumanTaskResolved，原有命令审批不受影响）。
    *
    * 整段跑在 execution 锁里：回调可能和"启动恢复推进"同时到达，两边都以为自己该续跑。
    */
@@ -547,6 +547,13 @@ export class WorkflowRunner {
 
     const marker = task.payload?.workflow as { nodeId?: string; kind?: string } | undefined;
     const nodeId = marker?.nodeId;
+    /**
+     * `kind` 是**落在人工任务 payload 里**的，所以它要读两种值：
+     * 改名之前建出来的待办写的是 `'action'`，之后写 `'command'`。
+     * 一条 `@command` 任务可能等上几小时（甚至跨一次部署），不能因为改个名就认不出来 ——
+     * 认不出来的后果是它被当成"未知类型"而既不续跑也不报错。
+     */
+    const markerKind = marker?.kind === 'action' ? 'command' : marker?.kind;
 
     /**
      * 绑定校验：这条任务真的是"当前这一步在等的那个任务"吗？
@@ -606,8 +613,8 @@ export class WorkflowRunner {
       return;
     }
 
-    if (marker?.kind === 'action') {
-      await this.resumeAction(rec, state, node, resolution, decisions);
+    if (markerKind === 'command') {
+      await this.resumeCommand(rec, state, node, resolution, decisions);
       return;
     }
     await this.resumeReview(rec, state, node, resolution, decisions);
@@ -652,7 +659,7 @@ export class WorkflowRunner {
       });
 
       // 执行**之前**先落 running：进程在节点中途退出时，durable 状态里留下"这一步开始了"。
-      // 没有它，重启后既可能重放已完成的动作，也可能跳过没跑完的动作。
+      // 没有它，重启后既可能重放已完成的命令，也可能跳过没跑完的命令。
       if (state.stepStatus !== 'running') {
         state = { ...state, stepStatus: 'running' };
         if ((await writer.write(state)) === 'conflict') return;
@@ -660,21 +667,21 @@ export class WorkflowRunner {
 
       let result: StepResult;
       switch (node.type) {
-        case 'agent':
-          result = await this.runAgentStep(rec, state, node);
+        case 'task':
+          result = await this.runTaskStep(rec, state, node);
           break;
         case 'gate':
           result = await this.runGateStep(rec, state, node);
           break;
-        case 'action': {
-          const action = await this.runActionStep(rec, state, node, writer);
+        case 'command': {
+          const command = await this.runCommandStep(rec, state, node, writer);
           // 需要审批：流程暂停，等人工任务收敛后由 onHumanTaskResolved 续跑
-          if (action === 'waiting') {
+          if (command === 'waiting') {
             await this.releaseSession(rec.sessionId);
             return;
           }
-          if (action === 'conflict') return;
-          result = action;
+          if (command === 'conflict') return;
+          result = command;
           break;
         }
         case 'review':
@@ -728,7 +735,11 @@ export class WorkflowRunner {
   // ---------- 节点实现（状态机这一侧：只决定出口，不管怎么执行） ----------
 
   /**
-   * `@agent`：只把节点正文当 prompt 交给 runtime，**不再回头去技能目录里找一遍技能**。
+   * `@task`：只把节点正文当 prompt 交给 runtime，**不再回头去技能目录里找一遍技能**。
+   *
+   * 节点 id 是**纯标签**：`@task research` 不代表"去调一个叫 research 的技能"，
+   * 也不代表"起一个 subagent"。要跑哪个技能是由**发起这次 execution 的技能**决定的
+   * （`state.skill`），节点正文就是那一步的 prompt。
    *
    * 原先这里会再调一次 `findSkill(node.id)` 做存在性检查。那看起来更保险，实际上
    * 引入了**第二条解析路径**：`findSkill` 会把每个候选 SKILL.md 重新读一遍、重新解析
@@ -736,16 +747,16 @@ export class WorkflowRunner {
    * （文件在两次读之间被替换）。真正该保证的是"校验与执行用的是同一份内容"，
    * 而那由 `FlowDefinitionProvider` 单次读 + 单次解析负责（见 definition-provider.ts）。
    *
-   * 技能是否存在已经在校验期查过（`validateSkillFlow` 的 `hasSkill`），而且每次
-   * resume 都会重新校验一遍 —— 这里不需要第二个真相来源。
+   * 校验期那条 `hasSkill(node.id)` 也已一并去掉 —— 它和"节点 id 只是标签"直接冲突，
+   * 会让 `@task research`（技能叫 investment-research）无法通过校验。
    */
-  private async runAgentStep(
+  private async runTaskStep(
     rec: ExecutionRecord,
     state: WorkflowState,
     node: FlowNode,
   ): Promise<StepResult> {
-    const prompt = node.body.trim() || `执行技能「${node.id}」`;
-    const result = await this.runtime().runAgent({
+    const prompt = node.body.trim() || `执行流程步骤「${node.id}」`;
+    const result = await this.runtime().runTask({
       execution: rec,
       state,
       node,
@@ -757,14 +768,13 @@ export class WorkflowRunner {
         outcome: 'fail',
         detail: {
           nodeId: node.id,
-          skill: node.id,
           ...(result.error ? { error: result.error } : {}),
         },
       };
     }
     return {
       outcome: 'success',
-      detail: { nodeId: node.id, skill: node.id, chars: result.chars },
+      detail: { nodeId: node.id, chars: result.chars },
       lastOutput: preview(result.content, OUTPUT_MAX_CHARS),
     };
   }
@@ -793,7 +803,7 @@ export class WorkflowRunner {
   }
 
   /**
-   * `@action` 的"需要审批"分支：**先落 workflow 状态，再迁移 execution**。
+   * `@command` 的"需要审批"分支：**先落 workflow 状态，再迁移 execution**。
    *
    * 任务此时已经建好了（runtime 只建任务、不改状态，见 runtime.ts 的契约），
    * 所以顺序必须是
@@ -803,13 +813,13 @@ export class WorkflowRunner {
    * 反过来的话，两步之间崩溃会留下 `execution = waiting_for_approval` +
    * `workflow.stepStatus = running` —— 恢复时既像"在等人工"又像"要重放这一步"。
    */
-  private async runActionStep(
+  private async runCommandStep(
     rec: ExecutionRecord,
     state: WorkflowState,
     node: FlowNode,
     writer: StateWriter,
   ): Promise<StepResult | 'waiting' | 'conflict'> {
-    const result = await this.runtime().runAction({
+    const result = await this.runtime().runCommand({
       execution: rec,
       node,
       ctx: this.flowContext(rec, state, node),
@@ -826,7 +836,7 @@ export class WorkflowRunner {
         waitingTaskId: result.taskId,
       };
       if ((await writer.write(waiting)) === 'conflict') {
-        await this.orphanTaskNote(rec.executionId, node.id, result.taskId, 'action');
+        await this.orphanTaskNote(rec.executionId, node.id, result.taskId, 'command');
         return 'conflict';
       }
       await this.deps.executions.transition(rec.executionId, 'waiting_for_approval', {
@@ -837,7 +847,7 @@ export class WorkflowRunner {
       await this.append(rec.executionId, EVT.workflowWaiting, {
         nodeId: node.id,
         taskId: result.taskId,
-        kind: 'action',
+        kind: 'command',
       });
       return 'waiting';
     }
@@ -921,7 +931,7 @@ export class WorkflowRunner {
     executionId: string,
     nodeId: string,
     taskId: string,
-    kind: 'review' | 'action',
+    kind: 'review' | 'command',
   ): Promise<void> {
     console.warn(
       `[workflow] execution ${executionId} 节点 ${nodeId} 的任务 ${taskId} 未被认领（状态写入冲突），将成为孤儿任务`,
@@ -1025,7 +1035,7 @@ export class WorkflowRunner {
     await this.resumeInto(rec.executionId, state, node, outcome);
   }
 
-  private async resumeAction(
+  private async resumeCommand(
     rec: ExecutionRecord,
     state: WorkflowState,
     node: FlowNode,
@@ -1046,13 +1056,13 @@ export class WorkflowRunner {
       await this.settleUnresumable(rec.executionId, node, resolution);
       return;
     }
-    // 与普通动作审批**同一条**执行路径：同幂等键、同 hash/版本复核
-    const result = await this.deps.executions.executeApprovedAction(rec.executionId, {
+    // 与普通命令审批**同一条**执行路径：同幂等键、同 hash/版本复核
+    const result = await this.deps.executions.executeApprovedCommand(rec.executionId, {
       completeOnSuccess: false,
       actor: decisions?.[decisions.length - 1]?.approverId ?? 'approver',
     });
     if (result.status === 'reapproval_required') {
-      // 动作内容或数据版本变了：已另开审批任务并回到 waiting_for_approval，继续等
+      // 命令内容或数据版本变了：已另开审批任务并回到 waiting_for_approval，继续等
       return;
     }
     const ok = result.status === 'executed' && result.ok;
@@ -1292,5 +1302,5 @@ export class WorkflowRunner {
   }
 }
 
-/** 默认 `@agent` 能力上限（与 config 缺省值一致；config 为空串时兜底） */
+/** 默认 `@task` 能力上限（与 config 缺省值一致；config 为空串时兜底） */
 const DEFAULT_AGENT_TOOLS: readonly FlowPermissionKind[] = ['read', 'write', 'url'];

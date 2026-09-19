@@ -100,20 +100,48 @@ export class SqliteDatabase implements SqlExecutor {
   }
 
   /**
-   * 给已存在的表补上新增列（老库文件升级路径）。
-   * 逐条查 pragma_table_info，缺了才 alter —— 相当于 SQLite 版的 `add column if not exists`。
+   * 给已存在的表补上新增列 / 应用列改名（老库文件升级路径）。
+   *
+   * 逐条查 pragma_table_info 再决定做不做 —— 相当于 SQLite 版的
+   * `add column if not exists` / `rename column if exists`：
+   *
+   *   alter table t add column c ...            → c 不在表里才执行
+   *   alter table t rename column a to b        → a 在、且 b 不在，才执行
+   *
+   * 改名那条的"两边都查"是关键：只查 a 存在就 rename 的话，第二次启动会因为
+   * a 已经不存在而报错；只查 b 不存在就 rename 的话，新库里没有 a，同样报错。
+   * 两个条件合起来才既幂等、又能同时服务"老库升级"和"新库首次建表"。
    */
   private applyColumnUpgrades(): void {
     for (const statement of SQLITE_COLUMN_UPGRADES) {
-      const parsed = /^alter table (\w+) add column (\w+)/i.exec(statement.trim());
-      if (!parsed) continue;
-      const [, table, column] = parsed;
-      const existing = this.db
-        .prepare(`select name from pragma_table_info('${table}')`)
-        .all() as Array<{ name: string }>;
-      if (existing.some((row) => row.name === column)) continue;
-      this.db.exec(statement);
+      const trimmed = statement.trim();
+      const columns = this.tableColumns(trimmed);
+
+      const add = /^alter table (\w+) add column (\w+)/i.exec(trimmed);
+      if (add) {
+        const [, , column] = add;
+        if (columns.some((row) => row.name === column)) continue;
+        this.db.exec(trimmed);
+        continue;
+      }
+
+      const rename = /^alter table (\w+) rename column (\w+) to (\w+)/i.exec(trimmed);
+      if (rename) {
+        const [, , from, to] = rename;
+        const hasFrom = columns.some((row) => row.name === from);
+        const hasTo = columns.some((row) => row.name === to);
+        if (hasFrom && !hasTo) this.db.exec(trimmed);
+      }
     }
+  }
+
+  /** 表当前有哪些列（表不存在时返回空数组） */
+  private tableColumns(statement: string): Array<{ name: string }> {
+    const table = /^alter table (\w+)/i.exec(statement)?.[1];
+    if (!table) return [];
+    return this.db.prepare(`select name from pragma_table_info('${table}')`).all() as Array<{
+      name: string;
+    }>;
   }
 
   /** 可选扩展（如 sqlite-vec）：配了路径才加载，失败只记日志不影响启动 */

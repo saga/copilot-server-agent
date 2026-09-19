@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
-import type { ActionService } from '../actions/action-service.js';
+import type { CommandService } from '../commands/command-service.js';
 import type { HumanTaskService, HumanTaskResolution } from '../human-tasks/human-task-service.js';
 import type { HumanTask } from '../human-tasks/types.js';
 import type { SessionOwner } from '../services/session-registry.js';
-import { hashAction } from './hash.js';
+import { hashCommand } from './hash.js';
 import { preview } from './redact.js';
 import { ExecutionEventLog } from './events.js';
 import type { EventRepository, ExecutionRepository, ExecutionStats } from './repository.js';
@@ -12,7 +12,7 @@ import {
   ALLOWED_TRANSITIONS,
   EXECUTION_EVENT_TYPES as EVT,
   isTerminal,
-  type ActionIntent,
+  type CommandIntent,
   type ExecutionFilter,
   type ExecutionKind,
   type ExecutionRecord,
@@ -38,21 +38,21 @@ export interface ExecutionServiceDeps {
   events: EventRepository;
   /** 由 wiring 注入（避免模块循环依赖） */
   humanTasks?: HumanTaskService;
-  actions?: ActionService;
+  commands?: CommandService;
   /** 取当前数据版本（resourceVersion 复核用；不配则不校验版本） */
-  resolveResourceVersion?: (intent: ActionIntent) => Promise<string | undefined>;
+  resolveResourceVersion?: (intent: CommandIntent) => Promise<string | undefined>;
 }
 
 /**
- * 审批通过后执行动作的结果。
+ * 审批通过后执行命令的结果。
  *
  * 分成三态是因为调用方要决定"接下来干什么"：
- * - `executed`：动作有结论（ok / !ok），编排层据此选下一个 route
- * - `reapproval_required`：动作内容或数据版本变了，已另开审批任务 —— 必须**继续等待**，
+ * - `executed`：命令有结论（ok / !ok），编排层据此选下一个 route
+ * - `reapproval_required`：命令内容或数据版本变了，已另开审批任务 —— 必须**继续等待**，
  *   不能当成失败继续往下走
  * - `idle`：execution 不存在或没什么可做的
  */
-export type ApprovedActionResult =
+export type ApprovedCommandResult =
   | { status: 'executed'; ok: boolean; output?: unknown; error?: string }
   | { status: 'reapproval_required'; reason: string }
   | { status: 'idle' };
@@ -137,8 +137,8 @@ export class ExecutionService {
   /**
    * 启动恢复：把进程退出时留在 running/resuming 的执行落成 interrupted。
    *
-   * **刻意不自动重试**：agent 可能已经执行过业务动作（提交交易、表决），
-   * 进程死在动作之后、状态落库之前时自动重跑会重复提交 —— 金融场景不可接受。
+   * **刻意不自动重试**：agent 可能已经执行过业务命令（提交交易、表决），
+   * 进程死在命令之后、状态落库之前时自动重跑会重复提交 —— 金融场景不可接受。
    * 是否重跑交给人工判断。
    *
    * 不在这个状态集里的：`created`（还没开跑，重新入队即可）与 `waiting_*`
@@ -221,7 +221,7 @@ export class ExecutionService {
    *
    * 顺序要求：先把 `current` 推进到下一个节点写库，再去执行它。
    * 反过来的话，进程在"执行完了但状态还没落库"之间退出，重启后会把同一步再跑一遍
-   * （子流程可能已经把动作做出去了）。
+   * （子流程可能已经把命令做出去了）。
    *
    * `expectedVersion` 给了就做 **CAS**（单写者）：版本对不上返回 `{ ok: false }`，
    * 调用方必须停止推进 —— 说明另一个推进者（重启恢复 / 另一副本 / 人工任务回调）
@@ -424,20 +424,20 @@ export class ExecutionService {
   // ---------- HITL ----------
 
   /**
-   * agent 提出业务动作意图 → 策略裁决 → 自动放行 / 建审批任务 / 拒绝。
+   * agent 提出业务命令意图 → 策略裁决 → 自动放行 / 建审批任务 / 拒绝。
    * 高风险 mutation 的执行权在 server，不在 agent 的工具集里。
    */
-  async proposeAction(
+  async proposeCommand(
     executionId: string,
-    intent: ActionIntent,
+    intent: CommandIntent,
     opts: {
       resourceVersion?: string;
       onTaskCreated?: (task: HumanTask) => void;
       /**
-       * Skill Flow 的 `@action` 节点：审批任务上打 workflow 标记。
-       * 收敛时的 dispatcher（wiring）据此把任务交回 WorkflowRunner 而不是当成终态动作。
+       * Skill Flow 的 `@command` 节点：审批任务上打 workflow 标记。
+       * 收敛时的 dispatcher（wiring）据此把任务交回 WorkflowRunner 而不是当成终态命令。
        *
-       * `restrictRoles` = SKILL.md 里写的 `@action role:`，只收窄不放宽（见 ActionService.classify）。
+       * `restrictRoles` = SKILL.md 里写的 `@command role:`，只收窄不放宽（见 CommandService.classify）。
        */
       workflow?: {
         nodeId: string;
@@ -450,7 +450,7 @@ export class ExecutionService {
          * 崩溃窗口：`execution = waiting_for_approval` + `workflow.stepStatus = running`，
          * 恢复时"在等人工"和"要重放这一步"两个判断同时成立。
          *
-         * 普通动作审批（`@action` 之外的路径）不要用这个开关：那时 execution 的生命周期
+         * 普通命令审批（`@command` 之外的路径）不要用这个开关：那时 execution 的生命周期
          * 就归 ExecutionService 管，没有第二个写者。
          */
         deferWaitingTransition?: boolean;
@@ -459,22 +459,22 @@ export class ExecutionService {
   ): Promise<{ decision: 'auto_approve' | 'needs_approval' | 'denied'; taskId?: string; reason?: string; result?: unknown }> {
     const rec = await this.deps.repository.get(executionId);
     if (!rec) throw new Error(`execution 不存在："${executionId}"`);
-    const actionHash = hashAction(intent);
+    const commandHash = hashCommand(intent);
     await this.deps.repository.update(executionId, {
-      actionIntent: intent,
-      actionHash,
+      commandIntent: intent,
+      commandHash,
       ...(opts.resourceVersion ? { resourceVersion: opts.resourceVersion } : {}),
     });
     await this.eventLog.append({
       executionId,
-      type: EVT.actionProposed,
+      type: EVT.commandProposed,
       actorType: 'agent',
-      payload: { actionType: intent.actionType, target: intent.target, actionHash },
+      payload: { commandType: intent.commandType, target: intent.target, commandHash },
     });
 
-    const actions = this.deps.actions;
-    if (!actions) throw new Error('ActionService 未注入（wiring 缺失）');
-    const verdict = actions.classify(
+    const commands = this.deps.commands;
+    if (!commands) throw new Error('CommandService 未注入（wiring 缺失）');
+    const verdict = commands.classify(
       intent,
       opts.workflow?.restrictRoles ? { restrictRoles: opts.workflow.restrictRoles } : {},
     );
@@ -482,7 +482,7 @@ export class ExecutionService {
     if (verdict.decision === 'denied') {
       await this.eventLog.append({
         executionId,
-        type: EVT.actionDenied,
+        type: EVT.commandDenied,
         actorType: 'system',
         payload: { reason: verdict.reason },
       });
@@ -490,11 +490,11 @@ export class ExecutionService {
     }
 
     if (verdict.decision === 'auto_approve') {
-      const result = await this.runAction(executionId, intent, {
-        approvedHash: actionHash,
+      const result = await this.runCommand(executionId, intent, {
+        approvedHash: commandHash,
         approvedResourceVersion: opts.resourceVersion,
         actor: 'system:auto',
-        // workflow 的动作执行完不能收尾：后面还有节点要跑
+        // workflow 的命令执行完不能收尾：后面还有节点要跑
         completeOnSuccess: !opts.workflow,
       });
       return { decision: 'auto_approve', result };
@@ -504,16 +504,16 @@ export class ExecutionService {
     const task = await humanTasks.createApprovalTask({
       executionId,
       tenantId: rec.tenantId,
-      title: `审批：${intent.actionType}`,
+      title: `审批：${intent.commandType}`,
       ...(intent.reason ? { description: intent.reason } : {}),
       payload: {
-        actionType: intent.actionType,
+        commandType: intent.commandType,
         target: intent.target,
         parameters: intent.parameters,
-        actionHash,
+        commandHash,
         ...(opts.resourceVersion ? { resourceVersion: opts.resourceVersion } : {}),
         ...(opts.workflow
-          ? { workflow: { executionId, nodeId: opts.workflow.nodeId, kind: 'action' } }
+          ? { workflow: { executionId, nodeId: opts.workflow.nodeId, kind: 'command' } }
           : {}),
       },
       policy: verdict.policy,
@@ -541,7 +541,7 @@ export class ExecutionService {
     await this.transition(executionId, 'waiting_for_approval', {
       currentHumanTaskId: task.taskId,
       waitReason: 'approval',
-      actionHash,
+      commandHash,
     });
     await this.eventLog.append({
       executionId,
@@ -631,33 +631,33 @@ export class ExecutionService {
     }
 
     // approved：不直接执行 —— 复核 hash + resourceVersion 后再执行
-    await this.executeApprovedAction(task.executionId, {
+    await this.executeApprovedCommand(task.executionId, {
       actor: decisions?.[decisions.length - 1]?.approverId ?? 'approver',
     });
   }
 
   /**
-   * 审批通过之后的执行：复核 actionHash / resourceVersion → executor → 决定终态。
+   * 审批通过之后的执行：复核 commandHash / resourceVersion → executor → 决定终态。
    *
-   * 抽成公开方法而不是留在 onHumanTaskResolved 里，是因为 Skill Flow 的 `@action` 节点
+   * 抽成公开方法而不是留在 onHumanTaskResolved 里，是因为 Skill Flow 的 `@command` 节点
    * 也要走**同一条**路径（同样的幂等键、同样的失配重新审批），但它成功之后不能收尾
-   * —— 流程后面还有节点。两条调用路径共用这一份实现，"动作怎么执行"只有一处定义。
+   * —— 流程后面还有节点。两条调用路径共用这一份实现，"命令怎么执行"只有一处定义。
    */
-  async executeApprovedAction(
+  async executeApprovedCommand(
     executionId: string,
     opts: { completeOnSuccess?: boolean; actor?: string } = {},
-  ): Promise<ApprovedActionResult> {
+  ): Promise<ApprovedCommandResult> {
     const rec = await this.deps.repository.get(executionId);
     if (!rec) return { status: 'idle' };
-    const intent = rec.actionIntent;
+    const intent = rec.commandIntent;
     if (!intent) {
-      const reason = '审批通过但 execution 上没有 actionIntent';
+      const reason = '审批通过但 execution 上没有 commandIntent';
       await this.fail(executionId, new Error(reason));
       return { status: 'executed', ok: false, error: reason };
     }
     const currentResourceVersion = await this.deps.resolveResourceVersion?.(intent);
-    const result = await this.runAction(executionId, intent, {
-      approvedHash: rec.actionHash,
+    const result = await this.runCommand(executionId, intent, {
+      approvedHash: rec.commandHash,
       approvedResourceVersion: rec.resourceVersion,
       ...(currentResourceVersion !== undefined ? { currentResourceVersion } : {}),
       actor: opts.actor ?? 'approver',
@@ -671,7 +671,7 @@ export class ExecutionService {
     };
     if (r && r.ok === false) {
       const error = String(r.error ?? '执行失败');
-      // hash/版本失配 = 动作实质变了 → 重新审批（保持 waiting_for_approval，另开任务）
+      // hash/版本失配 = 命令实质变了 → 重新审批（保持 waiting_for_approval，另开任务）
       if (r.verified && (!r.verified.hash || !r.verified.resourceVersion)) {
         await this.transition(executionId, 'waiting_for_approval', { error });
         await this.reapprove(executionId, intent, error);
@@ -683,24 +683,24 @@ export class ExecutionService {
     return { status: 'executed', ok: true, ...(r?.output !== undefined ? { output: r.output } : {}) };
   }
 
-  /** hash 或版本失配：动作实质变了 → 重新发起审批，而不是拿旧批准继续执行 */
-  private async reapprove(executionId: string, intent: ActionIntent, reason: string): Promise<void> {
-    const actions = this.deps.actions;
-    if (!actions) return;
-    const verdict = actions.classify(intent);
+  /** hash 或版本失配：命令实质变了 → 重新发起审批，而不是拿旧批准继续执行 */
+  private async reapprove(executionId: string, intent: CommandIntent, reason: string): Promise<void> {
+    const commands = this.deps.commands;
+    if (!commands) return;
+    const verdict = commands.classify(intent);
     if (verdict.decision !== 'needs_approval') return;
     const rec = await this.deps.repository.get(executionId);
     if (!rec) return;
     const task = await this.requireHumanTasks().createApprovalTask({
       executionId,
       tenantId: rec.tenantId,
-      title: `重新审批：${intent.actionType}`,
+      title: `重新审批：${intent.commandType}`,
       description: reason,
       payload: {
-        actionType: intent.actionType,
+        commandType: intent.commandType,
         target: intent.target,
         parameters: intent.parameters,
-        actionHash: hashAction(intent),
+        commandHash: hashCommand(intent),
       },
       policy: verdict.policy,
       initiatedBy: rec.initiatedByUserId ?? rec.userId,
@@ -714,34 +714,38 @@ export class ExecutionService {
     });
   }
 
-  private async runAction(
+  private async runCommand(
     executionId: string,
-    intent: ActionIntent,
+    intent: CommandIntent,
     ctx: {
       approvedHash?: string;
       approvedResourceVersion?: string;
       currentResourceVersion?: string;
       actor: string;
       /**
-       * 动作成功后是否把 execution 收成 completed（默认 true）。
-       * Skill Flow 的 `@action` 传 false：动作只是流程中的一步，后面还有节点。
+       * 命令成功后是否把 execution 收成 completed（默认 true）。
+       * Skill Flow 的 `@command` 传 false：命令只是流程中的一步，后面还有节点。
        */
       completeOnSuccess?: boolean;
     },
   ): Promise<unknown> {
-    const actions = this.deps.actions!;
+    const commands = this.deps.commands!;
     await this.eventLog.append({
       executionId,
       type: EVT.authorizationChecked,
       actorType: 'system',
-      payload: { actionType: intent.actionType, actor: ctx.actor },
+      payload: { commandType: intent.commandType, actor: ctx.actor },
     });
-    // 幂等键绑定「execution + 动作内容 hash」，而不是 taskId：
-    // 重新审批会产出新的 HumanTask，但下游要认的是同一次业务动作。
+    // 幂等键绑定「execution + 命令内容 hash」，而不是 taskId：
+    // 重新审批会产出新的 HumanTask，但下游要认的是同一次业务命令。
     // 重试（外部副作用已成、进程在落终态前崩）时这两个值都不变，下游据此去重。
-    const actionHash = ctx.approvedHash ?? hashAction(intent);
-    const idempotencyKey = `action:${executionId}:${actionHash}`;
-    const result = await actions.execute(intent, {
+    //
+    // 前缀 `action:` 是**冻结的 wire format**（同 hash.ts 的 frozenHashInput）：这个 key 会
+    // 离开进程边界传给下游网关，改名成 `command:` 会让部署期间的在途重试换一个 key，
+    // 下游去重失效、副作用执行两次。要改必须先想清楚在途重试怎么办。
+    const commandHash = ctx.approvedHash ?? hashCommand(intent);
+    const idempotencyKey = `action:${executionId}:${commandHash}`;
+    const result = await commands.execute(intent, {
       executionId,
       actor: ctx.actor,
       idempotencyKey,
@@ -751,7 +755,7 @@ export class ExecutionService {
     });
     await this.eventLog.append({
       executionId,
-      type: result.verified.hash ? EVT.actionHashVerified : EVT.actionHashMismatch,
+      type: result.verified.hash ? EVT.commandHashVerified : EVT.commandHashMismatch,
       actorType: 'system',
       payload: { verified: result.verified },
     });
@@ -768,9 +772,9 @@ export class ExecutionService {
     }
     await this.eventLog.append({
       executionId,
-      type: EVT.actionExecuted,
+      type: EVT.commandExecuted,
       actorType: 'system',
-      payload: { actionType: intent.actionType, ok: result.ok },
+      payload: { commandType: intent.commandType, ok: result.ok },
     });
     if (result.ok) {
       // 等待态 → resuming → running → completed（终态不允许直接跳）

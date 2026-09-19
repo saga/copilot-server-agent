@@ -613,7 +613,7 @@ test('共享会话：member 不能 resume 改会话配置（能力边界属于 o
   );
 });
 
-test('共享会话：observer 既不能发言也不能指挥 execution（run 与 cancel/actions 同档）', async () => {
+test('共享会话：observer 既不能发言也不能指挥 execution（run 与 cancel/commands 同档）', async () => {
   const s = makeStack();
   await s.openSession('sess-run', 'shared');
   await s.participantService.add('sess-run', ALICE, { userId: 'carol', role: 'observer' });
@@ -624,7 +624,7 @@ test('共享会话：observer 既不能发言也不能指挥 execution（run 与
   // 但看得见不等于能发言
   await assert.rejects(() => s.access.assertCanSend('sess-run', CAROL), /无权发消息到/);
 
-  // `/run` 与 `/cancel`、`/actions` 现在是同一档判定。此前 `/run` 只判 `send`，
+  // `/run` 与 `/cancel`、`/commands` 现在是同一档判定。此前 `/run` 只判 `send`，
   // 于是 member 能把别人发起的 execution 跑起来，而 cancel 它却不行 —— 语义自相矛盾。
   const submitted = await s.collaboration.submitMessage({
     sessionId: 'sess-run',

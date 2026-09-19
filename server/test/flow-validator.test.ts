@@ -14,7 +14,7 @@ import type { FlowDefinition, FlowIssue } from '../src/workflow/types.js';
  *
  * 最容易出事的两个方向：
  *   - 路由指向不存在的节点 → 运行时走到那一步才炸，而 execution 那时可能已经等人工了
- *   - 出口写漏（@action 只写了 success，忘了 fail）→ 失败分支无处可去
+ *   - 出口写漏（@command 只写了 success，忘了 fail）→ 失败分支无处可去
  * 这两类必须在建 execution 时就 400。
  *
  * 同时确认**允许环**：research → review → research 是研究流程的常态，不能按 DAG 判。
@@ -49,7 +49,7 @@ const FLOW_OK = flow(
   '',
   'start -> work',
   '',
-  '## @agent work',
+  '## @task work',
   '',
   '干活。',
   '',
@@ -76,7 +76,7 @@ const FLOW_OK = flow(
 const ALL_REGISTERED = {
   hasGate: () => true,
   hasReview: () => true,
-  hasAction: () => true,
+  hasCommand: () => true,
 };
 
 /** 注册表里的 `@review` 基策略（服务端权威值；SKILL.md 的属性只能在其上收窄） */
@@ -103,7 +103,7 @@ test('校验：结构完整时通过，并给出 FlowDefinition', () => {
   assert.equal(r.definition!.id, 'demo');
   assert.equal(r.definition!.start, 'work');
   assert.deepEqual(Object.keys(r.definition!.nodes).sort(), ['check', 'done', 'failed', 'work']);
-  assert.equal(r.definition!.nodes['work']!.type, 'agent');
+  assert.equal(r.definition!.nodes['work']!.type, 'task');
   // body 是原样 Markdown（含 route 行）：agent 直接拿它当 prompt，非 agent 取首行当描述
   assert.equal(r.definition!.nodes['check']!.body, '判断。\n\n- pass -> done\n- fail -> failed');
 });
@@ -164,7 +164,7 @@ test('校验：终态不允许再 route，非终态必须有 route', () => {
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       '- success -> failed',
       '- fail -> failed',
@@ -182,13 +182,13 @@ test('校验：终态不允许再 route，非终态必须有 route', () => {
   assert.ok(noRoute.issues.some((i) => i.code === 'node-missing-route'), '非终态没有出口必须报错');
 });
 
-test('校验：出口写漏（@action 只写 success）会在执行前报出来', () => {
+test('校验：出口写漏（@command 只写 success）会在执行前报出来', () => {
   const r = ok(
-    flow('## @flow demo', '', 'start -> pub', '', '## @action pub', '', '- success -> done', '', '## @end done', '', 'ok'),
+    flow('## @flow demo', '', 'start -> pub', '', '## @command pub', '', '- success -> done', '', '## @end done', '', 'ok'),
     { registry: ALL_REGISTERED },
   );
   const hit = r.issues.find((i) => i.code === 'node-missing-outcome');
-  assert.ok(hit, '@action 缺 fail 出口必须报错');
+  assert.ok(hit, '@command 缺 fail 出口必须报错');
   assert.match(hit!.message, /fail/);
 });
 
@@ -207,7 +207,7 @@ test('校验：不可达节点报错', () => {
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       '- success -> done',
       '- fail -> done',
@@ -233,7 +233,7 @@ test('校验：**允许环**（research ⇄ review 是研究流程常态，不�
       '',
       'start -> research',
       '',
-      '## @agent research',
+      '## @task research',
       '',
       '- success -> review',
       '- fail -> research',
@@ -269,7 +269,7 @@ test('校验：服务端没注册的 gate / review / action 在执行前就报�
     '- approve -> act1',
     '- reject -> act1',
     '',
-    '## @action act1',
+    '## @command act1',
     '',
     '- success -> done',
     '- fail -> done',
@@ -278,21 +278,44 @@ test('校验：服务端没注册的 gate / review / action 在执行前就报�
     '',
     'ok',
   );
-  const r = ok(md, { registry: { hasGate: () => false, hasReview: () => false, hasAction: () => false } });
+  const r = ok(md, { registry: { hasGate: () => false, hasReview: () => false, hasCommand: () => false } });
   assert.deepEqual(
     r.issues.map((i) => i.code).sort(),
-    ['registry-missing-action', 'registry-missing-gate', 'registry-missing-review'],
+    ['registry-missing-command', 'registry-missing-gate', 'registry-missing-review'],
   );
   assert.equal(r.definition, undefined, '有 issue 就不给定义');
 
   assert.deepEqual(ok(md, { registry: ALL_REGISTERED }).issues, []);
 });
 
-test('校验：@agent 指向不存在的技能要报错（不能让 LLM 自己猜一个技能）', () => {
-  const r = ok(FLOW_OK, { hasSkill: (n) => n === 'other-skill' });
-  const hit = r.issues.find((i) => i.code === 'skill-missing');
-  assert.ok(hit);
-  assert.equal(hit!.nodeId, 'work');
+test('校验：@task 的 id 只是标签 —— 不要求它命中某个技能名', () => {
+  // 早先版本要求 `@agent <id>` 的 id 必须能在技能目录里找到一个同名 SKILL.md
+  // （`skill-missing`）。那和 `@task` 的语义直接冲突：`@task research` 里的
+  // research 是"这一步在研究"，不是"去调用一个叫 research 的技能"。
+  // 跑哪个技能由**发起 execution 的那个技能**决定（state.skill），节点正文就是 prompt。
+  const r = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> research',
+      '',
+      '## @task research',
+      '',
+      'output: non-empty',
+      '',
+      '做研究。',
+      '',
+      '- success -> done',
+      '- fail -> done',
+      '',
+      '## @end done',
+      '',
+      'ok',
+    ),
+    { registry: ALL_REGISTERED },
+  );
+  assert.ok(r.definition, 'id 与任何技能名都不重合，照样通过');
+  assert.ok(!r.issues.some((i) => i.code === 'skill-missing'), '这条检查已经不存在了');
 });
 
 test('校验：同一个出口写了两条 route 必须报错（否则后一条静默失效）', () => {
@@ -398,7 +421,7 @@ test('校验：固定出口的节点类型不允许"多出来的出口"（假分
       '',
       'start -> research',
       '',
-      '## @agent research',
+      '## @task research',
       '',
       '- success -> done',
       '- fail -> failed',
@@ -414,7 +437,7 @@ test('校验：固定出口的节点类型不允许"多出来的出口"（假分
     ),
   );
   const hit = r.issues.find((i) => i.code === 'node-unknown-outcome');
-  assert.ok(hit, '@agent 只会返回 success / fail —— `retry` 是一条永远走不到的假分支');
+  assert.ok(hit, '@task 只会返回 success / fail —— `retry` 是一条永远走不到的假分支');
   assert.equal(hit!.nodeId, 'research');
   assert.equal(hit!.line, 9, '指到那条 route 自己的行（`- retry -> research`），不是节点标题行');
   assert.match(hit!.message, /success \/ fail/);
@@ -429,13 +452,13 @@ test('校验：假分支会被拦住 —— 它可能让一个本该报错的流
     '',
     'start -> research',
     '',
-    '## @agent research',
+    '## @task research',
     '',
     '- success -> done',
     '- fail -> done',
     '- retry -> retry',
     '',
-    '## @agent retry',
+    '## @task retry',
     '',
     '- success -> done',
     '- fail -> done',
@@ -483,7 +506,7 @@ test('校验：route 指向不存在的节点时指到 **route 那一行**', () 
       '',
       'start -> research',
       '',
-      '## @agent research',
+      '## @task research',
       '',
       '说明……',
       '',
@@ -620,9 +643,8 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
   const r = validateSkillFlow(parseSkillFlow(skill.markdown), {
     flow: 'investment-review',
     registry: flowRegistryLookup,
-    hasSkill: (n) => Boolean(loadSkill(n, dirs)),
     hasRole: businessRoleLookup.hasRole,
-    // 与生产默认一致：每个 @agent 都必须有完成契约（见 config.workflowRequireAgentOutput）
+    // 与生产默认一致：每个 @task 都必须有完成契约（见 config.workflowRequireAgentOutput）
     requireAgentOutput: true,
     agentTools: ['read', 'write', 'url'],
   });
@@ -631,13 +653,13 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
     [],
     `示例技能不该有校验问题：\n${r.issues.map((i) => `SKILL.md:${i.line} ${i.message}`).join('\n')}`,
   );
-  assert.equal(r.definition!.start, 'investment-research');
+  assert.equal(r.definition!.start, 'research');
   assert.deepEqual(r.definition!.nodes['investment-review']!.routes, [
     { on: 'approve', to: 'publish' },
     { on: 'reject', to: 'investment-rejected' },
   ]);
   assert.equal(r.definition!.nodes['compliance']!.type, 'gate');
-  assert.equal(r.definition!.nodes['publish']!.type, 'action');
+  assert.equal(r.definition!.nodes['publish']!.type, 'command');
   // 保留属性：示例技能用 `role:` 声明业务角色（不是 AD Group），审批策略在服务端
   assert.deepEqual(r.definition!.nodes['compliance-review']!.attrs, {
     role: 'compliance.reviewer',
@@ -653,9 +675,9 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
   });
   assert.deepEqual(r.definition!.nodes['publish']!.attrs, { role: 'investment.reviewer' });
   assert.deepEqual(
-    r.definition!.nodes['investment-research']!.attrs,
+    r.definition!.nodes['research']!.attrs,
     { output: 'non-empty' },
-    '@agent 只有完成契约属性（谁有权跑这个 skill 不由 SKILL.md 决定）',
+    '@task 只有完成契约属性（谁有权跑这个 skill 不由 SKILL.md 决定）',
   );
 });
 
@@ -874,15 +896,15 @@ test('校验：@gate 声明的出口必须有 route，route 的出口必须被�
   assert.deepEqual(ok(md, { registry: ALL_REGISTERED }).issues, []);
 });
 
-// ---------- @agent 的完成契约与能力边界 ----------
+// ---------- @task 的完成契约与能力边界 ----------
 
-test('校验：@agent 的 tools 只能比服务端上限更严', () => {
+test('校验：@task 的 tools 只能比服务端上限更严', () => {
   const md = flow(
     '## @flow demo',
     '',
     'start -> work',
     '',
-    '## @agent work',
+    '## @task work',
     '',
     'tools: read',
     '',
@@ -908,7 +930,7 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       'tools: read,write',
       '',
@@ -922,7 +944,7 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
       'ok',
     ),
     { agentTools: ['read'] },
-  ).issues.find((i) => i.code === 'agent-tools-widens');
+  ).issues.find((i) => i.code === 'task-tools-widens');
   assert.ok(widened, 'tools 超出上限必须报错');
   assert.match(widened!.message, /write/);
   assert.match(widened!.message, /COPILOT_WORKFLOW_AGENT_TOOLS/, '要告诉运维改哪里');
@@ -939,19 +961,19 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
  * `mcp` / `shell` 是**永久禁止**的类别，不是"默认上限里没有"。
  *
  * 差别很关键：做成默认值的话，把 `COPILOT_WORKFLOW_AGENT_TOOLS=mcp` 一写，
- * `@agent` 就重新拿到了绕开 `@action` 审批的路径 —— 一条环境变量取消了整条流程的
+ * `@task` 就重新拿到了绕开 `@command` 审批的路径 —— 一条环境变量取消了整条流程的
  * 授权模型，而 SKILL.md、审批记录、审计链上都看不出任何异常。
  *
  * 所以校验是**无条件**的：不传 agentTools（只做结构校验的场景）也要报。
  */
-test('校验：@agent 的 tools 里写 mcp / shell 一律拒绝（与部署配置无关）', () => {
+test('校验：@task 的 tools 里写 mcp / shell 一律拒绝（与部署配置无关）', () => {
   const withTools = (tools: string): string =>
     flow(
       '## @flow demo',
       '',
       'start -> work',
       '',
-      '## @agent work',
+      '## @task work',
       '',
       `tools: ${tools}`,
       '',
@@ -967,12 +989,12 @@ test('校验：@agent 的 tools 里写 mcp / shell 一律拒绝（与部署配�
 
   for (const bad of ['mcp', 'shell', 'read,mcp', 'read,shell,url']) {
     // 连"不提供上限"的结构校验场景也要拒绝
-    const hit = ok(withTools(bad)).issues.find((i) => i.code === 'agent-tools-forbidden');
-    assert.ok(hit, `tools: ${bad} 必须报 agent-tools-forbidden`);
+    const hit = ok(withTools(bad)).issues.find((i) => i.code === 'task-tools-forbidden');
+    assert.ok(hit, `tools: ${bad} 必须报 task-tools-forbidden`);
     assert.match(hit!.message, /永久禁止/);
-    assert.match(hit!.message, /@action/, '要指出业务动作该走哪里');
+    assert.match(hit!.message, /@command/, '要指出业务动作该走哪里');
     assert.ok(
-      !ok(withTools(bad)).issues.some((i) => i.code === 'agent-tools-widens'),
+      !ok(withTools(bad)).issues.some((i) => i.code === 'task-tools-widens'),
       '不该同时报成"超出配置上限"—— 那会让人以为改配置就能放开',
     );
   }
@@ -981,13 +1003,13 @@ test('校验：@agent 的 tools 里写 mcp / shell 一律拒绝（与部署配�
   assert.deepEqual(ok(withTools('read,write,url'), { agentTools: ['read', 'write', 'url'] }).issues, []);
 });
 
-test('校验：@agent 的 output 必须是已注册的完成契约，且可被要求必填', () => {
+test('校验：@task 的 output 必须是已注册的完成契约，且可被要求必填', () => {
   const md = flow(
     '## @flow demo',
     '',
     'start -> work',
     '',
-    '## @agent work',
+    '## @task work',
     '',
     'output: research.brief',
     '',
@@ -1013,13 +1035,13 @@ test('校验：@agent 的 output 必须是已注册的完成契约，且可被�
   assert.ok(missing);
   assert.match(missing!.message, /不能自己定义/);
 
-  // requireAgentOutput：没写 output 的 @agent 直接报错（生产默认配置）
+  // requireAgentOutput：没写 output 的 @task 直接报错（生产默认配置）
   const noOutput = flow(
     '## @flow demo',
     '',
     'start -> work',
     '',
-    '## @agent work',
+    '## @task work',
     '',
     '干活。',
     '',
@@ -1031,7 +1053,7 @@ test('校验：@agent 的 output 必须是已注册的完成契约，且可被�
     'ok',
   );
   const required = ok(noOutput, { registry: withOutput, requireAgentOutput: true }).issues.find(
-    (i) => i.code === 'agent-output-missing',
+    (i) => i.code === 'task-output-missing',
   );
   assert.ok(required, '开启 requireAgentOutput 后没写契约必须报错');
   assert.match(required!.message, /output:/);

@@ -24,7 +24,7 @@ Principal { userId, roles, groups }
   与 `HumanTaskService.isAssignee`（看不看得到）。加新授权点时别只改前者。
 - `Principal.groups` 是 optional（本地开发/单测可不传），`principalFromHeaders` 总会填。
 
-## Skill Flow（`@flow` / `@agent` / `@gate` / `@review` / `@action` / `@stop` / `@end`）
+## Skill Flow（`@flow` / `@task` / `@gate` / `@review` / `@command` / `@stop` / `@end`）
 - 定义写在 `SKILL.md` 里，Markdown AST 解析（remark），**没有第二套 YAML/BPMN DSL**。
 - 🧱 **四层流水线（不要合并、也不要再加第五层）**：
   `flow-parser.ts` → `FlowAst`（作者写了什么）→ `flow-validator.ts` → `FlowDefinition`
@@ -42,13 +42,17 @@ Principal { userId, roles, groups }
 - 结构错误存在时**不跑分析器**（边指向不存在节点会得出"这节点出不去"的错误结论）。
 - 离线 lint：`npm --prefix server run flow:lint -- <SKILL.md|技能目录|技能根目录>`，
   用**与生产同一份**注册表与配置；输出 `path:line ERROR|WARN code  message`，error 退出码 1。
-- `@subagent` 是 `@agent` 的旧名（parser 归一化）；**别动** SDK 的 `subagent.*` 事件，那是另一回事。
-- `@agent <id>` 的 **id 必须等于技能目录名**（`findSkill` 按目录找），否则 `skill-missing`。
+- ⚠️ **关键字是硬改名，不做别名**：`@agent`/`@subagent` → `@task`，`@action` → `@command`。
+  旧名直接报 `block-unknown-type`。**别动** SDK 的 `subagent.*` 事件，那是另一回事。
+- `@task <id>` 的 id 是**纯标签**：不必是技能名，**不检查**是否命中技能 ——
+  `@task` 不创建、也不委派 agent，它只是"让当前 Agent Runtime 跑一次受约束的 AI 工作单元"。
+  四个执行词同层级：`@task` AI 做事 / `@gate` 系统判断 / `@review` 人做决定 /
+  `@command` 系统改变业务状态。`FlowNodeRuntime` = `runTask` / `runGate` / `openReview` / `runCommand`。
 - 三个文件分工：`workflow/runner.ts`（状态机）/ `workflow/runtime.ts`（节点怎么执行）/
   `workflow/definition-provider.ts`（定义从哪来）。**不要**合并成一个 WorkflowEngine 接口。
-- 保留属性：`@review`（role/strategy/required/exclude）、`@action`（role）、
-  `@agent`（output/tools），**必须写在正文最前面**；parser 把属性区从正文剥掉。
-- 🔒 **属性一律只能比服务端更严**（`attr-widens` / `role-not-allowed` / `agent-tools-widens`）：
+- 保留属性：`@review`（role/strategy/required/exclude）、`@command`（role）、
+  `@task`（output/tools），**必须写在正文最前面**；parser 把属性区从正文剥掉。
+- 🔒 **属性一律只能比服务端更严**（`attr-widens` / `role-not-allowed` / `task-tools-widens`）：
   `@review role` 与注册表 `eligibleRoles` 取**交集**；`strategy` 只能 ANY→ALL；
   `required` 只能 ≥ 基策略；`exclude: none` 在基策略禁止自批时报错。
   注册表 `FlowReview` 是权威（`eligibleRoles` 必填 + `allowInitiator`）。
@@ -60,18 +64,18 @@ Principal { userId, roles, groups }
 - `@gate` 必须静态声明 `outcomes`（`gate-outcome-unrouted` / `gate-outcome-unknown`）；
   outcomes 非空/去重/归一化小写。**注册键一律小写**（`norm` + `requireName`）——
   只在查找侧归一化的话，含大写的注册永远查不到。
-- `@agent output:` 走服务端 `FlowOutput` 完成契约（`success` ≠ 业务成功，不让 LLM 自评），
+- `@task output:` 走服务端 `FlowOutput` 完成契约（`success` ≠ 业务成功，不让 LLM 自评），
   **默认必填**（`COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT` 默认 true）。
-- 🔒 `@agent tools:` 里 **mcp/shell 是代码硬禁，不是配置默认**：
+- 🔒 `@task tools:` 里 **mcp/shell 是代码硬禁，不是配置默认**：
   `WORKFLOW_AGENT_ALLOWED_KINDS = ['read','write','url']`（`types.ts`），
   `parseAgentTools` 过滤 + `resolveAgentTools` 再取交集 + validator 无条件查
-  （`agent-tools-forbidden`，与"超部署上限"的 `agent-tools-widens` **分开两个 code**）。
+  （`task-tools-forbidden`，与"超部署上限"的 `task-tools-widens` **分开两个 code**）。
   `COPILOT_WORKFLOW_AGENT_TOOLS=mcp` **不再有任何效果**。
 - 推进顺序：**先落 `stepStatus = running`，再执行节点**；执行完落 `{current: next, pending}`。
-  中断恢复：`@agent`/`@gate` 可重放；`@action`/`@review` 落 failed 交人工核对
+  中断恢复：`@task`/`@gate` 可重放；`@command`/`@review` 落 failed 交人工核对
   （`admitInterruptedStep`）。`@review` 不重放的理由：其产物是人工任务，
   崩在 `waitingTaskId` 落库前时该产物在持久化状态里不可见。
-- 🔑 **等待态落库顺序**（`@review`/`@action` 通用）：
+- 🔑 **等待态落库顺序**（`@review`/`@command` 通用）：
   `create HumanTask → CAS 写 workflow=waiting + waitingTaskId → transition execution=waiting_for_approval`。
   **不能反过来** —— 反过来中间崩会得到 `execution=waiting_for_approval` + `workflow=running`
   的**不可判定**态。代价是可能留**孤儿任务**（靠过期+四重绑定自愈，不写清理器）；
@@ -89,8 +93,8 @@ Principal { userId, roles, groups }
   **没有 `failed`**。它跑在收尾路径上 → 异常往上抛 → execution 反而永远停在等待态。
   必须走 `exitWaitingIfNeeded()`：等待态先补 `→ resuming`，再 `resuming → failed`。
   （`resumeFromTask()` 里"节点不存在"/"input_submitted"、`loadChecked()` 失败原本都会抛。）
-- 契约：`runtime.runAction()` **只建任务，绝不碰 execution 状态**（单写者）。
-  `ExecutionService.proposeAction()` 的 `workflow.deferWaitingTransition` 置位时
+- 契约：`runtime.runCommand()` **只建任务，绝不碰 execution 状态**（单写者）。
+  `ExecutionService.proposeCommand()` 的 `workflow.deferWaitingTransition` 置位时
   只建任务+发事件就 return，不 transition、不发 `waitingForApproval`。
 - 能力边界 `AgentCapability` 带 `executionId`；`tool-policy` Layer-0 先比
   `ctx.activeExecution()` 与 `capability.executionId`，**不匹配或 undefined 一律 deny**。
@@ -107,6 +111,13 @@ Principal { userId, roles, groups }
 
 ## 改动习惯
 - 注释写"为什么"，尤其是**反直觉的取舍**（例：为什么角色解析不放服务端、为什么允许环）。
-- 失败一律 fail-closed：未登记的 actionType 拒绝、没配 group 的角色不授予、
-  `@action role:` 越界直接 deny。
+- 失败一律 fail-closed：未登记的 commandType 拒绝、没配 group 的角色不授予、
+  `@command role:` 越界直接 deny。
+- ⚠️ **改名时"冻结的 wire format"一律不动**（改了会静默变坏，不报错）：
+  `commandHash` 的输入键仍是旧名 `actionType`（`execution/hash.ts` 的 `frozenHashInput`，
+  有字面值断言钉着）、幂等键前缀仍是 `action:{executionId}:{commandHash}`、
+  环境变量名（`COPILOT_AUTO_APPROVE_ACTIONS` / `COPILOT_WORKFLOW_AGENT_TOOLS`）不变。
+  历史审计行的 `action.*` 事件名**不迁移**，靠 `canonicalEventType()` 在读取边界归一化；
+  人工任务 payload 的旧键 `actionType`、旧标记 `kind: 'action'` 都读两种值
+  （`test/command-compat.test.ts` 锁这些过渡期契约，老调用方升级完可整文件删掉）。
 - 新配置项要在 `config.ts` 集中声明 + `test/config.test.ts` 加"非法值启动即失败"用例。

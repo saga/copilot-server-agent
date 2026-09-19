@@ -25,7 +25,7 @@ import { resolveRolesForGroups } from './business-roles.js';
  *
  * 边界：这一层只回答"这个人**具备**哪些业务角色"。它不回答"这个角色在这个业务上下文里
  * 能不能做这件事" —— 那是 ApprovalPolicy（要几票、能否自批）与 HumanTaskService /
- * ActionService 的判断。
+ * CommandService 的判断。
  */
 export class AuthorizationService {
   /** 业务角色列表（去重、排序，便于比对与审计） */

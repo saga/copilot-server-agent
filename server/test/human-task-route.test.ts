@@ -59,10 +59,10 @@ const task = await humanTaskService.createApprovalTask({
   executionId: exec.executionId,
   tenantId: 't1',
   title: '提交代理投票',
-  payload: { actionType: 'custom_test_action' },
+  payload: { commandType: 'custom_test_command' },
   policy: {
     policyId: 'p-route',
-    actionType: 'custom_test_action',
+    commandType: 'custom_test_command',
     strategy: 'ANY',
     eligibleRoles: ['risk'],
     allowInitiator: false,

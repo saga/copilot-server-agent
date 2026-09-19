@@ -14,7 +14,7 @@ export interface HumanTaskRepository {
    *
    * 返回 `undefined` = 这一枪没打中（任务已被别人关闭）。调用方据此判断
    * **自己是不是完成状态收敛的那一个**，只有抢到的人才允许触发 `onResolved`
-   * （否则并发审批会让 `runAction` 执行两次）。语义等价于
+   * （否则并发审批会让 `runCommand` 执行两次）。语义等价于
    * `update ... where task_id = ? and status = 'open'`，但把"条件"固化在契约里，
    * 避免调用方各写各的、漏掉 where。
    */

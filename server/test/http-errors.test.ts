@@ -99,7 +99,7 @@ const CLIENT_ERROR = [
  */
 const INTERNAL_ERROR = [
   'execution 写入通道尚未装配：请在 wiring 里调用 bindExecutionSink(executionService)',
-  'ActionService 未注入（wiring 缺失）',
+  'CommandService 未注入（wiring 缺失）',
   'HumanTaskService 未注入（wiring 缺失）',
   'fetch failed',
   'socket hang up',

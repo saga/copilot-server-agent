@@ -29,7 +29,7 @@ Client (Web / API / Ops UI)
 Express routes        routes/{sessions,session-collaboration,executions,human-tasks,meta}.ts
         ↓              （route 只做编排与传输，不含 SDK 事件 plumbing）
 Services              SessionService / SessionAccessService / ExecutionService / HumanTaskService
-                      ApprovalService / ActionService / WorkspaceService
+                      ApprovalService / CommandService / WorkspaceService
 Collaboration         CollaborationService（提交分派）/ SessionCoordinator（排队调度）
                       MessageService / ParticipantService / SessionEventService
         ↓
@@ -152,7 +152,7 @@ Session Access          能不能进这个会话、能不能发言          （3
       ↓
 Execution Command       能不能指挥这一个 execution          （run / cancel / propose action）
       ↓
-Business Authorization  能不能做这个业务动作、要不要人批、谁有资格批
+Business Authorization  能不能做这个业务命令、要不要人批、谁有资格批
 ```
 
 **指挥一次 execution 是独立的一层**，不属于 `view / send / manage_members / manage_session / delete`
@@ -162,15 +162,15 @@ Business Authorization  能不能做这个业务动作、要不要人批、谁�
 - member：只能指挥**自己发起**的（`initiated_by_user_id` 是自己）；
 - observer：不可。
 
-`view` 是"看得见"，`command` 是"能动手"。observer 有 `view` 不等于有 `run / cancel / propose-action`：
+`view` 是"看得见"，`command` 是"能动手"。observer 有 `view` 不等于有 `run / cancel / propose-command`：
 只判 `view` 会让 observer 取消别人的执行、或对别人的 execution 提 `submit_proxy_vote` 这类业务意图。
 
-**`run` / `cancel` / `propose-action` 三个端点走同一档判定**，不各判各的。
+**`run` / `cancel` / `propose-command` 三个端点走同一档判定**，不各判各的。
 `/run` 早期只判 `send`，结果是 member 能把别人发起的 execution 跑起来、却取消不了它 ——
 "owner 或发起人才能指挥 execution"这句话就不成立了。三种命令统一为
 `assertCanCommandExecution`，规则只有一条，端点之间不会再漂移。
 
-本层通过与否**都不影响第三层**：高风险动作照旧要过 ActionPolicy 与人工审批（见第 6 节），
+本层通过与否**都不影响第三层**：高风险动作照旧要过 CommandPolicy 与人工审批（见第 6 节），
 只是连会话门都进不来的请求根本走不到那一层。
 
 ### 3.4 Shared Session 不变式
@@ -187,7 +187,7 @@ Business Authorization  能不能做这个业务动作、要不要人批、谁�
    data capability；要被加进来，得先满足本会话的 data / capability eligibility。
    也就是 shared session = shared data boundary，这一点在邀请那一刻定死。
 4. 会话成员资格只给**协作访问权**，不给业务授权：审批仍由 `AuthorizationService.resolveRoles(Principal)` → `ApprovalPolicy` 决定。
-   加进共享会话 ≠ 获得高风险动作的执行权。
+   加进共享会话 ≠ 获得高风险命令的执行权。
 5. **session owner 永远不是 execution actor 的隐式替代。** 每次 human-initiated execution 都必须
    记录真实发起人：`agent_execution.user_id` 是**会话 owner**（resume 的归属校验、数据范围），
    `initiated_by_user_id` 是**发起人**（审计、以及 SoD"发起人不能自批"）。
@@ -230,7 +230,7 @@ execution 上只留脱敏预览，不能当输入用。同一会话并发恒为 
 **建 app → `recoverPending()` → 起 sweeper → `listen`**，恢复在开始接流量之前跑完：
 
 - `running` / `resuming` → 终态 `interrupted`（**不自动重试**）。理由：崩溃时那次 turn
-  可能已经把业务动作做出去了（下单、投票、发邮件），自动重跑会二次执行。标志"服务中断过、
+  可能已经把业务命令做出去了（下单、投票、发邮件），自动重跑会二次执行。标志"服务中断过、
   结果未知、需要人看一眼"，重跑必须由人显式发起。
 - `created`（排队项）→ 按 `queue_sequence` 重新入队 drain。
 
@@ -305,7 +305,7 @@ CREATED ──→ RUNNING ──→ COMPLETED / FAILED / CANCELLED
   目前没有驱动者（`resuming` 是悬挂态），见 5.2；approval 分支是闭环的
 - `created` 在 shared 会话里额外承担"排队中"的语义（见第 3 节）
 - `interrupted` 是**终态**，只由启动恢复写入，没有自动出边：崩溃时那次 turn 可能已经把业务
-  动作做出去了，自动重跑等于二次执行。要重来必须由人显式发起新 execution。
+  命令做出去了，自动重跑等于二次执行。要重来必须由人显式发起新 execution。
 - **等待人工期间不持有 session lock**：session lock 只覆盖一个 agent turn，不能横跨审批的整个
   生命周期（审批可以几小时）。execution 落到 `waiting_*` 时 `SessionCoordinator.afterRun` 断开
   runtime（`session.disconnect()`）释放锁，会话配置留在 registry；之后要真正再跑 agent turn，
@@ -317,10 +317,10 @@ CREATED ──→ RUNNING ──→ COMPLETED / FAILED / CANCELLED
 ### 5.1 Approval：从提议到执行，闭环
 
 ```text
-agent 提出 ActionIntent
+agent 提出 CommandIntent
         ↓
-ActionService.classify(actionType)
-   ├ 未登记策略      → DENIED（默认拒绝，不允许 LLM 自己发明高风险动作）
+CommandService.classify(commandType)
+   ├ 未登记策略      → DENIED（默认拒绝，不允许 LLM 自己发明高风险命令）
    ├ 自动放行名单    → server 直接执行
    └ 否则            → needs_approval
         ↓
@@ -329,12 +329,12 @@ HumanTaskService.createApprovalTask → execution → WAITING_FOR_APPROVAL
 人工审批（ANY / ALL / N_OF_M / SEQUENTIAL）
         ↓ 全部通过
 ExecutionService.onHumanTaskResolved
-   ├ actionHash 复核        （批准的动作内容没被改）
+   ├ commandHash 复核        （批准的动作内容没被改）
    ├ resourceVersion 复核   （批准时依据的数据版本仍是当前版本）
    └ ToolPolicy 通过后 → server 侧 executor 执行 → COMPLETED
 ```
 
-- `actionHash = sha256(canonicalJson(intent 去掉 createdAt))`，执行前重算比对；
+- `commandHash = sha256(canonicalJson(intent 去掉 createdAt))`，执行前重算比对；
   失配 → 回到 `WAITING_FOR_APPROVAL` 并开新审批任务
 - `resourceVersion` 是另一维度：批准时的数据版本 vs 执行时的当前版本
 - **审批批准的是 intent，不是一次 HTTP 请求**：批准后必须重新校验才能执行
@@ -371,8 +371,8 @@ ExecutionService.onHumanTaskResolved → transition(resuming)
 进程重启时启动恢复会把残留的 `resuming` 归到终态 `interrupted`（见 3.5），
 所以它不会无声无息地永久卡在库里。
 
-approval 不需要这个 runner：批准后由 server 侧执行器直接执行动作并收尾 ——
-`runAction` 内部一次走完 `waiting_for_approval → resuming → running → completed`。
+approval 不需要这个 runner：批准后由 server 侧执行器直接执行命令并收尾 ——
+`runCommand` 内部一次走完 `waiting_for_approval → resuming → running → completed`。
 
 **提交输入要过 assignee 判定**：`submitInput` 与 `approve` / `reject` / `delegate` / `cancel`
 一样按 `isAssignee`（角色命中 / 显式指派 / 被委派，三者之一）放行。只凭 task id 就能写值，
@@ -403,11 +403,11 @@ approval 不需要这个 runner：批准后由 server 侧执行器直接执行�
 
 `human_task` 的关闭是**条件写**：`update ... set status = ? where task_id = ? and status = 'open'`。
 并发审批下只有一个请求能把任务从 `open` 改走，**只有它**触发 `onResolved`
-（→ hash/版本复核 → `runAction` → 落终态）。四条关闭路径（`decide` / `submitInput` /
+（→ hash/版本复核 → `runCommand` → 落终态）。四条关闭路径（`decide` / `submitInput` /
 `cancel` / `sweepExpired`）共用这一个原语，各自恰好触发一次。
 
 没有这层时，两个审批者会各自判定"票已凑齐"、各自关闭、各自触发一次 `onResolved` ——
-approval 分支由此把**同一个业务动作执行两遍**（`runAction` 在服务端真的下单/投票）。
+approval 分支由此把**同一个业务动作执行两遍**（`runCommand` 在服务端真的下单/投票）。
 `unique(task_id, approver_id)` 防的是"同一个人重复投票"，防不住"两个不同的人同时关闭同一个任务"。
 
 进程内还有一把 per-task 串行锁，覆盖「读决策 → 判资格 → 加决策 → 评估 → 关闭」整段，
@@ -415,7 +415,7 @@ approval 分支由此把**同一个业务动作执行两遍**（`runAction` 在�
 "还差一票"于是**谁都不关闭**（漏收敛）。跨副本时这把锁不生效 —— 条件写仍然保证"不会重复执行"，
 但存在"最后一个投票者读到的集合偏旧 → 没人关闭"的漏收敛窗口，兜底是任务过期扫描与人工重提。
 
-## 6. 授权分层（Session Access → Execution Command → Business Action → Approval）
+## 6. 授权分层（Session Access → Execution Command → Business Command → Approval）
 
 请求从外到内要过四道判定，每道回答不同的问题，不能互相替代：
 
@@ -430,12 +430,12 @@ approval 分支由此把**同一个业务动作执行两遍**（`runAction` 在�
                  ┌────────────┴────────────┐
                  ▼                         ▼
            Session View            Execution Command        ← 能不能指挥这一个 execution
-                                   run / cancel /               （run / cancel / propose-action）
-                                   propose-action                见 3.3
+                                   run / cancel /               （run / cancel / propose-command）
+                                   propose-command                见 3.3
                                             │
                                             ▼
-                                Business Action Policy       ← 让不让 agent 做这个动作
-                                （actionType → 策略：要不要人批、谁能批）
+                                Business Command Policy       ← 让不让 agent 做这个动作
+                                （commandType → 策略：要不要人批、谁能批）
                                             │
                                       Human Approval
                                             │
@@ -446,9 +446,9 @@ approval 分支由此把**同一个业务动作执行两遍**（`runAction` 在�
                              Server-controlled executor（真正的 mutation）
 ```
 
-executor 拿到的上下文里带一个**幂等键**：`action:{executionId}:{actionHash}`。真实下游（券商网关、
+executor 拿到的上下文里带一个**幂等键**：`action:{executionId}:{commandHash}`。真实下游（券商网关、
 合规模块、邮件网关）必须把它透传过去，用来挡"外部副作用已生效 → 进程在落 `completed` 前崩 → 重试"
-造成的重复提交。刻意不绑 `taskId`：重新审批会产出新的 HumanTask，但那仍是同一次业务动作。
+造成的重复提交。刻意不绑 `taskId`：重新审批会产出新的 HumanTask，但那仍是同一次业务命令。
 
 工具调用那一侧是另一条正交的链，决定 agent 能用哪些工具、能写到哪：
 
@@ -459,21 +459,21 @@ Permission Policy（onPermissionRequest：read / write / shell / mcp / url）
       ↓
 PreToolUse Policy（强制 hook：写类工具路径必须在 session workspace）
       ↓
-Business Action Policy（与上面那条链的第三层是同一个）
+Business Command Policy（与上面那条链的第三层是同一个）
 ```
 
 两个最容易混的边界：
 
 - **`view` ≠ `command`**：能看见一个 execution 不等于能指挥它。observer 只有 `view`，
-  没有 `run / cancel / propose-action`（见 3.3）。
+  没有 `run / cancel / propose-command`（见 3.3）。
 - **`Session Access` ≠ `Business Authorization`**：前者是数据边界（谁能进这个会话、
-  能发消息吗），后者是业务边界（能不能做这个动作、要不要审批、谁有资格批）。会话访问不通过，
-  请求根本进不来；通过之后（含 execution command 也通过），高风险动作照旧要过 ActionPolicy
+  能发消息吗），后者是业务边界（能不能做这个命令、要不要审批、谁有资格批）。会话访问不通过，
+  请求根本进不来；通过之后（含 execution command 也通过），高风险动作照旧要过 CommandPolicy
   与人工审批。两层合并就等于把"能进这个会"当成"能替这个会签字"。
 
 高风险 mutation（`submit_proxy_vote` / `submit_trade` / `send_external_message` / `delete_data`）
-**不作为普通模型工具暴露**：agent 只能 `propose_action`，执行器在服务端
-（`server/src/actions/action-registry.ts`）。agent 侧入口见 `scripts/governance-mcp.mjs`。
+**不作为普通模型工具暴露**：agent 只能 `propose_command`，执行器在服务端
+（`server/src/commands/command-registry.ts`）。agent 侧入口见 `scripts/governance-mcp.mjs`。
 
 ## 7. 并发与锁
 
@@ -551,7 +551,7 @@ psql "$DATABASE_URL" -f server/src/db/migrations/003_workflow.sql
 | `session_participant` | session_id, tenant_id, user_id, role(owner/member/observer), status(active/left/removed), joined_at, left_at, `primary key(session_id, user_id)` |
 | `agent_message` | message_id, session_id, sequence, actor_type(user/agent), actor_id, **client_message_id**（幂等键）, content, execution_id, `unique(session_id, sequence)`、`unique(session_id, client_message_id)` |
 | `session_event` | event_id, session_id, sequence, type, actor_type, actor_id, execution_id, message_id, payload, `unique(session_id, sequence)` |
-| `agent_execution` | execution_id, session_id, tenant/user（= 会话 owner）, **initiated_by_user_id**（发起人）, **source_message_id**, **queue_sequence**（队列定序键，镜像来源消息序号）, **event_sequence**（执行事件序号分配器）, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars, **workflow_state**（Skill Flow 的 durable 状态，见第 11 节） |
+| `agent_execution` | execution_id, session_id, tenant/user（= 会话 owner）, **initiated_by_user_id**（发起人）, **source_message_id**, **queue_sequence**（队列定序键，镜像来源消息序号）, **event_sequence**（执行事件序号分配器）, kind, status, command_intent, **command_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars, **workflow_state**（Skill Flow 的 durable 状态，见第 11 节） |
 | `human_task` | task_id, execution_id, type, status, payload, **input_values**（人工输入回填）, input_schema, policy_id, strategy, required_count, eligible_roles/users, initiated_by, expires_at, delegated_* |
 | `human_task_decision` | decision_id, task_id, approver_id, approver_role, decision, comment, `unique(task_id, approver_id)` |
 | `execution_event` | execution_id, sequence, type, actor_type, actor_id, payload, `unique(execution_id, sequence)` |
@@ -584,7 +584,7 @@ exec 里，老库文件就会在建出 `queue_sequence` 之前引用它 → `no 
 |----|------|
 | Session | `POST /api/sessions`、`GET /api/sessions`、`GET /api/sessions/:id`（含 mode/owner/participants）、`POST /:id/resume`、`DELETE /:id[?permanent=true]`、`POST /:id/chat` |
 | 协作 | `GET /:id/participants`、`POST /:id/participants`、`DELETE /:id/participants/:userId`、`POST /:id/leave`、`GET /:id/messages`、`GET /:id/events`（SSE） |
-| Execution | `POST /api/executions`（202）、`GET /api/executions`、`GET /:id`、`GET /:id/events`、`GET /:id/tasks`、`POST /:id/run`（202，后台跑）、`POST /:id/cancel`、`POST /:id/actions`（提议动作） |
+| Execution | `POST /api/executions`（202）、`GET /api/executions`、`GET /:id`、`GET /:id/events`、`GET /:id/tasks`、`POST /:id/run`（202，后台跑）、`POST /:id/cancel`、`POST /:id/commands`（提议命令；旧路径 `/:id/actions` 仍可用） |
 | HumanTask | `GET /api/human-tasks`（我的）、`GET /api/human-tasks/all`、`GET /:id`、`POST /:id/approve`、`POST /:id/reject`、`POST /:id/input`、`POST /:id/delegate`、`POST /:id/cancel` |
 | 元信息 | `/api/providers`、`/api/models`、`/api/agents`、`/api/mcp`、`/api/mcp/test`、`/api/hooks`、`/api/debug` |
 
@@ -605,7 +605,7 @@ exec 里，老库文件就会在建出 `queue_sequence` 之前引用它 → `no 
 | `POST /executions` | `send` | — |
 | `POST /executions/:id/run` | — | command 判定（与下面两条同档）+ execution 当前状态（见第 4 节） |
 | `POST /executions/:id/cancel` | — | command 判定：owner 任意 / member 仅自己发起 / observer 不可 |
-| `POST /executions/:id/actions` | — | command 判定 + Business Action Policy（未登记 → 403、需审批 → 202 + taskId） |
+| `POST /executions/:id/commands` | — | command 判定 + Business Command Policy（未登记 → 403、需审批 → 202 + taskId）。旧路径 `/:id/actions` 指向同一个 handler |
 
 读端点（`GET /:id`、`GET /:id/events`、`GET /:id/tasks`、`GET /executions/*`）一律要 `view`
 再加下面的读准入 —— **没有额外授权**。
@@ -645,13 +645,13 @@ service 层抛的是 `Error`，路由按**消息前缀族**映射状态码，规
 | 调用方写错 | 参数校验（非法/缺少/必须/不是）、业务规则（不能/没有/无需/已经/未轮到）、状态冲突（已存在/已关闭/已过期）、配置（未知/可选：/被拒绝/解析失败） | 400 |
 | 认不出来 | —— | 交给兜底 500 |
 
-判据用**具体词**而非「已」「未」这类单字：`ActionService 未注入（wiring 缺失）`、
+判据用**具体词**而非「已」「未」这类单字：`CommandService 未注入（wiring 缺失）`、
 `写入通道尚未装配` 是服务端装配故障，必须留 500 —— 否则"服务端炸了"会被伪装成
 "用户传错了"。文案清单由 `test/http-errors.test.ts` 逐条覆盖，**新增抛错文案必须补进那张表**。
 
 ## 11. Skill Flow：SKILL.md 上的编排层
 
-一次业务流程（研究 → 合规门禁 → 合规审核 → 投资审核 → 发布）不是一次 agent turn 能做完的：中间要等人，要做确定性判断，要做受控的业务动作。**编排本身不新造 runtime。**
+一次业务流程（研究 → 合规门禁 → 合规审核 → 投资审核 → 发布）不是一次 agent turn 能做完的：中间要等人，要做确定性判断，要做受控的业务命令。**编排本身不新造 runtime。**
 
 不引入 BPMN，不引入 XState，不做第二套 YAML DSL。流程定义写在**已有的 SKILL.md 里**，用 Markdown AST 解析：
 
@@ -660,7 +660,7 @@ SKILL.md（Markdown）
     ↓ remark-parse（## @xxx 块 + `- outcome -> 目标` 路由）
 FlowDefinition（6 种节点）
     ↓
-WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
+WorkflowRunner ── 复用现有 Execution / HumanTask / Command 三层
 ```
 
 理由很直接：编排要的是"下一步去哪"，而这件事的全部信息已经在技能文件里。再引一套 DSL 就会有两份流程定义、两套权限语义、两套审计口径 —— 而 authority 已经在服务端了（见第 6 节），DSL 不会让它更安全，只会让它更难对齐。
@@ -672,17 +672,17 @@ WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
 | 块 | 作用 | 复用 | 出口 |
 |----|------|------|------|
 | `@flow <id>` | 流程入口，正文第一行是 `start -> <节点 id>` | — | — |
-| `@agent <技能名>` | 跑一次 agent turn：节点正文就是给 LLM 的 prompt。**旧名 `@subagent`，语义相同**（parser 归一化，下游只认 `agent`） | `runExecutionTurn`（同一个 session / model / tool policy / 工具证据） | `success` / `fail` |
+| `@task <节点标签>` | 执行一个受约束的 **AI 工作单元**：节点正文就是给 LLM 的 prompt。节点 id 只是流程图里的标签，**不代表技能名、也不代表 subagent 委派**（v1 的 `@agent` / `@subagent` 已硬改名，不做别名） | `runTask` → `runExecutionTurn`（同一个 session / model / tool policy / 工具证据） | `success` / `fail` |
 | `@gate <注册名>` | 确定性判断，结果只来自服务端注册的实现 | registry 里的 gate 函数 | gate 自己返回的 outcome |
 | `@review <注册名>` | 人工审核（可声明 `role` / `strategy` / `required` / `exclude`） | HumanTask + ApprovalPolicy | `approve` / `reject` |
-| `@action <注册名>` | 业务动作（可声明 `role`，只收窄不放宽） | `proposeAction`（策略 → 审批 → hash/版本复核 → executor） | `success` / `fail` |
+| `@command <注册名>` | 受控业务状态变更（可声明 `role`，只收窄不放宽） | `proposeCommand`（策略 → 审批 → hash/版本复核 → executor） | `success` / `fail` |
 | `@stop <id>` | 失败/拒绝终态 → execution 落 `failed` | — | 无 |
 | `@end <id>` | 成功终态 → execution 落 `completed` | — | 无 |
 
 这三类节点各自看着像"新能力"，实际全部是复用，差别只在收尾方式：
 
 - `@review` 建出来的是**普通 HumanTask**（`payload.workflow = { nodeId, kind }` 做标记），My Tasks、委派、SoD、租户隔离、审计全都不改一行；wiring 的 dispatcher 按这个标记把收敛事件分给 `WorkflowRunner`，没有标记的仍走 `ExecutionService`。
-- `@action` **不直接调 executor**，走完整的 `proposeAction` 链路，所以"上一步人工审核过了，这一步为什么还要批"是特性不是冗余 —— 审核的是"研究结论能不能发布"，批的是"这个 mutation 能不能发出去"，两者不可互相替代。唯一区别是 `completeOnSuccess: false`：动作执行完**不**收尾 execution，因为后面还有节点。
+- `@command` **不直接调 executor**，走完整的 `proposeCommand` 链路，所以"上一步人工审核过了，这一步为什么还要批"是特性不是冗余 —— 审核的是"研究结论能不能发布"，批的是"这个 mutation 能不能发出去"，两者不可互相替代。唯一区别是 `completeOnSuccess: false`：命令执行完**不**收尾 execution，因为后面还有节点。
 - `@gate` 的判定权在服务端注册的实现里，agent 的自我评价不算数 —— 合规边界不由 LLM 定义。
 
 **授权边界不写在 SKILL.md 里。** SKILL.md 可以声明"这一步需要什么业务角色"（见下节），
@@ -692,7 +692,7 @@ WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
 
 ### 11.1.1 保留属性与角色模型
 
-`@review` / `@action` 的正文最前面可以写**保留属性**（`name: value` 行，必须紧跟标题、在正文之前）：
+`@review` / `@command` 的正文最前面可以写**保留属性**（`name: value` 行，必须紧跟标题、在正文之前）：
 
 ```md
 ## @review investment-review
@@ -708,15 +708,15 @@ exclude: initiator                  # SoD：发起人不能批（none = 显式�
 ```
 
 ```md
-## @action create-supplier
+## @command create-supplier
 
 role: vendor.masterdata.operator    # 谁有资格批准这笔 mutation
 - success -> completed
 - fail -> creation-failed
 ```
 
-属性区会被**从正文里剥掉**，所以它不会混进描述或 prompt。`@agent` / `@gate` 不支持任何属性：
-`@agent` 的正文就是 prompt，往里塞角色声明只会让"谁有权跑这个 skill"变成一句写给 LLM 的话
+属性区会被**从正文里剥掉**，所以它不会混进描述或 prompt。`@task` / `@gate` 不支持任何属性：
+`@task` 的正文就是 prompt，往里塞角色声明只会让"谁有权跑这个 skill"变成一句写给 LLM 的话
 （写了会报 `block-attr-unsupported`，不是静默忽略）。
 
 **三层必须分开，任何一层都不要越界：**
@@ -750,13 +750,13 @@ Actual User
 | 节点 | 角色来源 | 冲突时 |
 |------|----------|--------|
 | `@review` | SKILL.md `role:`，或注册表 `FlowReview.eligibleRoles` | SKILL.md 优先（属性是流程自己的声明） |
-| `@action` | SKILL.md `role:` | 与该动作类型的 `ApprovalPolicy.eligibleRoles` **取交集** |
+| `@command` | SKILL.md `role:` | 与该命令类型的 `ApprovalPolicy.eligibleRoles` **取交集** |
 
 两边都拿不到角色的 `@review` 会在建 execution 时直接报 `review-missing-role` ——
 一个没人有资格批的任务等于流程定义不完整，不该等到有人点开才发现。
 
-`@action role:` **只能收窄，不能放宽**：交集为空时 `ActionService.classify` 直接 deny
-（"流程可以收窄授权，不能放宽"），节点走 `- fail -> ...`。声明了 `role:` 的动作也不走
+`@command role:` **只能收窄，不能放宽**：交集为空时 `CommandService.classify` 直接 deny
+（"流程可以收窄授权，不能放宽"），节点走 `- fail -> ...`。声明了 `role:` 的命令也不走
 `COPILOT_AUTO_APPROVE_ACTIONS` —— 那等于用一个环境变量绕过流程里写明的审批要求。
 
 SoD 刻意只支持 `exclude: initiator` 这一个值。更复杂的冲突规则（不能与发起人同部门、
@@ -767,7 +767,7 @@ SoD 刻意只支持 `exclude: initiator` 这一个值。更复杂的冲突规则
 
 `POST /api/executions` 在**建 execution 之前**就把整份流程校验完，不过就 400 并带上行号：
 
-`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`route-outcome-duplicate`（同一个出口写了两条 route）、`node-unreachable`、`skill-missing`（`@agent` 指向的技能不存在）、`block-attr-unsupported` / `block-attr-unknown` / `block-attr-duplicate`（保留属性名不对、拼错、重复）、`attr-invalid`（属性值不合法）、`role-missing`（引用了未登记的业务角色）、`review-missing-role`（`@review` 拿不到任何角色）。
+`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`route-outcome-duplicate`（同一个出口写了两条 route）、`node-unreachable`、`node-unknown-outcome`（写了该节点类型不会产生的出口，是条永远走不到的假分支）、`task-tools-forbidden` / `task-output-missing`、`block-attr-unsupported` / `block-attr-unknown` / `block-attr-duplicate`（保留属性名不对、拼错、重复）、`attr-invalid`（属性值不合法）、`role-missing`（引用了未登记的业务角色）、`review-missing-role`（`@review` 拿不到任何角色）。
 
 `route-outcome-duplicate` 是后补的一条：`findRoute()` 是 `routes.find(...)`，第一条命中就返回，后面的**静默失效**。`- pass -> review-a` 加 `- pass -> review-b` 读起来像"两种可能"，实际永远只去 `review-a`。`@flow` 的 `start` 同一条规则 —— 金融流程不该有"看书写顺序决定走向"的不确定性。
 
@@ -776,7 +776,7 @@ SoD 刻意只支持 `exclude: initiator` 这一个值。更复杂的冲突规则
 已经认领到属性，段内认不出的名字（`roles:` 这类拼错）就会报 `block-attr-unknown` ——
 既不误伤正文，也不放过笔误。
 
-顺序有讲究：跑到一半才发现某个 `- approve -> xxx` 指向不存在的节点，那时 execution 可能已经停在等待态，或者已经把业务动作提出去了。`@gate` 的出口名无法静态校验（由服务端实现决定），所以这类节点不参与 `node-missing-outcome` 检查，但运行时找不到匹配出口会立刻失败，不做"只有一个出口就兜底"的猜测。
+顺序有讲究：跑到一半才发现某个 `- approve -> xxx` 指向不存在的节点，那时 execution 可能已经停在等待态，或者已经把业务命令提出去了。`@gate` 的出口名无法静态校验（由服务端实现决定），所以这类节点不参与 `node-missing-outcome` 检查，但运行时找不到匹配出口会立刻失败，不做"只有一个出口就兜底"的猜测。
 
 环是**允许**的（`- reject -> investment-research` 是研究流程的常态），所以有硬闸门 `MAX_FLOW_STEPS = 100`：超了就 failed。它刻意不在 DSL 里 —— 这是运行时保护，不是流程语义。
 
@@ -796,12 +796,12 @@ pending → running → pending
 
 | 中断在哪一步 | 处理 |
 |--------------|------|
-| `@agent` / `@gate` | 纯计算，记一条 `workflow.step.interrupted` 审计后**允许重放** |
-| `@action` | 有真实副作用，**不重放**，落 `failed` 交人工核对（幂等键只能防重复提交，防不了"外部系统已生效但本地没记上"） |
+| `@task` / `@gate` | 纯计算，记一条 `workflow.step.interrupted` 审计后**允许重放** |
+| `@command` | 有真实副作用，**不重放**，落 `failed` 交人工核对（幂等键只能防重复提交，防不了"外部系统已生效但本地没记上"） |
 
-状态里含 `current` / `stepStatus` / `steps` / `waitingTaskId` / `lastOutcome` / `lastOutput`（`@agent` 输出截断 4000 字符，只作下一步判断依据，不是证据仓库 —— 证据在 tool_calls 里）。
+状态里含 `current` / `stepStatus` / `steps` / `waitingTaskId` / `lastOutcome` / `lastOutput`（`@task` 输出截断 4000 字符，只作下一步判断依据，不是证据仓库 —— 证据在 tool_calls 里）。
 
-编排器自身的未预期异常（`buildIntent()` / `createApprovalTask()` / `transition()` / registry / DB）由 `runDetached()` 兜底落 `failed`：只 `console.error` 会留下一个永远 `running` 的 execution —— 它占着队列、挡住取消，也没人知道该不该重跑。节点内的失败（`@agent` 跑不动、`@gate` 抛错）不走这条路，它们是**可路由**的出口（`- fail -> ...`）。
+编排器自身的未预期异常（`buildIntent()` / `createApprovalTask()` / `transition()` / registry / DB）由 `runDetached()` 兜底落 `failed`：只 `console.error` 会留下一个永远 `running` 的 execution —— 它占着队列、挡住取消，也没人知道该不该重跑。节点内的失败（`@task` 跑不动、`@gate` 抛错）不走这条路，它们是**可路由**的出口（`- fail -> ...`）。
 
 `sourceHash` 是 SKILL.md 的 SHA-256，每次推进前重算比对。它只是一个字段，挡的是金融流程最不该发生的事：已经开始的执行悄悄切到另一个版本的流程定义上继续跑。不一致 → failed + 人工确认，不静默迁移。
 
@@ -823,7 +823,7 @@ POST /api/executions/:id/run     # workflow 不需要 prompt（步骤说明在 S
 
 ### 11.5 明确不做
 
-并行分支（fork/join）、定时器与 escalation、子流程调用、表达式与变量、动态生成流程、以及"审批超时自动通过"。这些要么在 Business Action Policy 那一层已经覆盖，要么属于真正的 workflow engine（第 13 节已排除）。当前这套只解决一件事：**把"研究→审核→发布"这类固定步骤串起来，并且串的时候不绕开现有的权限与审计。**
+并行分支（fork/join）、定时器与 escalation、子流程调用、表达式与变量、动态生成流程、以及"审批超时自动通过"。这些要么在 Business Command Policy 那一层已经覆盖，要么属于真正的 workflow engine（第 13 节已排除）。当前这套只解决一件事：**把"研究→审核→发布"这类固定步骤串起来，并且串的时候不绕开现有的权限与审计。**
 
 ## 12. 目录
 
@@ -841,7 +841,7 @@ server/src/
 │                events hash usage redact
 ├── human-tasks/ types repository sql-repository(+memory) human-task-service assignment
 ├── approval/    types approval-policy approval-service
-├── actions/     action-registry（server-controlled executor） action-service
+├── commands/    command-registry（server-controlled executor） command-service
 ├── workflow/    types registry（gate/review/action 的服务端注册） runner（编排器）
 ├── skills/      index（加载 / sourceHash） flow-parser（remark AST → FlowDefinition）
 │                flow-validator（行号级校验）

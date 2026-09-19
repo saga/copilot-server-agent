@@ -37,7 +37,7 @@ description: 对重大投资交易进行研究、合规与风险审查、投资�
 * 不得自行决定用户是否具有审批权限
 * 不得绕过合规、风险或投资委员会审批
 * 不得直接调用未经注册的交易系统
-* 所有实际业务动作必须通过注册的 Action 执行
+* 所有实际业务动作必须通过注册的 Command 执行
 * 发生信息变化时，应重新验证相关审批条件
 
 ## Required Input
@@ -62,7 +62,7 @@ start -> investment-analysis
 
 ---
 
-## @agent investment-analysis
+## @task investment-analysis
 
 对投资机会进行初步研究，形成投资分析包。
 
@@ -155,7 +155,7 @@ start -> investment-analysis
 
 ---
 
-## @agent research-revision
+## @task research-revision
 
 根据人工审核意见重新整理投资研究。
 
@@ -244,7 +244,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 
 ---
 
-## @agent risk-analysis
+## @task risk-analysis
 
 对交易进行独立风险评估。
 
@@ -373,7 +373,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 
 > 投资委员会同意继续执行该交易。
 
-它不能绕过最终 Action 的授权和重新验证。
+它不能绕过最终 Command 的授权和重新验证。
 
 * approve -> execution-check
 * reject -> investment-rejected
@@ -392,7 +392,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 * 交易指令版本没有变化
 * 标的状态没有变化
 * 交易金额没有超出批准范围
-* 审批对应的 ActionIntent 仍然有效
+* 审批对应的 CommandIntent 仍然有效
 * 所需审批没有过期
 * 没有新的阻断条件
 
@@ -442,17 +442,17 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 
 ---
 
-## @action execute-trade
+## @command execute-trade
 
 执行已经批准的交易。
 
-该 Action 必须通过注册的交易 Action 执行，不得由 Agent 直接调用底层交易系统。
+该 Command 必须通过注册的交易 Command 执行，不得由 Agent 直接调用底层交易系统。
 
 执行前必须：
 
 * 验证当前审批状态
 * 验证审批人资格
-* 验证 ActionIntent
+* 验证 CommandIntent
 * 验证 resourceVersion
 * 验证 action hash
 * 验证交易指令版本
@@ -476,7 +476,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 
 * 执行主体
 
-* Action idempotency key
+* Command idempotency key
 
 * success -> post-trade-check
 
@@ -484,7 +484,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 
 ---
 
-## @agent post-trade-check
+## @task post-trade-check
 
 对执行结果进行事后核对。
 
@@ -580,7 +580,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 * 人工处理
 * 取消后续流程
 
-不得因为 Action 重试而重复产生未经幂等控制的业务副作用。
+不得因为 Command 重试而重复产生未经幂等控制的业务副作用。
 
 ---
 
@@ -607,7 +607,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 * 最终批准了什么
 * 实际执行了什么
 * 为什么允许执行
-* Action 使用了什么版本和幂等键
+* Command 使用了什么版本和幂等键
 * 最终执行结果是什么
 
 ---
@@ -618,7 +618,7 @@ Agent 可以提供辅助信息，但不能自行给出正式合规结论。
 start
   │
   ▼
-@agent investment-analysis
+@task investment-analysis
   │
   ▼
 @gate research-quality
@@ -627,7 +627,7 @@ start
   │
   ├── review → @review research-review
   │                         │
-  │                         ├── reject → @agent research-revision
+  │                         ├── reject → @task research-revision
   │                         │                 │
   │                         │                 └──→ research-quality
   │                         │
@@ -645,7 +645,7 @@ start
                                             └── pass
                                                  │
                                                  ▼
-                                      @agent risk-analysis
+                                      @task risk-analysis
                                                  │
                                                  ▼
                                            @gate risk-gate
@@ -680,13 +680,13 @@ start
                                                    fail              review          pass
                                                     │                  │              │
                                                     ▼                  ▼              ▼
-                                              STOP blocked      @review execution  @action
+                                              STOP blocked      @review execution  @command
                                                                     │             execute-trade
                                                                reject│              │
                                                                     ▼          success/fail
                                                                STOP blocked        │
                                                                                   ▼
-                                                                          @agent post-trade-check
+                                                                          @task post-trade-check
                                                                                   │
                                                                     ┌─────────────┴────────────┐
                                                                     │                          │

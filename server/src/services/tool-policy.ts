@@ -34,9 +34,9 @@ export interface ToolPolicyContext {
   /** 本次会话实际启用的 MCP server 名（MCP 调用只放行这些） */
   mcpServers: string[];
   /**
-   * Skill Flow 的 `@agent` 能力边界（见 workflow/capability.ts）。
+   * Skill Flow 的 `@task` 能力边界（见 workflow/capability.ts）。
    *
-   * 做成**回调**而不是快照：边界在会话生命周期中间才生效（跑到 `@agent` 节点时才设），
+   * 做成**回调**而不是快照：边界在会话生命周期中间才生效（跑到 `@task` 节点时才设），
    * 建会话时拿不到。每次权限请求现取，才能跟上"现在跑的是流程里的哪一步"。
    *
    * 返回 undefined = 当前没有 workflow 节点在跑 → 不加这层限制（原有行为不变）。
@@ -107,7 +107,7 @@ function hostAllowed(url: URL): boolean {
 /**
  * onPermissionRequest：按 kind 分级裁决。
  *
- * **第 0 层（Skill Flow 能力边界）**：跑 `@agent` 节点时先按该节点的能力集合过一道。
+ * **第 0 层（Skill Flow 能力边界）**：跑 `@task` 节点时先按该节点的能力集合过一道。
  * 它只**收窄**，不替代下面的检查 —— 过了这一层还要继续走 workspace / SSRF 等原有判定。
  * 它先和"当前正在跑的 execution"对一次账，边界不属于当前 execution 就直接拒绝：
  * 边界是会话级存放、execution 级生效的，不比对账就会串台（见 ToolPolicyContext）。
@@ -126,7 +126,7 @@ export function createPermissionHandler(ctx: ToolPolicyContext): PermissionHandl
       recordHookEvent(ctx.sessionId, 'permission', `${decision} kind=${request.kind} ${detail}`);
     };
 
-    // 第 0 层：workflow @agent 的能力边界。
+    // 第 0 层：workflow @task 的能力边界。
     // 放在最前面，是为了让拒绝理由说清"这是流程节点的能力限制"，
     // 而不是让它落进下面某个 kind 分支、报一个看起来无关的错。
     const capability = ctx.capability?.();
@@ -160,9 +160,9 @@ export function createPermissionHandler(ctx: ToolPolicyContext): PermissionHandl
         const detail = `workflow node ${capability.nodeId} 不允许 ${request.kind}（允许：${[...capability.kinds].join(',') || '(无)'}）`;
         audit('deny', detail);
         return deny(
-          `流程节点 @agent ${capability.nodeId} 没有 ${request.kind} 权限：` +
+          `流程节点 @task ${capability.nodeId} 没有 ${request.kind} 权限：` +
             `它只能使用 ${[...capability.kinds].join(' / ') || '(无工具)'}。` +
-            '业务动作必须通过流程里声明的 @action 节点走审批，不能由 agent 直接执行。',
+            '业务命令必须通过流程里声明的 @command 节点走审批，不能由 agent 直接执行。',
         );
       }
     }

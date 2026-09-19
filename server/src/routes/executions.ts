@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import {
   executionService,
@@ -7,11 +7,11 @@ import {
   sessionCoordinator,
   workflowRunner,
 } from '../wiring.js';
-import type { ActionIntent } from '../execution/types.js';
+import { canonicalEventType, type CommandIntent } from '../execution/types.js';
 import type { WorkflowState } from '../workflow/types.js';
 import { FlowValidationError } from '../workflow/runner.js';
 import {
-  actionSchema,
+  commandSchema,
   assertSessionSendable,
   assertSessionVisible,
   principalOf,
@@ -74,7 +74,7 @@ executionRouter.get('/', async (req, res, next) => {
  * kind = "workflow" 时额外给 skill + flow：**建之前先把 SKILL.md 校验完**
  * （技能存在、恰好一个 @flow、路由目标存在、出口写全、gate/review/action 已注册）。
  * 校验不过直接 400 —— 不要跑到一半才发现路由指向不存在的节点，
- * 那时 execution 可能已经停在 waiting 或者已经把业务动作提出去了。
+ * 那时 execution 可能已经停在 waiting 或者已经把业务命令提出去了。
  */
 executionRouter.post('/', async (req, res, next) => {
   try {
@@ -155,7 +155,10 @@ executionRouter.get('/:id/events', async (req, res, next) => {
     const record = await executionService.get(id);
     if (!record) return res.status(404).json({ error: `execution 不存在："${id}"` });
     if (access !== 'all') await assertSessionVisible(record.sessionId, principalOf(req));
-    return res.json({ events: await executionService.events(id, limit) });
+    const events = await executionService.events(id, limit);
+    // 审计表里的历史行还带着改名前的 `action.*` 事件名 —— 在 API 边界归一化，
+    // 让调用方（UI / 排障脚本）只需认一套名字
+    return res.json({ events: events.map((e) => ({ ...e, type: canonicalEventType(e.type) })) });
   } catch (err) {
     return sendServiceError(res, err, next);
   }
@@ -187,7 +190,7 @@ executionRouter.get('/:id/tasks', async (req, res, next) => {
  *
  * 权限与 cancel / actions 同一档：`assertCanCommandExecution`（owner 任意 / member 只能
  * 跑自己发起的 / observer 不可）。**不能只判 `send`** —— 那等于"能在这个会话发言就能让
- * 别人的 execution 跑起来"，与 cancel/actions 的规则自相矛盾，也让文档里
+ * 别人的 execution 跑起来"，与 cancel/commands 的规则自相矛盾，也让文档里
  * "owner 或发起人才能指挥 execution" 不成立。
  */
 executionRouter.post('/:id/run', async (req, res, next) => {
@@ -239,20 +242,26 @@ executionRouter.post('/:id/cancel', async (req, res, next) => {
 });
 
 /**
- * POST /api/executions/:id/actions — agent 提出业务动作意图。
+ * POST /api/executions/:id/commands — agent 提出业务命令意图。
  *
  * 两层授权，不能互相替代：
  *   会话访问  发起人必须能指挥这个 execution（owner 或发起人本人；observer 不可）
- *   业务授权  能不能做这个动作、要不要审批、谁有资格批（ActionPolicy + ApprovalPolicy）
+ *   业务授权  能不能做这个命令、要不要审批、谁有资格批（CommandPolicy + ApprovalPolicy）
  * 裁决全在服务端：未登记策略 → 拒绝；需审批 → 建 HumanTask + execution 进入
  * WAITING_FOR_APPROVAL；登记为自动放行 → server 直接执行。执行权不在 agent 的工具集里。
  *
- * 只判 `view` 是不行的：observer 若能调这个端点，就等于能对别人的 execution 提业务动作
+ * 只判 `view` 是不行的：observer 若能调这个端点，就等于能对别人的 execution 提业务命令
  * （`submit_proxy_vote` 这类）。业务意图不是"看得见"就能提。
+ *
+ * **兼容层**：`/actions` 是改名前的路径，仍指向同一个 handler（老调用方不用改）；
+ * 请求体同时接受 `commandType` 与新名之前的 `actionType`。响应只发新名字。
  */
-executionRouter.post('/:id/actions', async (req, res, next) => {
+executionRouter.post('/:id/commands', handleProposeCommand);
+executionRouter.post('/:id/actions', handleProposeCommand);
+
+async function handleProposeCommand(req: Request, res: Response, next: NextFunction) {
   try {
-    const body = actionSchema.parse(req.body ?? {});
+    const body = commandSchema.parse(req.body ?? {});
     const id = String(req.params.id);
     const principal = principalOf(req);
     const record = await executionService.get(id);
@@ -260,15 +269,15 @@ executionRouter.post('/:id/actions', async (req, res, next) => {
     await sessionAccessService.assertCanCommandExecution(record.sessionId, principal, record);
     // 提案发生在 agent turn 中；若 execution 仍是 created（异步/手工场景），先置 running
     if (record.status === 'created') await executionService.start(id);
-    const intent: ActionIntent = {
-      actionType: body.actionType,
+    const intent: CommandIntent = {
+      commandType: body.commandType,
       target: body.target,
       parameters: body.parameters ?? {},
       ...(body.reason ? { reason: body.reason } : {}),
       requestedBy: { userId: principal.userId, tenantId: principal.tenantId },
       createdAt: new Date().toISOString(),
     };
-    const verdict = await executionService.proposeAction(id, intent, {
+    const verdict = await executionService.proposeCommand(id, intent, {
       ...(body.resourceVersion ? { resourceVersion: body.resourceVersion } : {}),
     });
     const status = (await executionService.get(id))?.status;
@@ -276,4 +285,4 @@ executionRouter.post('/:id/actions', async (req, res, next) => {
   } catch (err) {
     return sendServiceError(res, err, next);
   }
-});
+}

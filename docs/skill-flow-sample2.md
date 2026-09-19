@@ -36,7 +36,7 @@ description: 对新供应商进行资料收集、风险评估、采购与法务�
 * 不得自行决定审批人员
 * 不得绕过采购、法务、信息安全或最终审批
 * 不得直接修改供应商主数据
-* 所有主数据变更必须通过注册的 Action 执行
+* 所有主数据变更必须通过注册的 Command 执行
 * 对缺失资料应明确指出，不得自行补全不存在的事实
 
 ## Required Input
@@ -63,7 +63,7 @@ start -> supplier-analysis
 
 ---
 
-## @agent supplier-analysis
+## @task supplier-analysis
 
 分析供应商提交的资料，并建立供应商准入资料包。
 
@@ -164,7 +164,7 @@ start -> supplier-analysis
 
 ---
 
-## @agent supplier-risk
+## @task supplier-risk
 
 对供应商进行风险分析。
 
@@ -369,11 +369,11 @@ start -> supplier-analysis
 
 ---
 
-## @action create-supplier
+## @command create-supplier
 
 创建供应商主数据。
 
-该 Action 必须通过注册的供应商管理操作执行。
+该 Command 必须通过注册的供应商管理操作执行。
 
 执行前必须重新验证：
 
@@ -409,7 +409,7 @@ start -> supplier-analysis
 
 ---
 
-## @agent post-onboarding-check
+## @task post-onboarding-check
 
 核对供应商主数据是否正确创建。
 
@@ -537,7 +537,7 @@ start -> supplier-analysis
 start
   │
   ▼
-@agent supplier-analysis
+@task supplier-analysis
   │
   ▼
 @gate completeness-check
@@ -553,7 +553,7 @@ start
   └── pass ───────────────────────┐
                                    │
                                    ▼
-                         @agent supplier-risk
+                         @task supplier-risk
                                    │
                                    ▼
                          @gate procurement-gate
@@ -608,14 +608,14 @@ start
                                            reject                    approve
                                              │                         │
                                              ▼                         ▼
-                                   STOP onboarding-rejected     @action create-supplier
+                                   STOP onboarding-rejected     @command create-supplier
                                                                         │
                                                             ┌───────────┴───────────┐
                                                             │                       │
                                                           fail                    success
                                                             │                       │
                                                             ▼                       ▼
-                                                   STOP creation-failed    @agent post-onboarding-check
+                                                   STOP creation-failed    @task post-onboarding-check
                                                                                     │
                                                                          ┌──────────┴──────────┐
                                                                          │                     │

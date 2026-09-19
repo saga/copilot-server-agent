@@ -4,9 +4,9 @@ import { test } from 'node:test';
 import { ApprovalService } from '../src/approval/approval-service.js';
 import { BUILTIN_POLICIES, evaluateApproval, resolvePolicy } from '../src/approval/approval-policy.js';
 import type { ApprovalPolicy, HumanTaskDecision } from '../src/approval/types.js';
-import { ActionService } from '../src/actions/action-service.js';
+import { CommandService } from '../src/commands/command-service.js';
 import { config } from '../src/config.js';
-import { canonicalJson, hashAction, verifyActionHash } from '../src/execution/hash.js';
+import { canonicalJson, hashCommand, verifyCommandHash } from '../src/execution/hash.js';
 import { ExecutionService } from '../src/execution/execution-service.js';
 import {
   MemoryEventRepository,
@@ -14,15 +14,15 @@ import {
 } from '../src/execution/memory-repository.js';
 import { MemoryHumanTaskRepository } from '../src/human-tasks/memory-repository.js';
 import { HumanTaskService } from '../src/human-tasks/human-task-service.js';
-import type { ActionIntent } from '../src/execution/types.js';
+import type { CommandIntent } from '../src/execution/types.js';
 
 const OWNER = { tenantId: 't1', userId: 'pm-1' };
 const RISK = { tenantId: 't1', userId: 'risk-1', roles: ['risk'] };
 const OPS = { tenantId: 't1', userId: 'ops-1', roles: ['operations'] };
 const PM = { tenantId: 't1', userId: 'pm-1', roles: ['portfolio_manager'] };
 
-const voteIntent = (over: Partial<ActionIntent> = {}): ActionIntent => ({
-  actionType: 'submit_proxy_vote',
+const voteIntent = (over: Partial<CommandIntent> = {}): CommandIntent => ({
+  commandType: 'submit_proxy_vote',
   target: { type: 'security', id: 'US1234567890' },
   parameters: { resolution: 'FOR', shares: 125000 },
   reason: 'agent recommends FOR',
@@ -34,11 +34,11 @@ const voteIntent = (over: Partial<ActionIntent> = {}): ActionIntent => ({
 /** 装配一套 execution + human task + approval（与 wiring.ts 一致，只是仓储换内存） */
 function wire() {
   const approval = new ApprovalService({ allowInitiatorApproval: false });
-  const actions = new ActionService({ approval });
+  const commands = new CommandService({ approval });
   const execution = new ExecutionService({
     repository: new MemoryExecutionRepository(),
     events: new MemoryEventRepository(),
-    actions,
+    commands,
   });
   const humanTasks = new HumanTaskService({
     repository: new MemoryHumanTaskRepository(),
@@ -47,7 +47,7 @@ function wire() {
       execution.onHumanTaskResolved(task, resolution, decisions),
   });
   execution.bindHumanTasks(humanTasks);
-  return { approval, actions, execution, humanTasks };
+  return { approval, commands, execution, humanTasks };
 }
 
 function decision(
@@ -69,7 +69,7 @@ function decision(
 test('策略裁决：ANY / ALL / N_OF_M / SEQUENTIAL 语义正确', () => {
   const anyPolicy: ApprovalPolicy = {
     policyId: 'p-any',
-    actionType: 'x',
+    commandType: 'x',
     strategy: 'ANY',
     eligibleRoles: ['risk', 'compliance'],
     allowInitiator: false,
@@ -127,27 +127,46 @@ test('策略裁决：ANY / ALL / N_OF_M / SEQUENTIAL 语义正确', () => {
   );
 });
 
-test('未登记的动作类型默认拒绝（不放 LLM 自己发明高风险动作）', () => {
+test('未登记的命令类型默认拒绝（不放 LLM 自己发明高风险命令）', () => {
   assert.equal(resolvePolicy('do_something_new'), null);
-  const actions = new ActionService({
+  const commands = new CommandService({
     approval: new ApprovalService({ allowInitiatorApproval: false }),
   });
   assert.equal(
-    actions.classify(voteIntent({ actionType: 'wire_money' })).decision,
+    commands.classify(voteIntent({ commandType: 'wire_money' })).decision,
     'denied',
   );
-  assert.ok(BUILTIN_POLICIES.some((p) => p.actionType === 'submit_proxy_vote'));
+  assert.ok(BUILTIN_POLICIES.some((p) => p.commandType === 'submit_proxy_vote'));
 });
 
-test('actionHash：内容变了必须重新审批', () => {
+test('commandHash：内容变了必须重新审批', () => {
   const a = voteIntent();
   const b = voteIntent({ parameters: { resolution: 'AGAINST', shares: 999999 } });
   assert.equal(canonicalJson({ b: 1, a: 2 }), '{"a":2,"b":1}');
-  const hash = hashAction(a);
-  assert.equal(verifyActionHash(a, hash), true);
-  assert.equal(verifyActionHash(b, hash), false);
+  const hash = hashCommand(a);
+  assert.equal(verifyCommandHash(a, hash), true);
+  assert.equal(verifyCommandHash(b, hash), false);
   // createdAt 不进 hash：同一动作不同时间提出 hash 一致
-  assert.equal(hashAction(voteIntent({ createdAt: '2020-01-01T00:00:00Z' })), hash);
+  assert.equal(hashCommand(voteIntent({ createdAt: '2020-01-01T00:00:00Z' })), hash);
+});
+
+test('commandHash：hash 的输入是**冻结的 wire format**，字段改名不换 hash', () => {
+  // 这条断言的字面值就是它的意义：`commandHash` 算的是"批准了什么"，而它序列化时用的
+  // key 名**冻结**在 `execution/hash.ts` 的 frozenHashInput() 里（旧键名 `actionType`）。
+  //
+  // 为什么不能顺手把那个键改成 `commandType`：hash 是对 key 排序后序列化的结果，
+  // **改一个字段名就换一个 hash**。所有已经批准、还停在 `waiting_for_approval` 的命令
+  // 会在执行前复核时报"命令内容已被修改，必须重新审批" —— 而内容一个字都没变。
+  //
+  // 所以这里钉住字面值：谁动了那份格式，这条就红，逼他先想清楚在途审批怎么办。
+  const frozen = hashCommand(
+    voteIntent({ createdAt: '2020-01-01T00:00:00Z' }),
+  );
+  assert.equal(
+    frozen,
+    '3533ae5ec056416e60219ccac6f13ba56211445d89aee035dd8485dcdbe33097',
+    'frozenHashInput 的键名/字段集变了 —— 在途审批会全部失效，先读 hash.ts 的注释',
+  );
 });
 
 test('SoD：发起人不能自批', async () => {
@@ -179,14 +198,14 @@ test('HITL 全链路：propose → 建审批 → 顺序审批通过 → hash 复
   await execution.start(exec.executionId);
 
   const intent = voteIntent();
-  const verdict = await execution.proposeAction(exec.executionId, intent);
+  const verdict = await execution.proposeCommand(exec.executionId, intent);
   assert.equal(verdict.decision, 'needs_approval');
   assert.ok(verdict.taskId);
 
   const waiting = (await execution.get(exec.executionId))!;
   assert.equal(waiting.status, 'waiting_for_approval');
   assert.equal(waiting.waitReason, 'approval');
-  assert.equal(waiting.actionHash, hashAction(intent));
+  assert.equal(waiting.commandHash, hashCommand(intent));
 
   // 顺序审批：PM → risk → operations（发起人不能自批，所以这里由其他角色推进）
   await humanTasks.approve(verdict.taskId!, { principal: { ...PM, userId: 'pm-2' } });
@@ -198,18 +217,21 @@ test('HITL 全链路：propose → 建审批 → 顺序审批通过 → hash 复
   assert.equal(done.status, 'completed');
   const out = done.result as { receipt?: string; idempotencyKey?: string };
   assert.match(String(out?.receipt ?? ''), /^vote_ex_/);
-  // 幂等键 = action:{executionId}:{actionHash}，随执行上下文一路透传到 executor。
-  // 刻意不含 taskId：重新审批会换任务，但下游要认的是同一次业务动作。
-  assert.equal(out?.idempotencyKey, `action:${exec.executionId}:${hashAction(intent)}`);
+  // 幂等键 = action:{executionId}:{commandHash}，随执行上下文一路透传到 executor。
+  // 前缀 `action:` 是**冻结的 wire format**（见 execution-service.ts 的注释）：
+  // 它离开进程边界传给下游网关，改名会让在途重试换一个 key、下游去重失效。
+  // 刻意不含 taskId：重新审批会换任务，但下游要认的是同一次业务命令。
+  assert.equal(out?.idempotencyKey, `action:${exec.executionId}:${hashCommand(intent)}`);
   assert.ok(!String(out?.idempotencyKey).includes(verdict.taskId!), '幂等键不能绑 taskId');
 
   const events = await execution.events(exec.executionId, 100);
   const types = events.map((e) => e.type);
-  assert.ok(types.includes('agent.proposed_action'));
+  // 审计行写的是**新**事件名；老行（改名前的 `action.*`）由 canonicalEventType 在读的时候归一化
+  assert.ok(types.includes('agent.proposed_command'));
   assert.ok(types.includes('policy.approval_required'));
   assert.ok(types.includes('execution.waiting_for_approval'));
-  assert.ok(types.includes('action.hash_verified'));
-  assert.ok(types.includes('action.executed'));
+  assert.ok(types.includes('command.hash_verified'));
+  assert.ok(types.includes('command.executed'));
   assert.ok(types.includes('execution.completed'));
 });
 
@@ -219,7 +241,7 @@ test('HITL：审批后动作内容被改 → 拒绝执行并要求重新审批',
   await execution.start(exec.executionId);
 
   const intent = voteIntent();
-  const verdict = await execution.proposeAction(exec.executionId, intent);
+  const verdict = await execution.proposeCommand(exec.executionId, intent);
   const taskId = verdict.taskId!;
 
   // 模拟 agent/系统在等待期间把动作改了（hash 失配）
@@ -231,11 +253,11 @@ test('HITL：审批后动作内容被改 → 拒绝执行并要求重新审批',
   await humanTasks.approve(taskId, { principal: RISK });
 
   const rec = (await execution.get(exec.executionId))!;
-  // 篡改 actionIntent（保留原 hash）后让最后一次审批通过
+  // 篡改 commandIntent（保留原 hash）后让最后一次审批通过
   await (execution as unknown as { deps: { repository: { update(id: string, patch: unknown): Promise<unknown> } } }).deps.repository.update(
     exec.executionId,
     {
-      actionIntent: voteIntent({
+      commandIntent: voteIntent({
         parameters: { resolution: 'AGAINST', shares: 100000 },
       }),
     },
@@ -245,10 +267,10 @@ test('HITL：审批后动作内容被改 → 拒绝执行并要求重新审批',
 
   const after = (await execution.get(exec.executionId))!;
   assert.equal(after.status, 'waiting_for_approval', 'hash 失配应回到待审批而不是完成');
-  assert.equal(after.actionHash, rec.actionHash, '批准的 hash 仍是旧值');
-  assert.equal((after.actionIntent as ActionIntent).parameters.shares, 100000);
+  assert.equal(after.commandHash, rec.commandHash, '批准的 hash 仍是旧值');
+  assert.equal((after.commandIntent as CommandIntent).parameters.shares, 100000);
   const events = await execution.events(exec.executionId, 200);
-  assert.ok(events.map((e) => e.type).includes('action.hash_mismatch'));
+  assert.ok(events.map((e) => e.type).includes('command.hash_mismatch'));
   // 重新审批会开新任务
   const tasks = await humanTasks.repository.list({ executionId: exec.executionId });
   assert.equal(tasks.length, 2);
@@ -259,13 +281,13 @@ test('HITL：否决 / 过期 → execution 落到 rejected / expired', async () 
 
   const rejected = await execution.create({ sessionId: 's3', owner: OWNER, kind: 'job' });
   await execution.start(rejected.executionId);
-  const v1 = await execution.proposeAction(rejected.executionId, voteIntent());
+  const v1 = await execution.proposeCommand(rejected.executionId, voteIntent());
   await humanTasks.reject(v1.taskId!, { principal: { ...PM, userId: 'pm-2' }, comment: 'no' });
   assert.equal((await execution.get(rejected.executionId))!.status, 'rejected');
 
   const expiring = await execution.create({ sessionId: 's4', owner: OWNER, kind: 'job' });
   await execution.start(expiring.executionId);
-  const v2 = await execution.proposeAction(expiring.executionId, voteIntent());
+  const v2 = await execution.proposeCommand(expiring.executionId, voteIntent());
   await humanTasks.repository.update(v2.taskId!, {
     expiresAt: new Date(Date.now() - 1000).toISOString(),
   });
@@ -277,7 +299,7 @@ test('HITL：一人一票 + 委派留痕', async () => {
   const { execution, humanTasks } = wire();
   const exec = await execution.create({ sessionId: 's5', owner: OWNER, kind: 'job' });
   await execution.start(exec.executionId);
-  const verdict = await execution.proposeAction(exec.executionId, voteIntent());
+  const verdict = await execution.proposeCommand(exec.executionId, voteIntent());
   const taskId = verdict.taskId!;
 
   await humanTasks.approve(taskId, { principal: { ...PM, userId: 'pm-2' } });
@@ -397,17 +419,17 @@ test('并发审批：条件关闭 + 同一 task 串行，onResolved 只触发一
   });
   const COMPLIANCE = { tenantId: 't1', userId: 'comp-1', roles: ['compliance'] };
 
-  // actionType 故意不注册：decide() 会优先取**注册策略**（policyFor(actionType)），
+  // commandType 故意不注册：decide() 会优先取**注册策略**（policyFor(commandType)），
   // 用它就会盖掉这里的 inline 策略，测不到本用例要测的收敛逻辑。
   const makeTask = (strategy: ApprovalPolicy['strategy'], title: string) =>
     humanTasks.createApprovalTask({
       executionId: `ex-${title}`,
       tenantId: 't1',
       title,
-      payload: { actionType: 'custom_test_action' },
+      payload: { commandType: 'custom_test_command' },
       policy: {
         policyId: `p-${title}`,
-        actionType: 'custom_test_action',
+        commandType: 'custom_test_command',
         strategy,
         eligibleRoles: ['risk', 'compliance'],
         allowInitiator: false,
@@ -444,7 +466,7 @@ test('HumanTask：跨 tenant 不能审批 / 输入 / 取消 / 委派', async () 
     kind: 'job',
   });
   await execution.start(exec.executionId);
-  const vote = await execution.proposeAction(exec.executionId, voteIntent());
+  const vote = await execution.proposeCommand(exec.executionId, voteIntent());
   assert.equal(vote.decision, 'needs_approval');
   const taskId = vote.taskId!;
 
@@ -493,11 +515,11 @@ test('HumanTask list：只返回当前用户有资格处理的任务', async () 
   const base = {
     executionId: 'ex-list',
     tenantId: 't1',
-    payload: { actionType: 'custom_test_action' },
+    payload: { commandType: 'custom_test_command' },
   };
   const policy: ApprovalPolicy = {
     policyId: 'p-list',
-    actionType: 'custom_test_action',
+    commandType: 'custom_test_command',
     strategy: 'ANY',
     eligibleRoles: ['risk'],
     allowInitiator: false,
@@ -534,10 +556,10 @@ test('HumanTask list：同名角色跨 tenant 也不能看到任务', async () =
     executionId: 'ex-1',
     tenantId: 't1',
     title: 'tenant-a',
-    payload: { actionType: 'custom_test_action' },
+    payload: { commandType: 'custom_test_command' },
     policy: {
       policyId: 'p-1',
-      actionType: 'custom_test_action',
+      commandType: 'custom_test_command',
       strategy: 'ANY',
       eligibleRoles: ['risk'],
       allowInitiator: false,

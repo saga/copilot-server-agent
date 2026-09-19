@@ -106,7 +106,7 @@ export function resolveSkillDirectories(opts: {
 /**
  * 技能搜索目录：内置 + `COPILOT_SKILL_ROOTS`。
  *
- * 与 `resolveSkillDirectories` 同一套来源：Flow 里 `@agent <name>` 要能解析到
+ * 与 `resolveSkillDirectories` 同一套来源：Flow 里 `@task <name>` 要能解析到
  * 会话实际能看到的技能，否则"声明了却不生效"。
  */
 export function skillSearchDirs(extra: string[] = []): string[] {

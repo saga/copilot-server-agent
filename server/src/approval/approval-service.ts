@@ -28,9 +28,9 @@ export class ApprovalService {
     this.authorization = opts.authorization ?? authorizationService;
   }
 
-  /** 未登记的动作类型返回 null（调用方按默认拒绝处理，不放 LLM 自由发挥） */
-  policyFor(actionType: string): ApprovalPolicy | null {
-    return resolvePolicy(actionType);
+  /** 未登记的命令类型返回 null（调用方按默认拒绝处理，不放 LLM 自由发挥） */
+  policyFor(commandType: string): ApprovalPolicy | null {
+    return resolvePolicy(commandType);
   }
 
   required(policy: ApprovalPolicy): number {

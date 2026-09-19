@@ -23,8 +23,8 @@ flowchart TD
         D1 --> D16["Non-terminal has route"]
 
         D --> D2["Outcome / Branch"]
-        D2 --> D21["@agent: success + fail"]
-        D2 --> D22["@action: success + fail"]
+        D2 --> D21["@task: success + fail"]
+        D2 --> D22["@command: success + fail"]
         D2 --> D23["@review: approve + reject"]
         D2 --> D24["@gate: registry outcomes complete"]
 
@@ -67,10 +67,10 @@ flowchart TD
     L --> M["WorkflowRunner"]
 
     subgraph RUNTIME["4. Runtime Execution"]
-        M --> M1["@agent"]
+        M --> M1["@task"]
         M --> M2["@gate"]
         M --> M3["@review"]
-        M --> M4["@action"]
+        M --> M4["@command"]
         M --> M5["@stop"]
         M --> M6["@end"]
 

@@ -22,11 +22,11 @@ description: 投资研究流程：研究 → 合规门禁 → 合规审核 → �
 
 ## @flow investment-review
 
-start -> investment-research
+start -> research
 
 ---
 
-## @agent investment-research
+## @task research
 
 output: non-empty
 
@@ -73,7 +73,7 @@ exclude: initiator
 - 是否需要补充材料后重做
 
 - approve -> investment-review
-- reject -> investment-research
+- reject -> research
 
 ---
 
@@ -91,17 +91,17 @@ exclude: initiator
 
 ---
 
-## @action publish
+## @command publish
 
 role: investment.reviewer
 
 发布研究结论。
 
-这是业务动作：即使上一步已经有人工审核通过，这一笔 mutation 仍会按
-`publish_research` 的审批策略独立走一遍（动作绑定内容 hash 与数据版本）。
+这是业务命令：即使上一步已经有人工审核通过，这一笔 mutation 仍会按
+`publish_research` 的审批策略独立走一遍（命令绑定内容 hash 与数据版本）。
 
 `role:` 只是把审批资格**收窄**到 `investment.reviewer`，不会放宽服务端策略 ——
-交集为空时动作直接被拒，流程走 `- fail -> publish-failed`。
+交集为空时命令直接被拒，流程走 `- fail -> publish-failed`。
 
 - success -> completed
 - fail -> publish-failed

@@ -10,7 +10,7 @@ import { metaRouter } from './meta.js';
  *
  *   /api/sessions      → 会话生命周期 + chat（SSE）
  *   /api/sessions      → 协作端点（participants / messages / events），由 session-collaboration.ts 挂载
- *   /api/executions    → execution 生命周期 / 事件 / 人工任务 / 业务动作
+ *   /api/executions    → execution 生命周期 / 事件 / 人工任务 / 业务命令
  *   /api/human-tasks   → 审批与人工输入
  *   /api/{providers,models,agents,mcp,hooks,debug} → 元信息与诊断
  */

@@ -65,8 +65,8 @@ create table if not exists agent_execution (
   input text,
   result text,
   content_chars integer,
-  action_intent text,
-  action_hash text,
+  command_intent text,
+  command_hash text,
   resource_version text,
   approved_resource_version text,
   current_human_task_id text,
@@ -214,15 +214,18 @@ create index if not exists idx_session_event on session_event(session_id, sequen
 `;
 
 /**
- * 已有库文件的补列语句。
+ * 已有库文件的补列 / 改名语句。
  *
  * `create table if not exists` 对**已存在**的表什么都不做：老版本建的 `agent.db` 直接升上来，
  * 会在运行期报 `table agent_execution has no column named initiated_by_user_id`。
  * SQLite 没有 `add column if not exists`，所以由执行器先查 `pragma_table_info` 再决定是否 alter
  * （见 `db/sqlite.ts` 的 `applyColumnUpgrades`），重复启动安全。
  *
- * 与 `migrations/` 下的增量迁移（002 协作模型、003 workflow state）的 `add column if not exists`
- * 一一对应：新增列时两处都要加，否则两个后端会在运行期漂移。
+ * 两种语句都支持：
+ *   alter table t add column c ...       —— c 不在表里才执行
+ *   alter table t rename column a to b   —— a 在、且 b 不在，才执行（幂等）
+ *
+ * 与 `migrations/` 下的增量迁移一一对应：改 schema 时两处都要改，否则两个后端会漂移。
  * 这里只允许出现「CREATE TABLE 里已经声明过的列」——`test/schema.test.ts` 会校验。
  */
 export const SQLITE_COLUMN_UPGRADES: readonly string[] = [
@@ -235,4 +238,7 @@ export const SQLITE_COLUMN_UPGRADES: readonly string[] = [
   'alter table agent_execution add column event_sequence integer not null default 0',
   'alter table agent_execution add column workflow_state text',
   'alter table agent_execution add column workflow_version integer not null default 0',
+  // `@action` → `@command` 改名（与 migrations/005_rename_action_to_command.sql 对应）
+  'alter table agent_execution rename column action_intent to command_intent',
+  'alter table agent_execution rename column action_hash to command_hash',
 ];

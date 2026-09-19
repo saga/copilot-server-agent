@@ -23,7 +23,7 @@ import {
  *
  * 这里只回答「谁能进这个会话、能做什么」。业务授权（能不能批准某笔交易）不在这里，
  * 它由 Principal.roles → ApprovalPolicy 决定。两层不能合并：
- * 加进共享会话 ≠ 获得高风险动作的执行权。
+ * 加进共享会话 ≠ 获得高风险命令的执行权。
  */
 
 export interface ResolvedSessionAccess {
@@ -113,7 +113,7 @@ export class SessionAccessService {
   }
 
   /**
-   * 对某个 execution 下达命令（取消 / 提出业务动作）。
+   * 对某个 execution 下达命令（取消 / 提出业务命令）。
    *
    * 只判 `view` 是不够的 —— 看得见不等于能指挥别人的执行。规则：
    *   owner    可操作该会话内任意 execution

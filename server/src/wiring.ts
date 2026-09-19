@@ -1,5 +1,5 @@
 import { runExecutionTurn } from './agent/agent-execution.js';
-import { ActionService } from './actions/action-service.js';
+import { CommandService } from './commands/command-service.js';
 import { ApprovalService } from './approval/approval-service.js';
 import {
   CollaborationService,
@@ -64,12 +64,12 @@ export const approvalService = new ApprovalService({
   authorization: authorizationService,
 });
 
-export const actionService = new ActionService({ approval: approvalService });
+export const commandService = new CommandService({ approval: approvalService });
 
 export const executionService = new ExecutionService({
   repository: executionRepository,
   events: eventRepository,
-  actions: actionService,
+  commands: commandService,
 });
 
 // 让 agent-runner / tool-evidence / hooks-events / agent-context 能往"当前 execution"写证据，
@@ -83,9 +83,9 @@ export const humanTaskService = new HumanTaskService({
   /**
    * 人工任务收敛后的分派。
    *
-   * Skill Flow 的 `@review` / `@action` 任务带 `payload.workflow` 标记 —— 它们收敛后
-   * 不是"某个动作批完了，execution 可以收尾"，而是"流程可以往前走一步了"，必须交回编排器。
-   * 其余任务（普通业务动作审批、人工补数据）继续走 ExecutionService，行为完全不变。
+   * Skill Flow 的 `@review` / `@command` 任务带 `payload.workflow` 标记 —— 它们收敛后
+   * 不是"某个命令批完了，execution 可以收尾"，而是"流程可以往前走一步了"，必须交回编排器。
+   * 其余任务（普通业务命令审批、人工补数据）继续走 ExecutionService，行为完全不变。
    */
   onResolved: (task, resolution, decisions) => {
     if (isWorkflowTask(task)) {
@@ -99,7 +99,7 @@ executionService.bindHumanTasks(humanTaskService);
 
 // ---- Skill Flow 编排层：SKILL.md 的 @flow 由它推进（复用上面同一套 Execution/HumanTask/Action） ----
 
-/** 带 workflow 标记 = 该任务属于某条 Skill Flow，而不是某笔业务动作的审批 */
+/** 带 workflow 标记 = 该任务属于某条 Skill Flow，而不是某笔业务命令的审批 */
 export function isWorkflowTask(task: { payload?: Record<string, unknown> }): boolean {
   const marker = task.payload?.workflow;
   return Boolean(marker && typeof marker === 'object' && (marker as { nodeId?: unknown }).nodeId);

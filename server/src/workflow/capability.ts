@@ -5,39 +5,39 @@ import {
   type FlowPermissionKind,
 } from './types.js';
 
-// 硬上限是 `@agent` 能力边界的一部分，从这一层再导出：调用方（校验器、配置解析、测试）
+// 硬上限是 `@task` 能力边界的一部分，从这一层再导出：调用方（校验器、配置解析、测试）
 // 引用"生效边界"时只需要认 capability.ts 一个入口
 export { WORKFLOW_AGENT_ALLOWED_KINDS, WORKFLOW_AGENT_FORBIDDEN_KINDS, isWorkflowAgentKind } from './types.js';
 
 /**
- * `@agent` 节点的**能力边界**：这一步允许用哪些类别的工具权限。
+ * `@task` 节点的**能力边界**：这一步允许用哪些类别的工具权限。
  *
  * ## 它挡的是什么
  *
- * 流程把业务动作收敛到 `@action` 节点（策略 → 审批 → hash/版本复核 → executor），
- * 但 agent 手上还有工具 —— 它可以不走 `@action`，直接调一个 MCP server 把研究报告
+ * 流程把业务命令收敛到 `@command` 节点（策略 → 审批 → hash/版本复核 → executor），
+ * 但 agent 手上还有工具 —— 它可以不走 `@command`，直接调一个 MCP server 把研究报告
  * 发出去、或者用 shell curl 一个内部接口。那样整条流程的审批就成了摆设。
  *
- * 所以 `@agent` 节点**永远**碰不到 `mcp` 与 `shell`（见 `WORKFLOW_AGENT_ALLOWED_KINDS`）：
+ * 所以 `@task` 节点**永远**碰不到 `mcp` 与 `shell`（见 `WORKFLOW_AGENT_ALLOWED_KINDS`）：
  *
  *   read    允许（只读无副作用；没有它 agent 什么都干不了）
  *   write   允许（只能落在 session workspace 内，onPermissionRequest 已有路径守卫）
  *   url     允许（出站请求另有 SSRF 检查 + 域名 allowlist）
  *   shell   禁止 —— 命令可以绕过路径守卫触达任意外部系统
- *   mcp     禁止 —— MCP server 就是外部业务系统，正是"绕开 @action"的路径
+ *   mcp     禁止 —— MCP server 就是外部业务系统，正是"绕开 @command"的路径
  *
  * ## 为什么 mcp / shell 是**硬禁止**（连配置也放不开）
  *
  * 上一版把它们做成"配置默认值"（`COPILOT_WORKFLOW_AGENT_TOOLS` 不含即拒绝）。
- * 那等于说：把 `mcp` 写进环境变量，`@agent` 就能重新拿到绕开审批的路径 ——
+ * 那等于说：把 `mcp` 写进环境变量，`@task` 就能重新拿到绕开审批的路径 ——
  * 一条**企业配置**能悄悄取消流程的授权模型，而 SKILL.md、审计、审批链上都看不出来。
  *
  * 现在它是代码里的不变式（`WORKFLOW_AGENT_ALLOWED_KINDS`）：配置只能在
- * `read`/`write`/`url` 之内选，SKILL.md 的 `@agent tools:` 只能在此之上再收窄。
+ * `read`/`write`/`url` 之内选，SKILL.md 的 `@task tools:` 只能在此之上再收窄。
  *
  * ## 为什么是一份进程内状态
  *
- * 工具授权上下文（`ToolPolicyContext`）在**建会话时**就固定了，而 `@agent` 节点是在
+ * 工具授权上下文（`ToolPolicyContext`）在**建会话时**就固定了，而 `@task` 节点是在
  * 会话生命周期中间跑的 —— 没法把它烘进 session config。所以这里按 sessionId 存一份
  * 当前生效的边界，权限回调在**每次请求时**读它。
  *
@@ -65,7 +65,7 @@ export interface AgentCapability {
    * （或者会话里换了另一条 execution），不能拿它当当前边界用。
    */
   executionId: string;
-  /** 本次 `@agent` 允许的权限类别 */
+  /** 本次 `@task` 允许的权限类别 */
   kinds: ReadonlySet<FlowPermissionKind>;
   /** 哪个节点在跑（拒绝理由与审计要能看出是谁） */
   nodeId: string;
@@ -88,7 +88,7 @@ export function setAgentCapability(sessionId: string, capability: AgentCapabilit
 /**
  * 清除边界。**只清自己设的那一份**。
  *
- * 为什么要同时比 executionId 与 nodeId：`@agent` 的 `finally` 在 turn 槽**外面**跑，
+ * 为什么要同时比 executionId 与 nodeId：`@task` 的 `finally` 在 turn 槽**外面**跑，
  * 而 turn 槽一释放，同一会话里的下一条 execution 就可能立刻开始并设上自己的边界。
  * 只比 nodeId 时，同一个节点 id 在两条 execution 里是相同的，先跑完的那条会把
  * 后开始的那条的边界误删 —— 于是"节点执行期间"这段窗口里边界凭空消失。
@@ -110,11 +110,11 @@ export function clearAllAgentCapabilities(): void {
 }
 
 /**
- * 算出一个 `@agent` 节点的生效权限集合：**服务端上限 ∩ SKILL.md 声明**，
+ * 算出一个 `@task` 节点的生效权限集合：**服务端上限 ∩ SKILL.md 声明**，
  * 结果再与硬上限（`WORKFLOW_AGENT_ALLOWED_KINDS`）取交集。
  *
- * 最后那次交集是**兜底**而不是主判定：校验器已经会报 `agent-tools-forbidden` /
- * `agent-tools-widens`，配置解析也会过滤。它在这里是因为这一层是"真正决定
+ * 最后那次交集是**兜底**而不是主判定：校验器已经会报 `task-tools-forbidden` /
+ * `task-tools-widens`，配置解析也会过滤。它在这里是因为这一层是"真正决定
  * agent 拿到什么权限"的地方 —— 无论调用方传进来什么（配置、注入的上限、测试里的
  * 假注册表），`mcp` / `shell` 都不会出现在结果里。
  *

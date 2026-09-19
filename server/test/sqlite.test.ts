@@ -6,7 +6,7 @@ import path from 'node:path';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { ActionService } from '../src/actions/action-service.js';
+import { CommandService } from '../src/commands/command-service.js';
 import { ApprovalService } from '../src/approval/approval-service.js';
 import { currentDialect, getDb, setTestDb } from '../src/db/connection.js';
 import { SqliteDatabase } from '../src/db/sqlite.js';
@@ -17,7 +17,7 @@ import {
 } from '../src/collaboration/sql-repository.js';
 import { ExecutionService } from '../src/execution/execution-service.js';
 import { SqlEventRepository, SqlExecutionRepository } from '../src/execution/sql-repository.js';
-import type { ActionIntent } from '../src/execution/types.js';
+import type { CommandIntent } from '../src/execution/types.js';
 import { HumanTaskService } from '../src/human-tasks/human-task-service.js';
 import { SqlHumanTaskRepository } from '../src/human-tasks/sql-repository.js';
 import { SessionRegistry, SqlRegistryStore } from '../src/services/session-registry.js';
@@ -35,8 +35,8 @@ const PM = { tenantId: 't1', userId: 'pm-1', roles: ['portfolio_manager'] };
 const RISK = { tenantId: 't1', userId: 'risk-1', roles: ['risk'] };
 const OPS = { tenantId: 't1', userId: 'ops-1', roles: ['operations'] };
 
-const voteIntent = (over: Partial<ActionIntent> = {}): ActionIntent => ({
-  actionType: 'submit_proxy_vote',
+const voteIntent = (over: Partial<CommandIntent> = {}): CommandIntent => ({
+  commandType: 'submit_proxy_vote',
   target: { type: 'security', id: 'US1234567890' },
   parameters: { resolution: 'FOR', shares: 125000 },
   reason: 'agent recommends FOR',
@@ -65,11 +65,11 @@ function teardown(db: SqliteDatabase, dir: string): void {
 
 function wire() {
   const approval = new ApprovalService({ allowInitiatorApproval: false });
-  const actions = new ActionService({ approval });
+  const commands = new CommandService({ approval });
   const execution = new ExecutionService({
     repository: new SqlExecutionRepository(),
     events: new SqlEventRepository(),
-    actions,
+    commands,
   });
   const humanTasks = new HumanTaskService({
     repository: new SqlHumanTaskRepository(),
@@ -146,7 +146,7 @@ test('SQLite：关库重开后 execution / 事件时间线 / 审批任务都还�
     const exec = await execution.create({ sessionId: 's-durable', owner: OWNER, kind: 'job' });
     executionId = exec.executionId;
     await execution.start(executionId);
-    const verdict = await execution.proposeAction(executionId, voteIntent());
+    const verdict = await execution.proposeCommand(executionId, voteIntent());
     taskId = verdict.taskId!;
     assert.equal((await execution.get(executionId))!.status, 'waiting_for_approval');
 
@@ -231,7 +231,7 @@ test('SQLite：一人一票由唯一约束兜底（绕过应用层判断也拦�
     const { execution, humanTasks } = wire();
     const exec = await execution.create({ sessionId: 's-vote', owner: OWNER, kind: 'job' });
     await execution.start(exec.executionId);
-    const verdict = await execution.proposeAction(exec.executionId, voteIntent());
+    const verdict = await execution.proposeCommand(exec.executionId, voteIntent());
     const taskId = verdict.taskId!;
 
     const repo = new SqlHumanTaskRepository();
@@ -316,7 +316,7 @@ test('SQLite：删 execution 时级联清理 task / event（foreign_keys 必须�
     const { execution, humanTasks } = wire();
     const exec = await execution.create({ sessionId: 's-cascade', owner: OWNER, kind: 'job' });
     await execution.start(exec.executionId);
-    const verdict = await execution.proposeAction(exec.executionId, voteIntent());
+    const verdict = await execution.proposeCommand(exec.executionId, voteIntent());
 
     const repo = new SqlHumanTaskRepository();
     assert.ok(await repo.get(verdict.taskId!));

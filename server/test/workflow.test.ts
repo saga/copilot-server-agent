@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { ActionService } from '../src/actions/action-service.js';
+import { CommandService } from '../src/commands/command-service.js';
 import { ApprovalService } from '../src/approval/approval-service.js';
 import { ExecutionService } from '../src/execution/execution-service.js';
 import {
@@ -15,7 +15,7 @@ import { EXECUTION_EVENT_TYPES as EVT } from '../src/execution/types.js';
 import { HumanTaskService } from '../src/human-tasks/human-task-service.js';
 import { MemoryHumanTaskRepository } from '../src/human-tasks/memory-repository.js';
 import {
-  registerFlowAction,
+  registerFlowCommand,
   registerFlowGate,
   registerFlowReview,
 } from '../src/workflow/registry.js';
@@ -28,7 +28,7 @@ import type { WorkflowState } from '../src/workflow/types.js';
  * WorkflowRunner 端到端（内存仓储 + 假 turn，不拉 Copilot runtime）。
  *
  * 要证明的是编排本身：
- *   - @agent → @gate → @review（暂停等人工）→ 审批后续跑 → @action（再暂停）→ @end
+ *   - @task → @gate → @review（暂停等人工）→ 审批后续跑 → @command（再暂停）→ @end
  *   - 两条恢复路径（评审 / 动作审批）都能从 durable 状态接上
  *   - 失败与拒绝走到 @stop，execution 落 failed 而不是卡在中间
  *   - 环有步数上限兜底（否则 review 一直打回会把 execution 跑成死循环）
@@ -46,7 +46,7 @@ description: 编排测试用技能
 
 start -> flow-demo
 
-## @agent flow-demo
+## @task flow-demo
 
 output: non-empty
 
@@ -66,10 +66,10 @@ output: non-empty
 
 人工审核。
 
-- approve -> demo-action
+- approve -> demo-command
 - reject -> failed
 
-## @action demo-action
+## @command demo-command
 
 发布。
 
@@ -113,7 +113,7 @@ start -> demo-spin
 done
 `;
 
-/** 出口写错：@action 只写了 success（校验器必须在跑之前拦住） */
+/** 出口写错：@command 只写了 success（校验器必须在跑之前拦住） */
 const BROKEN_MD = `---
 name: flow-broken
 description: 缺出口
@@ -121,9 +121,9 @@ description: 缺出口
 
 ## @flow broken
 
-start -> demo-action
+start -> demo-command
 
-## @action demo-action
+## @command demo-command
 
 - success -> done
 
@@ -132,15 +132,15 @@ start -> demo-action
 ok
 `;
 
-/** 旧名 `@subagent`：已经写好的 SKILL.md 不该因为一次改名就整片校验失败 */
-const LEGACY_MD = SKILL_MD.replace('## @agent flow-demo', '## @subagent flow-demo');
+/** 旧名 `@agent` / `@subagent`：**硬改名**，不再做别名 —— 写了就建不出 execution */
+const LEGACY_MD = SKILL_MD.replace('## @task flow-demo', '## @agent flow-demo');
 
 /**
- * 保留属性：`@review` 声明**业务角色**（不是 AD Group），`@action` 把审批资格收窄。
+ * 保留属性：`@review` 声明**业务角色**（不是 AD Group），`@command` 把审批资格收窄。
  * 校验器要求 role 必须已登记，所以在用例里注册一个（组 ID 用可读串，等价于 Entra object ID）。
  *
- * `@agent` 上的 `output: non-empty` 不是装饰：`COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT`
- * 默认开，没有完成契约的 `@agent` 会直接校验不过（见 config.ts）。
+ * `@task` 上的 `output: non-empty` 不是装饰：`COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT`
+ * 默认开，没有完成契约的 `@task` 会直接校验不过（见 config.ts）。
  */
 const ROLE_MD = `---
 name: flow-role
@@ -151,7 +151,7 @@ description: 保留属性用
 
 start -> flow-role
 
-## @agent flow-role
+## @task flow-role
 
 output: non-empty
 
@@ -169,10 +169,10 @@ exclude: initiator
 
 人工审核。
 
-- approve -> demo-action
+- approve -> demo-command
 - reject -> failed
 
-## @action demo-action
+## @command demo-command
 
 role: operations
 
@@ -190,7 +190,7 @@ role: operations
 完成。
 `;
 
-/** `@action role:` 写了一个策略里没有的角色 → 收窄成空集 → 动作被拒（不能放宽） */
+/** `@command role:` 写了一个策略里没有的角色 → 收窄成空集 → 动作被拒（不能放宽） */
 const BAD_ROLE_MD = `---
 name: flow-bad-role
 description: 角色越界
@@ -200,16 +200,16 @@ description: 角色越界
 
 start -> flow-bad-role
 
-## @agent flow-bad-role
+## @task flow-bad-role
 
 output: non-empty
 
 做研究。
 
-- success -> demo-action
+- success -> demo-command
 - fail -> failed
 
-## @action demo-action
+## @command demo-command
 
 role: demo.reviewer
 
@@ -228,15 +228,15 @@ role: demo.reviewer
 `;
 
 /**
- * 在 `@agent flow-demo` 正文最前面插入保留属性行。
+ * 在 `@task flow-demo` 正文最前面插入保留属性行。
  *
  * 属性区必须**紧跟标题、且连续**（parser 只认最前面连续的一段 `name: value`）——
  * 所以已有的 `output:` 和追加的属性之间不能有空行，否则后面那些会被当成正文。
  */
 const agentWithAttrs = (...attrs: string[]): string =>
   SKILL_MD.replace(
-    '## @agent flow-demo\n\noutput: non-empty\n',
-    `## @agent flow-demo\n\n${['output: non-empty', ...attrs].join('\n')}\n`,
+    '## @task flow-demo\n\noutput: non-empty\n',
+    `## @task flow-demo\n\n${['output: non-empty', ...attrs].join('\n')}\n`,
   );
 
 function writeSkills(files: Record<string, string>): string {
@@ -258,7 +258,7 @@ let turnBehavior: (prompt: string, index: number) => { content: string; chars: n
 ) => ({ content: `研究结论 ${i}`, chars: 20 });
 let turnError: string | undefined;
 const seenPrompts: string[] = [];
-/** `@agent` turn 执行**期间**读到的能力边界（会话级，跑完必须被清掉） */
+/** `@task` turn 执行**期间**读到的能力边界（会话级，跑完必须被清掉） */
 const capabilitiesDuringTurn: Array<{ nodeId: string; kinds: string[] } | undefined> = [];
 
 registerFlowGate({
@@ -298,12 +298,12 @@ registerFlowReview({
   allowInitiator: false,
 });
 
-registerFlowAction({
-  name: 'demo-action',
-  // 复用已登记策略与 executor 的真实动作类型（未登记的动作会被 ActionService 默认拒绝）
-  actionType: 'send_external_message',
+registerFlowCommand({
+  name: 'demo-command',
+  // 复用已登记策略与 executor 的真实动作类型（未登记的动作会被 CommandService 默认拒绝）
+  commandType: 'send_external_message',
   buildIntent: (ctx) => ({
-    actionType: 'send_external_message',
+    commandType: 'send_external_message',
     target: { type: 'report', id: 'r-1' },
     parameters: { to: 'compliance@example.com', body: `发布 ${ctx.skill}/${ctx.nodeId}` },
     requestedBy: { userId: ctx.initiatorId, tenantId: ctx.tenantId },
@@ -336,18 +336,21 @@ interface Wired {
   executions: ExecutionService;
   humanTasks: HumanTaskService;
   runner: WorkflowRunner;
+  /** 直连仓储：测试要模拟"改名之前落库的任务"，得能改写 payload */
+  taskRepo: MemoryHumanTaskRepository;
 }
 
 function wire(dir: string): Wired {
   const approval = new ApprovalService({ allowInitiatorApproval: false });
-  const actions = new ActionService({ approval });
+  const commands = new CommandService({ approval });
   const executions = new ExecutionService({
     repository: new MemoryExecutionRepository(),
     events: new MemoryEventRepository(),
-    actions,
+    commands,
   });
+  const taskRepo = new MemoryHumanTaskRepository();
   const humanTasks = new HumanTaskService({
-    repository: new MemoryHumanTaskRepository(),
+    repository: taskRepo,
     approval,
     // 与 wiring.ts 里的分派一致：workflow 任务交回编排器，其余仍走 ExecutionService
     onResolved: (task, resolution, decisions) => {
@@ -366,7 +369,7 @@ function wire(dir: string): Wired {
       return turnBehavior(prompt, index);
     },
   });
-  return { executions, humanTasks, runner };
+  return { executions, humanTasks, runner, taskRepo };
 }
 
 /** 按 SKILL.md 的真实内容建一个 workflow execution（sourceHash 取自文件） */
@@ -419,7 +422,7 @@ test.beforeEach(() => {
   };
 });
 
-test('编排：agent → gate → review 暂停 → 审批续跑 → action 再暂停 → 审批 → 完成', async () => {
+test('编排：agent → gate → review 暂停 → 审批续跑 → command 再暂停 → 审批 → 完成', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w, { input: { securityId: 'AAPL' } });
@@ -431,8 +434,8 @@ test('编排：agent → gate → review 暂停 → 审批续跑 → action 再�
   assert.equal(rec.workflow?.current, 'demo-review');
   assert.ok(rec.workflow?.waitingTaskId, '要记下在等哪个任务（重启后才能接上）');
   assert.equal(rec.workflow?.steps, 2, 'work + check 已推进两步');
-  assert.deepEqual(seenPrompts.length, 1, '@agent 只跑一次 agent turn');
-  assert.match(seenPrompts[0]!, /做研究，输出带证据的结论/, '@agent 的 prompt 就是节点正文');
+  assert.deepEqual(seenPrompts.length, 1, '@task 只跑一次 agent turn');
+  assert.match(seenPrompts[0]!, /做研究，输出带证据的结论/, '@task 的 prompt 就是节点正文');
 
   const reviewTask = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
   assert.equal(reviewTask.type, 'approval');
@@ -447,23 +450,23 @@ test('编排：agent → gate → review 暂停 → 审批续跑 → action 再�
     kind: 'review',
   });
 
-  // 审核通过 → 自动续跑到 @action 的审批
+  // 审核通过 → 自动续跑到 @command 的审批
   await w.humanTasks.approve(reviewTask.taskId, { principal: REVIEWER });
   rec = (await w.executions.get(id))!;
-  assert.equal(rec.status, 'waiting_for_approval', '@action 需要审批 → 再次暂停');
-  assert.equal(rec.workflow?.current, 'demo-action');
+  assert.equal(rec.status, 'waiting_for_approval', '@command 需要审批 → 再次暂停');
+  assert.equal(rec.workflow?.current, 'demo-command');
   assert.equal(rec.workflow?.lastOutcome, 'approve');
 
-  const actionTask = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
-  assert.equal(actionTask.payload['actionType'], 'send_external_message');
-  assert.deepEqual(actionTask.payload['workflow'], {
+  const commandTask = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
+  assert.equal(commandTask.payload['commandType'], 'send_external_message');
+  assert.deepEqual(commandTask.payload['workflow'], {
     executionId: id,
-    nodeId: 'demo-action',
-    kind: 'action',
+    nodeId: 'demo-command',
+    kind: 'command',
   });
 
-  // 动作审批通过 → 执行 → @end
-  await w.humanTasks.approve(actionTask.taskId, { principal: OPS });
+  // 命令审批通过 → 执行 → @end
+  await w.humanTasks.approve(commandTask.taskId, { principal: OPS });
   rec = (await w.executions.get(id))!;
   assert.equal(rec.status, 'completed', '流程走到 @end 应当收尾成 completed');
   assert.equal(rec.workflow?.current, 'done');
@@ -481,7 +484,7 @@ test('编排：agent → gate → review 暂停 → 审批续跑 → action 再�
     EVT.workflowCompleted,
     EVT.humanTaskCreated,
     EVT.waitingForApproval,
-    EVT.actionExecuted,
+    EVT.commandExecuted,
     EVT.completed,
   ]) {
     assert.ok(types.includes(expected), `审计时间线缺少 ${expected}`);
@@ -494,9 +497,36 @@ test('编排：agent → gate → review 暂停 → 审批续跑 → action 再�
     'flow-demo:success',
     'demo-gate:pass',
     'demo-review:approve',
-    'demo-action:success',
+    'demo-command:success',
     'done:completed',
   ]);
+});
+
+test('编排：改名之前落的 `kind: "action"` 标记仍能续跑（不能因为改个名就认不出来）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w, { input: { securityId: 'AAPL' } });
+
+  // 先跑到 @command 的审批（这一步的标记由当前代码写成 'command'）
+  await w.runner.run(id);
+  let rec = (await w.executions.get(id))!;
+  await w.humanTasks.approve(rec.workflow!.waitingTaskId!, { principal: REVIEWER });
+  rec = (await w.executions.get(id))!;
+  assert.equal(rec.workflow?.current, 'demo-command');
+
+  // 模拟"部署之前建出来、一直挂到现在的待办"：payload 里写的是旧标记 'action'。
+  // 一条 @command 待办可能等几小时、跨一次部署，runner 必须读得懂两种值 ——
+  // 读不懂的后果是它被当成"未知类型"，既不续跑也不报错，流程永远停在那里。
+  const task = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
+  const marker = task.payload['workflow'] as Record<string, unknown>;
+  await w.taskRepo.update(task.taskId, {
+    payload: { ...task.payload, workflow: { ...marker, kind: 'action' } },
+  });
+
+  await w.humanTasks.approve(task.taskId, { principal: OPS });
+  const after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'completed', '旧标记必须被认成 @command，而不是"未知类型"');
+  assert.equal(after.workflow?.current, 'done');
 });
 
 test('编排：审核拒绝走到 @stop，execution 落 failed 而不是卡在中间', async () => {
@@ -531,7 +561,7 @@ test('编排：gate 判 fail → 走 @stop（确定性判断真的会改变走�
   assert.match(String(gateEvent?.payload?.['reason']), /gate 判定 fail/, 'gate 的理由要进审计');
 });
 
-test('编排：@agent 抛错是**可路由**的失败，不是编排器崩溃', async () => {
+test('编排：@task 抛错是**可路由**的失败，不是编排器崩溃', async () => {
   turnError = 'runtime 挂了';
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
@@ -587,7 +617,7 @@ test('编排：自动放行的动作不再暂停，直接走到 @end', async () 
     const rec = (await w.executions.get(id))!;
     assert.equal(rec.status, 'completed', 'auto_approve 的动作不该再开人工任务');
     const autoEvent = (await w.executions.events(id, 200)).find(
-      (e) => e.type === EVT.workflowStepCompleted && e.payload?.['nodeId'] === 'demo-action',
+      (e) => e.type === EVT.workflowStepCompleted && e.payload?.['nodeId'] === 'demo-command',
     );
     assert.equal(autoEvent?.payload?.['decision'], 'auto_approve');
   } finally {
@@ -595,15 +625,17 @@ test('编排：自动放行的动作不再暂停，直接走到 @end', async () 
   }
 });
 
-test('编排：旧名 @subagent 与 @agent 等价（改名不让已写好的 SKILL.md 失效）', async () => {
+test('编排：旧名 @agent 已被移除 —— prepare 阶段就拒绝，不会跑出一个半截流程', async () => {
+  // 有意做成硬改名：@agent 会让人把它读成"起一个 subagent"，而它实际只是
+  // "跑一个受约束的 AI 工作单元"。留别名等于把那个误读留在 DSL 里。
   const dir = writeSkills({ 'flow-demo/SKILL.md': LEGACY_MD });
   const w = wire(dir);
-  const id = await startWorkflow(w);
-
-  await w.runner.run(id);
-  const rec = (await w.executions.get(id))!;
-  assert.equal(rec.status, 'waiting_for_approval', '旧名照样能跑起来');
-  assert.equal(rec.workflow?.current, 'demo-review');
+  const r = w.runner.validate({ skill: 'flow-demo', flow: 'demo' });
+  assert.equal(r.ok, false);
+  assert.ok(
+    r.issues.some((i) => i.code === 'block-unknown-type'),
+    `旧名必须在建 execution 之前就被拦住：${JSON.stringify(r.issues)}`,
+  );
 });
 
 test('编排：每一步**先把 stepStatus=running 落库、再执行**，执行完才落 pending', async () => {
@@ -633,18 +665,18 @@ test('编排：每一步**先把 stepStatus=running 落库、再执行**，执�
   assert.equal((await w.executions.get(id))!.workflow?.stepStatus, 'waiting');
 });
 
-test('编排：crash 在 @agent 中途 → 允许重放（纯计算），但要留审计', async () => {
+test('编排：crash 在 @task 中途 → 允许重放（纯计算），但要留审计', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
 
-  // 模拟"进程在 @agent 节点执行到一半被杀"：durable 状态停在 running
+  // 模拟"进程在 @task 节点执行到一半被杀"：durable 状态停在 running
   const rec0 = (await w.executions.get(id))!;
   await w.executions.updateWorkflowState(id, { ...rec0.workflow!, stepStatus: 'running' });
 
   await w.runner.run(id);
   const rec = (await w.executions.get(id))!;
-  assert.equal(rec.status, 'waiting_for_approval', '@agent 重放后照常推进');
+  assert.equal(rec.status, 'waiting_for_approval', '@task 重放后照常推进');
   assert.ok(
     (await eventTypes(w, id)).includes(EVT.workflowStepInterrupted),
     '重放必须在时间线上留痕',
@@ -652,7 +684,7 @@ test('编排：crash 在 @agent 中途 → 允许重放（纯计算），但要�
   assert.equal(seenPrompts.length, 1);
 });
 
-test('编排：crash 在 @action 中途 → **不重放**，落 failed 交人工核对（不能重复提交）', async () => {
+test('编排：crash 在 @command 中途 → **不重放**，落 failed 交人工核对（不能重复提交）', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
@@ -660,7 +692,7 @@ test('编排：crash 在 @action 中途 → **不重放**，落 failed 交人工
   const rec0 = (await w.executions.get(id))!;
   await w.executions.updateWorkflowState(id, {
     ...rec0.workflow!,
-    current: 'demo-action',
+    current: 'demo-command',
     stepStatus: 'running',
     steps: 3,
   });
@@ -722,21 +754,21 @@ test('编排：@review 的 role 只**收窄**注册表（交集），且走 AD g
   // 只有 group、没有 roles 的人：RoleRegistry 把他解析成 demo.reviewer 之后就能批
   await w.humanTasks.approve(task.taskId, { principal: REVIEWER_BY_GROUP });
   const after = (await w.executions.get(id))!;
-  assert.equal(after.status, 'waiting_for_approval', '@action 的 role: 把它收窄到 operations → 再暂停');
+  assert.equal(after.status, 'waiting_for_approval', '@command 的 role: 把它收窄到 operations → 再暂停');
   assert.equal(after.workflow?.lastOutcome, 'approve');
 
-  const actionTask = (await w.humanTasks.get(after.workflow!.waitingTaskId!))!;
+  const commandTask = (await w.humanTasks.get(after.workflow!.waitingTaskId!))!;
   assert.deepEqual(
-    actionTask.eligibleRoles,
+    commandTask.eligibleRoles,
     ['operations'],
-    '@action role: 只收窄（策略里本来就有 operations）',
+    '@command role: 只收窄（策略里本来就有 operations）',
   );
 
-  await w.humanTasks.approve(actionTask.taskId, { principal: OPS });
+  await w.humanTasks.approve(commandTask.taskId, { principal: OPS });
   assert.equal((await w.executions.get(id))!.status, 'completed');
 });
 
-test('编排：@action 声明了角色就不能被 auto_approve 绕过（流程写明的审批要求优先）', async () => {
+test('编排：@command 声明了角色就不能被 auto_approve 绕过（流程写明的审批要求优先）', async () => {
   process.env.COPILOT_AUTO_APPROVE_ACTIONS = 'send_external_message';
   try {
     const dir = writeSkills({ 'flow-role/SKILL.md': ROLE_MD });
@@ -753,13 +785,13 @@ test('编排：@action 声明了角色就不能被 auto_approve 绕过（流程�
       'waiting_for_approval',
       '环境变量不该绕过 SKILL.md 里写明的角色要求',
     );
-    assert.equal(rec.workflow?.current, 'demo-action');
+    assert.equal(rec.workflow?.current, 'demo-command');
   } finally {
     delete process.env.COPILOT_AUTO_APPROVE_ACTIONS;
   }
 });
 
-test('编排：@action role: 越界（策略里没有这个角色）→ 动作被拒，不能靠 Skill 放宽授权', async () => {
+test('编排：@command role: 越界（策略里没有这个角色）→ 动作被拒，不能靠 Skill 放宽授权', async () => {
   const dir = writeSkills({ 'flow-bad-role/SKILL.md': BAD_ROLE_MD });
   const w = wire(dir);
   const id = await startWorkflow(w, { skill: 'flow-bad-role' });
@@ -768,7 +800,7 @@ test('编排：@action role: 越界（策略里没有这个角色）→ 动作�
   const rec = (await w.executions.get(id))!;
   assert.equal(rec.status, 'failed', '走 - fail -> failed');
   const denied = (await w.executions.events(id, 200)).find(
-    (e) => e.type === EVT.workflowStepCompleted && e.payload?.['nodeId'] === 'demo-action',
+    (e) => e.type === EVT.workflowStepCompleted && e.payload?.['nodeId'] === 'demo-command',
   );
   assert.equal(denied?.payload?.['decision'], 'denied');
   assert.match(String(denied?.payload?.['reason']), /不能放宽/, '拒绝理由要说清是"收窄 vs 放宽"');
@@ -829,7 +861,7 @@ test('编排：stale 人工任务回调只留痕、**不推进**流程（推错�
   // 把状态修回去之后，同一条任务就能正常续跑（绑定校验不是"一次拒绝永久拒绝"）
   await w.executions.updateWorkflowState(id, { ...after.workflow!, stepStatus: 'waiting' });
   await w.runner.onHumanTaskResolved(task, 'approved', []);
-  assert.equal((await w.executions.get(id))!.workflow?.current, 'demo-action');
+  assert.equal((await w.executions.get(id))!.workflow?.current, 'demo-command');
 });
 
 test('编排：人工任务过期 / 取消 → execution 必须落终态，不能永远停在等待', async () => {
@@ -893,9 +925,9 @@ test('编排：CAS 版本号对不上 → 写不进去（repository 层的单写
   assert.equal((await w.executions.get(id))!.workflowVersion, 1);
 });
 
-// ---------- @agent 的能力边界与完成契约 ----------
+// ---------- @task 的能力边界与完成契约 ----------
 
-test('编排：@agent 执行期间套上能力边界（默认不含 mcp / shell），跑完立刻清掉', async () => {
+test('编排：@task 执行期间套上能力边界（默认不含 mcp / shell），跑完立刻清掉', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
@@ -904,12 +936,12 @@ test('编排：@agent 执行期间套上能力边界（默认不含 mcp / shell�
   assert.deepEqual(
     capabilitiesDuringTurn,
     [{ nodeId: 'flow-demo', kinds: ['read', 'url', 'write'] }],
-    '默认上限是 read/write/url —— agent 碰不到 MCP 与 shell（绕开 @action 审批的两条路）',
+    '默认上限是 read/write/url —— agent 碰不到 MCP 与 shell（绕开 @command 审批的两条路）',
   );
   assert.equal(agentCapabilityFor('s1'), undefined, '节点跑完必须清掉，否则后续 turn 一直被限制');
 });
 
-test('编排：@agent 的 tools 只能收窄（tools: read → 只剩 read）', async () => {
+test('编排：@task 的 tools 只能收窄（tools: read → 只剩 read）', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': agentWithAttrs('tools: read') });
   const w = wire(dir);
   const id = await startWorkflow(w);
@@ -919,7 +951,7 @@ test('编排：@agent 的 tools 只能收窄（tools: read → 只剩 read）', 
   assert.equal(agentCapabilityFor('s1'), undefined);
 });
 
-test('编排：@agent 的完成契约没过 → 走可路由的 fail 出口，不是 success', async () => {
+test('编排：@task 的完成契约没过 → 走可路由的 fail 出口，不是 success', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
@@ -937,7 +969,7 @@ test('编排：@agent 的完成契约没过 → 走可路由的 fail 出口，�
   assert.match(String(step?.payload?.['error']), /完成契约/, '审计要写清是哪个契约没过');
 });
 
-test('编排：@agent 的完成契约过了就照常推进', async () => {
+test('编排：@task 的完成契约过了就照常推进', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
@@ -945,15 +977,15 @@ test('编排：@agent 的完成契约过了就照常推进', async () => {
   assert.equal((await w.executions.get(id))!.status, 'waiting_for_approval');
 });
 
-test('校验：@agent 没声明完成契约时 prepare 直接失败（默认强制）', () => {
-  // 把 output: 那行去掉 —— 没有契约的 @agent 在默认配置下不该能建出 execution
+test('校验：@task 没声明完成契约时 prepare 直接失败（默认强制）', () => {
+  // 把 output: 那行去掉 —— 没有契约的 @task 在默认配置下不该能建出 execution
   const noOutput = SKILL_MD.replace('output: non-empty\n\n', '');
   const dir = writeSkills({ 'flow-demo/SKILL.md': noOutput });
   const w = wire(dir);
   const r = w.runner.validate({ skill: 'flow-demo', flow: 'demo' });
   assert.equal(r.ok, false);
-  const hit = r.issues.find((i) => i.code === 'agent-output-missing');
-  assert.ok(hit, '没有完成契约必须报 agent-output-missing');
+  const hit = r.issues.find((i) => i.code === 'task-output-missing');
+  assert.ok(hit, '没有完成契约必须报 task-output-missing');
   assert.match(hit!.message, /output:/);
 });
 
@@ -997,7 +1029,7 @@ test('编排：crash 在建任务与迁移之间 → 重跑只接回任务，不
   assert.equal(after.workflow?.stepStatus, 'waiting');
   assert.equal(after.workflow?.current, 'demo-review');
   assert.equal(after.workflow?.waitingTaskId, taskId, '等的还是原来那条任务');
-  assert.equal(seenPrompts.length, promptsBefore, '@agent 一步都不该重跑');
+  assert.equal(seenPrompts.length, promptsBefore, '@task 一步都不该重跑');
   assert.equal(
     (await w.humanTasks.repository.list({ executionId: id })).length,
     1,
@@ -1011,8 +1043,8 @@ test('编排：crash 在建任务与迁移之间 → 重跑只接回任务，不
   // 接回来的任务仍然能正常续跑（对账没有破坏绑定校验）
   await w.humanTasks.approve(taskId, { principal: REVIEWER });
   const resumed = (await w.executions.get(id))!;
-  assert.equal(resumed.status, 'waiting_for_approval', '继续走到 @action 的审批');
-  assert.equal(resumed.workflow?.current, 'demo-action');
+  assert.equal(resumed.status, 'waiting_for_approval', '继续走到 @command 的审批');
+  assert.equal(resumed.workflow?.current, 'demo-command');
 });
 
 /**
@@ -1037,9 +1069,9 @@ test('编排：任务已收敛但 workflow 仍停在等待态（续跑中途崩�
   const taskId = paused.workflow!.waitingTaskId!;
   const waitingState = paused.workflow!;
 
-  // 审批通过 → 续跑（@action 那里又开了第二条待办），流程已经前进到 demo-action
+  // 审批通过 → 续跑（@command 那里又开了第二条待办），流程已经前进到 demo-command
   await w.humanTasks.approve(taskId, { principal: REVIEWER });
-  assert.equal((await w.executions.get(id))!.workflow?.current, 'demo-action');
+  assert.equal((await w.executions.get(id))!.workflow?.current, 'demo-command');
 
   // 构造崩溃残留：把 durable 状态倒回"续跑刚把 execution 推出等待态、还没写下一个节点"
   // 的那一刻 —— 此时 T 已经是 approved。
@@ -1057,14 +1089,14 @@ test('编排：任务已收敛但 workflow 仍停在等待态（续跑中途崩�
   const after = (await w.executions.get(id))!;
   assert.equal(
     after.workflow?.current,
-    'demo-action',
+    'demo-command',
     '必须把那次续跑补完（推到下一个节点），不能推回等待态等一个不会来的回调',
   );
-  assert.equal(after.status, 'waiting_for_approval', '@action 那里照常暂停');
+  assert.equal(after.status, 'waiting_for_approval', '@command 那里照常暂停');
   assert.notEqual(
     after.workflow?.waitingTaskId,
     taskId,
-    '等的必须是 @action 的新任务，不是那条已经批完的 review 任务',
+    '等的必须是 @command 的新任务，不是那条已经批完的 review 任务',
   );
 
   const reconciled = (await w.executions.events(id, 200)).find(

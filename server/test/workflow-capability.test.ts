@@ -13,7 +13,7 @@ import {
 import { createPermissionHandler, type ToolPolicyContext } from '../src/services/tool-policy.js';
 
 /**
- * `@agent` 的能力边界：**流程里声明的业务动作只能走 @action 审批，agent 不能自己干**。
+ * `@task` 的能力边界：**流程里声明的业务动作只能走 @command 审批，agent 不能自己干**。
  *
  * 这一层挡的不是"agent 会不会做错"，而是"agent 完全可以绕开流程"：
  * 它手上如果有 MCP 或 shell，就能直接把研究报告发出去、或者 curl 一个内部下单接口 ——
@@ -54,7 +54,7 @@ test('能力边界：上限 ∩ 声明 —— 只能收窄，不能凭空多出�
   assert.deepEqual(resolveAgentTools(ceiling, ['read']), ['read']);
   assert.deepEqual(resolveAgentTools(ceiling, ['read', 'write']), ['read', 'write']);
 
-  // 声明了上限之外的类别：交集里不会出现它（校验器会报 agent-tools-widens，这里再兜一次）
+  // 声明了上限之外的类别：交集里不会出现它（校验器会报 task-tools-widens，这里再兜一次）
   assert.deepEqual(resolveAgentTools(ceiling, ['read', 'mcp']), ['read']);
   assert.deepEqual(resolveAgentTools(ceiling, ['mcp', 'shell']), [], '全都不在上限内 = 一个都不给');
 });
@@ -107,7 +107,7 @@ test('能力边界：只清自己设的那一份（executionId + nodeId 都要�
   clearAgentCapability('s1', { executionId: 'e1', nodeId: 'work-a' });
   assert.equal(agentCapabilityFor('s1')?.nodeId, 'work-b');
 
-  // 同一个 nodeId、**另一条 execution**：也不能清 —— @agent 的 finally 在 turn 槽外面跑，
+  // 同一个 nodeId、**另一条 execution**：也不能清 —— @task 的 finally 在 turn 槽外面跑，
   // 槽一释放，同一会话里的下一条 execution 就可能已经设上自己的边界了
   setAgentCapability('s1', cap({ executionId: 'e2', nodeId: 'work-b' }));
   clearAgentCapability('s1', { executionId: 'e1', nodeId: 'work-b' });
@@ -137,10 +137,10 @@ test('能力边界：权限回调真的拒绝 mcp / shell，且只在节点执�
   assert.equal(mcp.kind, 'denied-by-permission-request-hook');
   assert.match(
     String((mcp as { message?: string }).message),
-    /流程节点 @agent research 没有 mcp 权限/,
+    /流程节点 @task research 没有 mcp 权限/,
     '拒绝理由要说清是流程节点的能力限制，而不是一个看起来无关的错',
   );
-  assert.match(String((mcp as { message?: string }).message), /@action/, '要指出业务动作该走哪里');
+  assert.match(String((mcp as { message?: string }).message), /@command/, '要指出业务动作该走哪里');
 
   const shell = await ask(request('shell', { possiblePaths: ['/tmp/ws/a.sh'] }));
   assert.equal(shell.kind, 'denied-by-permission-request-hook', 'shell 默认也不给');
@@ -181,7 +181,7 @@ test('能力边界：声明的 tools 收窄后，未声明的类别立刻被拒'
 /**
  * 边界是**会话级存放、execution 级生效**。
  *
- * 一条会话会先后（甚至排队）承载多条 execution：A 的 `@agent` 节点允许 `write`，
+ * 一条会话会先后（甚至排队）承载多条 execution：A 的 `@task` 节点允许 `write`，
  * B 的节点只声明 `read`。只按 sessionId 取一份，B 就会拿到 `write` ——
  * 一次**跨 execution 的能力放宽**，而审计链上只会看到"B 用了 write 工具"。
  *

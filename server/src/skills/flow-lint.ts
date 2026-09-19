@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import { config } from '../config.js';
 import { businessRoleLookup } from '../identity/index.js';
-import { loadSkill, skillSearchDirs } from './index.js';
+import { skillSearchDirs } from './index.js';
 import { analyzeFlow } from './flow-analyzer.js';
 import { parseSkillFlow } from './flow-parser.js';
 import { validateSkillFlow, type FlowRegistryLookup } from './flow-validator.js';
@@ -35,11 +35,10 @@ import {
 export interface LintOptions {
   /** 只校验某个流程（`@flow` 的 id）；不给则不做名字比对 */
   flow?: string;
-  /** 技能搜索目录（`@agent <id>` 指向的技能是否存在） */
+  /** 技能搜索目录（用于解析 `<file>` / `<skill-dir>` 这类 CLI 路径参数） */
   dirs?: string[];
   registry?: FlowRegistryLookup;
   hasRole?: (id: string) => boolean;
-  hasSkill?: (name: string) => boolean;
   agentTools?: readonly FlowPermissionKind[];
   requireAgentOutput?: boolean;
 }
@@ -74,7 +73,6 @@ export function lintSkillFlow(markdown: string, opts: LintOptions = {}): LintRes
   const validated = validateSkillFlow(ast, {
     ...(opts.flow ? { flow: opts.flow } : {}),
     ...(opts.registry ? { registry: opts.registry } : {}),
-    ...(opts.hasSkill ? { hasSkill: opts.hasSkill } : {}),
     ...(opts.hasRole ? { hasRole: opts.hasRole } : {}),
     ...(opts.agentTools ? { agentTools: opts.agentTools } : {}),
     ...(opts.requireAgentOutput ? { requireAgentOutput: true } : {}),
@@ -137,7 +135,6 @@ function defaultOptions(dirs: string[]): LintOptions {
     dirs,
     registry: flowRegistryLookup,
     hasRole: businessRoleLookup.hasRole,
-    hasSkill: (name) => Boolean(loadSkill(name, dirs)),
     agentTools: parseAgentTools(config.workflowAgentTools, WORKFLOW_AGENT_ALLOWED_KINDS),
     requireAgentOutput: config.workflowRequireAgentOutput,
   };

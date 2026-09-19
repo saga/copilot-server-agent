@@ -72,7 +72,7 @@ export interface FlowAstRoute {
   line: number;
 }
 
-/** 一个 `## @agent work` 之类的节点块 */
+/** 一个 `## @task work` 之类的节点块 */
 export interface FlowAstNode {
   type: FlowNodeType;
   id: string;

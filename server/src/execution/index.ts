@@ -1,7 +1,7 @@
 export { ExecutionService } from './execution-service.js';
 export type { CreateExecutionInput, ExecutionServiceDeps } from './execution-service.js';
 export { ExecutionEventLog } from './events.js';
-export { canonicalJson, hashAction, verifyActionHash } from './hash.js';
+export { canonicalJson, hashCommand, verifyCommandHash } from './hash.js';
 export {
   MemoryEventRepository,
   MemoryExecutionRepository,
@@ -18,8 +18,8 @@ export {
   isTerminal,
 } from './types.js';
 export type {
-  ActionIntent,
-  ActionTarget,
+  CommandIntent,
+  CommandTarget,
   ExecutionEvent,
   ExecutionFilter,
   ExecutionKind,

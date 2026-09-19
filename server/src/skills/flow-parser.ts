@@ -42,21 +42,12 @@ import {
  * 路由只从段落与列表项里取，` ``` ` 里的 `- pass -> x` 不算。
  *
  * 另外解析正文最前面的**保留属性**（`role: compliance.reviewer`）：只有 `@review` /
- * `@action` / `@agent` 支持，且必须写在正文最前面。属性区会被从正文里剥掉，所以它
+ * `@command` / `@task` 支持，且必须写在正文最前面。属性区会被从正文里剥掉，所以它
  * 不会混进描述或 prompt；值的合法性由 flow-validator 判定。
  */
 
-/** `## @agent research` / `## @flow investment-review` */
-const FLOW_HEADING = /^@(flow|agent|subagent|gate|review|action|stop|end)(?:\s+(.+))?$/i;
-
-/**
- * `@subagent` 是 v1 的旧名，等价于 `@agent`。
- *
- * 它启动的是**当前 session 的一次 agent turn**（`runExecutionTurn`），不是另起一个
- * 独立 agent / 独立 skill —— 名字必须说清这一点，否则会被读成真正的 subagent 委派。
- * 旧名保留为别名：已经写好的 SKILL.md 不该因为一次改名就整片校验失败。
- */
-const BLOCK_ALIASES: Record<string, FlowBlockType> = { subagent: 'agent' };
+/** `## @task research` / `## @flow investment-review` */
+const FLOW_HEADING = /^@(flow|task|gate|review|command|stop|end)(?:\s+(.+))?$/i;
 
 /**
  * 路由：`- pass -> review`，也接受不带列表符号的 `start -> research`。
@@ -110,7 +101,7 @@ const norm = (s: string): string => s.toLowerCase();
  *   1. 只认最前面**连续**的 `name: value` 行 —— 遇到别的行（包括空行）就结束。
  *      所以正文里的 `Note: ...` 不会被当成属性。
  *   2. 名字是该节点类型支持的属性 → 认领。
- *   3. 名字是**别的**节点类型的属性（`@agent` 上写 `role:`）→ 一定报错：这类写法
+ *   3. 名字是**别的**节点类型的属性（`@task` 上写 `role:`）→ 一定报错：这类写法
  *      作者的本意很明确，静默当正文/prompt 才是最坏的结果。
  *      名字完全没见过（`Note:`）→ 只有在这段确实已认领到属性时才报错，
  *      否则整段当普通正文。
@@ -211,7 +202,7 @@ export function parseSkillFlow(markdown: string): FlowAst {
         issues.push({
           code: 'block-unknown-type',
           line,
-          message: `未知的 flow block 类型：「${headingText}」（可用：@flow / @agent / @gate / @review / @action / @stop / @end；@subagent 是 @agent 的旧名）`,
+          message: `未知的 flow block 类型：「${headingText}」（可用：@flow / @task / @gate / @review / @command / @stop / @end）`,
         });
       }
       continue;
@@ -227,8 +218,7 @@ export function parseSkillFlow(markdown: string): FlowAst {
       continue;
     }
 
-    const type = (BLOCK_ALIASES[match[1]!.toLowerCase()] ??
-      match[1]!.toLowerCase()) as FlowBlockType;
+    const type = match[1]!.toLowerCase() as FlowBlockType;
     const id = (match[2] ?? '').trim();
 
     // 正文 = 本标题之后、下一个同级（或更高级）标题之前的全部节点

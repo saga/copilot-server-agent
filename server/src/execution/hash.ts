@@ -1,13 +1,13 @@
 import { createHash } from 'node:crypto';
-import type { ActionIntent } from './types.js';
+import type { CommandIntent } from './types.js';
 
 /**
- * actionHash：审批绑定的是“批准了什么”，不是“批准了一次 HTTP 请求”。
+ * commandHash：审批绑定的是“批准了什么”，不是“批准了一次 HTTP 请求”。
  *
  *   agent 提出 intent → hash=ABC → 人工批准 ABC → 执行前重算 → 一致才执行
  *
  * 与 resourceVersion 是两个维度：
- *   actionHash      = 批准的动作内容
+ *   commandHash     = 批准的命令内容
  *   resourceVersion = 批准时所依据的数据版本
  */
 
@@ -22,13 +22,33 @@ export function canonicalJson(value: unknown): string {
   return `{${entries.join(',')}}`;
 }
 
-/** createdAt 不进 hash（同样的动作在不同时间提出，hash 应一致） */
-export function hashAction(action: ActionIntent): string {
-  const { createdAt: _drop, ...rest } = action;
-  return createHash('sha256').update(canonicalJson(rest)).digest('hex');
+/**
+ * hash 的输入是一份**冻结的 wire format**，不是 `CommandIntent` 这个 TS 接口本身。
+ *
+ * 为什么必须解耦：hash 是对 key 排序后序列化的结果，**改一个字段名就换一个 hash**。
+ * 直接把 intent 丢进去的话，`actionType` 改名成 `commandType` 的那一刻，所有已经批准、
+ * 还停在 `waiting_for_approval` 的命令都会在执行前复核时报"命令内容已被修改，
+ * 必须重新审批" —— 明明内容一个字都没变。
+ *
+ * 所以这里显式列出参与 hash 的字段，并固定用改名前的 key 名。
+ * 要改这份格式必须先想清楚在途审批怎么办（迁移 or 强制重批），别顺手改。
+ */
+function frozenHashInput(intent: CommandIntent): Record<string, unknown> {
+  return {
+    actionType: intent.commandType, // ← 冻结：改名前的 key，别动
+    target: intent.target,
+    parameters: intent.parameters,
+    requestedBy: intent.requestedBy,
+    ...(intent.reason !== undefined ? { reason: intent.reason } : {}),
+  };
 }
 
-/** 执行前复核：hash 不一致说明 agent 改了动作内容，必须重新审批 */
-export function verifyActionHash(action: ActionIntent, expected: string): boolean {
-  return hashAction(action) === expected;
+/** createdAt 不进 hash（同样的命令在不同时间提出，hash 应一致） */
+export function hashCommand(intent: CommandIntent): string {
+  return createHash('sha256').update(canonicalJson(frozenHashInput(intent))).digest('hex');
+}
+
+/** 执行前复核：hash 不一致说明 agent 改了命令内容，必须重新审批 */
+export function verifyCommandHash(intent: CommandIntent, expected: string): boolean {
+  return hashCommand(intent) === expected;
 }

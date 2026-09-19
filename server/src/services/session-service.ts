@@ -475,7 +475,7 @@ class SessionService {
       sessionId,
       workspacePath: workspaceDir,
       mcpServers: mcpServers ? Object.keys(mcpServers) : [],
-      // Skill Flow 的 @agent 能力边界：跑到流程节点时才有值，所以按请求现取（见 capability.ts）
+      // Skill Flow 的 @task 能力边界：跑到流程节点时才有值，所以按请求现取（见 capability.ts）
       capability: () => agentCapabilityFor(sessionId),
       // 边界是"会话级存放、execution 级生效"：再对一次账，避免上一轮节点的边界
       // 作用到本轮的另一条 execution 上（见 tool-policy 第 0 层）

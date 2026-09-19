@@ -7,7 +7,7 @@ Skill Flow 是在标准 `SKILL.md` Markdown 中加入少量保留关键字，用
 * 哪一步由 Agent 执行
 * 哪一步由确定性规则判断
 * 哪一步需要人工处理
-* 哪一步执行业务动作
+* 哪一步执行业务命令
 * 每一步完成后流向哪里
 * 哪些情况直接结束流程
 
@@ -43,10 +43,10 @@ Analyze an investment opportunity and prepare a research report.
 
 ```md
 ## @flow ...
-## @agent ...
+## @task ...
 ## @gate ...
 ## @review ...
-## @action ...
+## @command ...
 ## @stop ...
 ## @end ...
 ```
@@ -85,7 +85,7 @@ allow: portfolio-manager
 
 ### 1.3 Agent 可以推理，但不能决定企业边界
 
-`@agent` 表示：
+`@task` 表示：
 
 > 这一阶段由 Copilot Agent 执行。
 
@@ -101,10 +101,10 @@ allow: portfolio-manager
 
 * 是否满足合规要求
 * 是否有审批权限
-* 是否可以执行高风险动作
+* 是否可以执行高风险命令
 * 是否可以突破 Data Entitlement
 
-这些由 `@gate`、`@review`、`@action` 对应的服务端逻辑决定。
+这些由 `@gate`、`@review`、`@command` 对应的服务端逻辑决定。
 
 ---
 
@@ -161,16 +161,16 @@ LLM
 
 ---
 
-### 1.6 Action 表示业务副作用
+### 1.6 Command 表示受控的业务状态变更
 
-`@action` 表示：
+`@command` 表示：
 
-> 当前节点要执行一个受控的业务操作。
+> 流程提出一个业务意图，由服务端经过 Policy / Approval 检查后，执行**一次**受控的业务状态变更。
 
 例如：
 
 ```md
-## @action publish
+## @command publish
 ```
 
 并不意味着 Agent 可以直接：
@@ -184,22 +184,37 @@ POST /publish
 ```text
 Skill Flow
    ↓
-Action registry
+Command registry
    ↓
-ActionIntent
+CommandIntent
    ↓
-ActionPolicy
+CommandPolicy
    ↓
 Approval / Authorization
    ↓
-ActionService
+CommandService
    ↓
 Business mutation
 ```
 
 因此：
 
-> `@action` 是业务动作的声明，不是直接授予 Agent 执行权限。
+> `@command` 是业务命令的声明，不是直接授予 Agent 执行权限。
+
+#### 四个执行词在同一抽象层级上
+
+Flow DSL 里只有四个“做事”的关键字，它们描述的是**这件事由谁做**，而不是怎么实现：
+
+| 关键字 | 谁做 | 一句话 |
+| --- | --- | --- |
+| `@task` | AI | AI 做事：一次受约束的 AI 工作单元 |
+| `@gate` | 系统 | 系统判断：确定性规则 |
+| `@review` | 人 | 人做决定：Human Task / Approval |
+| `@command` | 系统 | 系统改变业务状态：一次受控的业务副作用 |
+
+`@command` 与 `@task` 的区别值得单独说：`@task` 产出的是**结论**（可以被重新生成、被 `@gate` 推翻），
+`@command` 产生的是**已经发生的事实**（发出去了就是发出去了）。所以两者的失败语义不同 ——
+`@task` 允许重放，`@command` 重放等于重复提交（见第 17 节）。
 
 ---
 
@@ -274,7 +289,7 @@ interface FlowAstAttr {
 ```text
 route.target 一定存在
 属性一定合法且已归一化
-@gate / @review / @action 一定已注册
+@gate / @review / @command 一定已注册
 ```
 
 两个模型各自承担一条不变量，中间那次转换（校验器）就是"把 AST 提升为可执行模型"。
@@ -328,7 +343,7 @@ npm --prefix server run flow:lint -- server/skills
 ```
 
 ```text
-server/skills/x/SKILL.md:18 ERROR node-missing-outcome  @agent research 缺少出口 fail 的 route
+server/skills/x/SKILL.md:18 ERROR node-missing-outcome  @task research 缺少出口 fail 的 route
 server/skills/x/SKILL.md:31 ERROR gate-outcome-unrouted  @gate compliance 声明的出口 review 没有 route
 server/skills/x/SKILL.md:47 ERROR no-terminal-path  @gate retry 无法到达任何终态（@end / @stop）
 
@@ -352,17 +367,20 @@ server/skills/x/SKILL.md:47 ERROR no-terminal-path  @gate retry 无法到达任�
 | 关键字       | 作用            | 是否执行代码 | 是否允许自然语言正文 |
 | --------- | ------------- | -----: | ---------: |
 | `@flow`   | 定义一个 workflow |      否 |          是 |
-| `@agent`  | Agent 执行步骤    |      是 |          是 |
-| `@gate`   | 确定性业务判断       |      是 |          是 |
-| `@review` | 人工审核 / 审批     |      是 |          是 |
-| `@action` | 受控业务动作        |      是 |          是 |
+| `@task`   | AI 工作单元（由 Agent Runtime 执行） |      是 |          是 |
+| `@gate`   | 确定性业务判断（系统做） |      是 |          是 |
+| `@review` | 人工审核 / 审批（人做） |      是 |          是 |
+| `@command` | 受控业务状态变更（系统改变业务状态） |      是 |          是 |
 | `@stop`   | 明确终止流程        |      是 |          是 |
 | `@end`    | 正常结束流程        |      是 |          是 |
 
-不再使用：
+不再使用（`@agent` / `@subagent` 已**硬改名**为 `@task`，`@action` 已**硬改名**为 `@command`，
+都不做别名 —— 旧名会直接报 `block-unknown-type`）：
 
 ```text
+@agent
 @subagent
+@action
 @route
 ```
 
@@ -411,12 +429,12 @@ start -> investment-research
 
 ---
 
-# 4. `@agent`
+# 4. `@task`
 
 ## 语法
 
 ```md
-## @agent <node-id>
+## @task <node-id>
 
 <instructions>
 
@@ -427,7 +445,7 @@ start -> investment-research
 例如：
 
 ```md
-## @agent investment-research
+## @task investment-research
 
 Analyze the investment opportunity.
 
@@ -448,16 +466,18 @@ Produce a structured research result.
 
 ## 作用
 
-`@agent` 表示：
+`@task` 表示：
 
-> 这一阶段交给 Agent Runtime 执行。
+> **由配置的 Agent Runtime 执行一个受约束的 AI 工作单元。**
+> 它**不**创建、也**不**委派给一个独立的 agent，**不**决定流程走向
+> —— 走向只由它返回的 outcome 和写好的 route 决定。
 
 在当前实现中，它由 Copilot SDK 执行一个 Agent turn。
 
 因此：
 
 ```text
-@agent
+@task
    ↓
 Copilot SDK
    ↓
@@ -468,7 +488,23 @@ Tool / MCP / Skill
 result
 ```
 
-未来如果 Copilot SDK 自己提供更完整的 agent/sub-agent orchestration，也不影响 Skill Flow。
+**Agent 不是 Workflow 的一级概念** —— 它只是 `@task` 的执行实现：
+
+```text
+Flow DSL
+    ↓
+Workflow semantics
+    ↓
+@task
+    ↓
+Agent Runtime（Copilot SDK / OpenAI Agents SDK / DeepAgents / LangGraph …）
+```
+
+所以换一个执行后端，SKILL.md 里的一个字都不用改。这也正是关键字从 `@agent` 改成
+`@task` 的原因 —— `@agent` 会被读成“起一个 agent”，而它实际做的是上面那句话。
+
+节点 id（`## @task <node-id>`）是**纯标签**：它不必是技能名，也不代表“去调用那个技能”。
+跑哪个技能由**发起这次 execution 的技能**决定，节点正文就是那一步的 prompt。
 
 ---
 
@@ -488,20 +524,22 @@ fail
 - fail -> failure
 ```
 
-`@agent` 的业务意义不是“调用一个新的独立 Agent 实例”，而是：
+`@task` 的业务意义不是“调用一个新的独立 Agent 实例”，而是：
 
-> 当前流程进入一个 Agent execution step。
+> 让当前 Agent Runtime 执行一次受约束的 AI 工作单元，然后根据结果继续流转。
 
 如果未来需要真正多 Agent，可以在 Agent Runtime 层实现，而不需要改变 Skill Flow 语法。
+（真要给流程加 skill → skill 的委派，得先实现 subagent invocation —— 那是 `@task` 之外的
+另一件事，不要靠 `@task` 的名字去暗示它。）
 
 ---
 
 ## 保留属性：`output` 与 `tools`
 
-`@agent` 的正文最前面可以写两行保留属性（必须**紧跟标题**，否则会被当成 prompt 正文）：
+`@task` 的正文最前面可以写两行保留属性（必须**紧跟标题**，否则会被当成 prompt 正文）：
 
 ```md
-## @agent investment-research
+## @task investment-research
 
 output: non-empty
 tools: read,url
@@ -530,41 +568,41 @@ registerFlowOutput({
 契约没过 → 走 `fail` 出口（**可路由**，不是编排器崩溃）。契约 id 必须在服务端注册，
 SKILL.md 不能自己定义“什么叫做完了”（`registry-missing-output`）。
 
-**默认强制**：每个 `@agent` 都必须声明契约，否则 `prepare()` 直接 400
-（`agent-output-missing`）。理由就是上面那句 —— 没有契约时 `@agent success`
+**默认强制**：每个 `@task` 都必须声明契约，否则 `prepare()` 直接 400
+（`task-output-missing`）。理由就是上面那句 —— 没有契约时 `@task success`
 只等于“这次 turn 没抛异常”。迁移期可以用
 `COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT=false` 临时关掉，但那是例外而非常态。
 
 ### `tools: <权限类别>` —— 能力边界
 
-流程把业务动作收敛到 `@action`（策略 → 审批 → hash/版本复核 → executor），
-但 agent 手上还有工具：它完全可以不走 `@action`，直接调一个 MCP server 把研究报告发出去。
+流程把业务动作收敛到 `@command`（策略 → 审批 → hash/版本复核 → executor），
+但 agent 手上还有工具：它完全可以不走 `@command`，直接调一个 MCP server 把研究报告发出去。
 那样整条流程的审批就成了摆设。
 
-所以 `@agent` 节点执行期间会套上一个能力边界：
+所以 `@task` 节点执行期间会套上一个能力边界：
 
 ```text
 read    允许（只读无副作用）
 write   允许（只能落在 session workspace 内，路径守卫仍然生效）
 url     允许（出站请求另有 SSRF 检查 + 域名 allowlist）
 shell   永久禁止 —— 命令可以绕过路径守卫触达任意外部系统
-mcp     永久禁止 —— MCP server 就是外部业务系统，正是"绕开 @action"的路径
+mcp     永久禁止 —— MCP server 就是外部业务系统，正是"绕开 @command"的路径
 ```
 
 `mcp` / `shell` 是**代码里的不变式**（`WORKFLOW_AGENT_ALLOWED_KINDS`），不是配置：
 
 ```md
-tools: read,mcp    # ❌ agent-tools-forbidden（与部署配置无关，永远拒绝）
+tools: read,mcp    # ❌ task-tools-forbidden（与部署配置无关，永远拒绝）
 tools: read,url    # ✅
 ```
 
 这条区别很关键。做成“配置默认值不含 mcp”的话，把 `COPILOT_WORKFLOW_AGENT_TOOLS=mcp`
-一写，`@agent` 就重新拿到了绕开审批的路径 —— 一条**环境变量**取消了整条流程的授权模型，
+一写，`@task` 就重新拿到了绕开审批的路径 —— 一条**环境变量**取消了整条流程的授权模型，
 而 SKILL.md、审批记录、审计链上都看不出任何异常。所以：
 
 - 配置只能在 `read` / `write` / `url` 之内选，写 `mcp` 会被直接丢掉（不生效）
 - SKILL.md 的 `tools:` 只能在这个硬上限之上再**收窄**
-- 超出**部署上限**是另一条规则（`agent-tools-widens`，改配置可以放开）
+- 超出**部署上限**是另一条规则（`task-tools-widens`，改配置可以放开）
 - 要真正放开 `mcp` / `shell`，必须改代码（一次代码评审）
 
 这条与 `role:` 是同一条规则：SKILL.md 是会被 LLM 读到、也会被人随手改的文件，
@@ -842,12 +880,12 @@ SKILL.md 是在它之上做收窄，**不能放宽**。四条违规各自有独�
 
 ---
 
-# 7. `@action`
+# 7. `@command`
 
 ## 语法
 
 ```md
-## @action <node-id>
+## @command <node-id>
 
 <description>
 
@@ -858,7 +896,7 @@ SKILL.md 是在它之上做收窄，**不能放宽**。四条违规各自有独�
 例如：
 
 ```md
-## @action publish
+## @command publish
 
 Publish the approved research report.
 
@@ -870,28 +908,31 @@ Publish the approved research report.
 
 ## 作用
 
-`@action` 是：
+`@command` 是：
 
-> 一个具有业务副作用的受控操作。
+> 流程提出一个业务意图，由服务端经过 Policy / Approval 检查后，执行一次受控的业务状态变更。
+
+也就是 DDD / CQRS 里的 **Command**：命令可以被拒绝、可以被要求批准，但一旦执行就是一次
+真实的业务副作用（提交表决、下单、对外发消息、删数据）。
 
 它对应：
 
 ```ts
-FlowAction
+FlowCommand
 ```
 
 例如：
 
 ```text
-@action publish
+@command publish
        ↓
-ActionRegistry
+CommandRegistry
        ↓
-ActionIntent
+CommandIntent
        ↓
-ActionPolicy
+CommandPolicy
        ↓
-ActionService
+CommandService
 ```
 
 ---
@@ -917,13 +958,13 @@ Business authorization
 ```text
 Agent
   ↓
-propose ActionIntent
+propose CommandIntent
   ↓
 Policy
   ↓
 Approval
   ↓
-ActionService
+CommandService
   ↓
 Mutation
 ```
@@ -935,7 +976,7 @@ Mutation
 ## 保留属性：`role`
 
 ```md
-## @action publish
+## @command publish
 
 role: investment.reviewer
 
@@ -945,19 +986,19 @@ Publish the approved research result.
 - fail -> publish-failed
 ```
 
-含义与 `@review role:` **不同**：这里是把该动作类型的审批资格**收窄**到声明的业务角色。
+含义与 `@review role:` **不同**：这里是把该命令类型的审批资格**收窄**到声明的业务角色。
 
 ```text
-ApprovalPolicy(actionType).eligibleRoles  ∩  { role: }   =  生效的审批角色
+ApprovalPolicy(commandType).eligibleRoles  ∩  { role: }   =  生效的审批角色
 ```
 
-交集为空 → `ActionService` 直接拒绝（`decision: 'denied'`），流程走 `fail` 出口。
-所以 `@action role:` 写一个策略里没有的角色，效果是**动作被拒**，而不是“换一个角色来批”。
+交集为空 → `CommandService` 直接拒绝（`decision: 'denied'`），流程走 `fail` 出口。
+所以 `@command role:` 写一个策略里没有的角色，效果是**命令被拒**，而不是“换一个角色来批”。
 
-同样只能收窄：SKILL.md 不能让一个本来只需要 `operations` 批的动作变成需要 `investment.reviewer`。
+同样只能收窄：SKILL.md 不能让一个本来只需要 `operations` 批的命令变成需要 `investment.reviewer`。
 
-另外，声明了 `role:` 的动作**不走 auto_approve**：否则一个环境变量就能绕过
-流程里写明的审批要求（`COPILOT_AUTO_APPROVE_ACTIONS` 只对没写 `role:` 的动作生效）。
+另外，声明了 `role:` 的命令**不走 auto_approve**：否则一个环境变量就能绕过
+流程里写明的审批要求（`COPILOT_AUTO_APPROVE_ACTIONS` 只对没写 `role:` 的命令生效）。
 
 ---
 
@@ -1160,7 +1201,7 @@ duplicate route outcome: pass
 
 start -> first-step
 
-## @agent first-step
+## @task first-step
 
 ...
 
@@ -1189,7 +1230,7 @@ start -> first-step
 - approve -> action
 - reject -> rejected
 
-## @action action
+## @command action
 
 ...
 
@@ -1242,7 +1283,7 @@ When performing research:
 
 start -> investment-research
 
-## @agent investment-research
+## @task investment-research
 
 output: non-empty
 
@@ -1311,7 +1352,7 @@ The reviewer should evaluate:
 - approve -> publish
 - reject -> investment-rejected
 
-## @action publish
+## @command publish
 
 Publish the approved research report.
 
@@ -1386,7 +1427,7 @@ When reviewing a proxy item:
 
 start -> voting-analysis
 
-## @agent voting-analysis
+## @task voting-analysis
 
 Analyze the proxy voting item.
 
@@ -1444,7 +1485,7 @@ eligibility and segregation-of-duties policy.
 - approve -> submit-vote
 - reject -> vote-rejected
 
-## @action submit-vote
+## @command submit-vote
 
 Submit the approved voting instruction through the registered
 proxy voting action.
@@ -1501,13 +1542,13 @@ Proxy Voting
 最后都可以抽象成：
 
 ```text
-@agent
+@task
    ↓
 @gate
    ↓
 @review
    ↓
-@action
+@command
    ↓
 @end
 ```
@@ -1515,7 +1556,7 @@ Proxy Voting
 遇到问题：
 
 ```text
-@agent
+@task
    ↓
 @stop
 
@@ -1527,7 +1568,7 @@ Proxy Voting
    ↓
 @stop
 
-@action
+@command
    ↓
 @stop
 ```
@@ -1610,7 +1651,7 @@ Proxy Voting
   ↓
 Business Process
 
-@agent
+@task
   ↓
 Agent Execution
 
@@ -1622,7 +1663,7 @@ Deterministic Decision
   ↓
 Human Task / Approval
 
-@action
+@command
   ↓
 Authorized Business Mutation
 
@@ -1654,20 +1695,55 @@ Successful Terminal State
                     ↓
                 Approval
                     ↓
-              ActionService
+              CommandService
                     ↓
               Business System
 ```
 
-**这就是目前我建议固定下来的版本：`@flow / @agent / @gate / @review / @action / @stop / @end`。**
+**这就是目前固定下来的版本：`@flow / @task / @gate / @review / @command / @stop / @end`。**
 
 其中最关键的命名变化就是：
 
 ```text
-@subagent  →  @agent
+@subagent  →  @agent  →  @task
 ```
 
-因为 Skill Flow 描述的是“这一步由 Agent 执行”，而不是要求 Skill DSL 自己定义什么叫 sub-agent；真正的 agent / sub-agent 层次应该交给 Copilot SDK 本身处理。
+`@subagent` 改成 `@agent` 是为了不说“委派给另一个 agent”；再从 `@agent` 改成 `@task`
+是因为 `@task` 仍然会让人把它读成“起一个 agent 实例”。这一步实际做的是：
+
+> 让当前 Agent Runtime 执行一次受约束的 AI 工作单元，然后根据结果继续流转。
+
+改完之后 **Agent 不再是 Workflow 的一级概念** —— 它只是 `@task` 的执行实现。
+所以 `FlowNodeRuntime` 上的方法叫 `runTask()` 而不是 `runAgent()`，SKILL.md 里的节点 id
+也只是一个标签（不再要求命中某个技能名）。
+
+第二次命名变化同理：
+
+```text
+@action  →  @command
+```
+
+`action` 也是个“什么都能叫”的上位词 —— 读的人会以为它涵盖 `@task` / `@gate` / `@review`
+的全部，于是按错的模型设计流程。它实际做的是“提出一个业务意图，服务端检查后执行一次
+受控的业务状态变更”，所以叫 `@command`。这次是**平台级改名**：`ActionService` → `CommandService`、
+`ActionIntent` → `CommandIntent`、`actionType` → `commandType`、DB 列 `action_intent` → `command_intent`、
+审计事件 `action.*` → `command.*` 一并改掉 —— 只改 DSL 关键字、让代码里还叫 `action`，
+是最容易在排查时把两边对错的那种不一致。
+
+`FlowNodeRuntime` 上的四个方法因此是 `runTask()` / `runGate()` / `openReview()` / `runCommand()`。
+
+改名**不动**三样东西（都是离开进程边界、或者已经落库的 wire format）：
+
+- `commandHash` 的输入键仍叫 `actionType`（`execution/hash.ts` 的 `frozenHashInput`）——
+  否则所有在途审批会在执行前复核时报“内容已被修改”
+- 幂等键前缀仍是 `action:{executionId}:{commandHash}`（`execution-service.ts`）——
+  它传给下游网关，换了前缀等于在途重试去重失效
+- 环境变量名 `COPILOT_AUTO_APPROVE_ACTIONS` / `COPILOT_WORKFLOW_AGENT_TOOLS` 不变 ——
+  它们是部署契约，改名会静默改掉线上行为
+
+历史审计行里的 `action.*` 事件名**不迁移**，由 `execution/types.ts` 的 `canonicalEventType()`
+在读的时候归一化；人工任务 payload 里改名前的 `kind: 'action'` 标记与 `actionType` 键同理，
+runner 与 HumanTaskService 都读两种值。
 
 ---
 
@@ -1709,10 +1785,10 @@ type WorkflowStepStatus = 'pending' | 'running' | 'waiting' | 'completed';
 
 | 节点 | 有副作用？ | 中断后 |
 | --- | --- | --- |
-| `@agent` / `@gate` | 否（纯计算） | 记一条审计后**允许重放** |
-| `@action` | 是 | **不自动重放**，落 failed 交人工核对 |
+| `@task` / `@gate` | 否（纯计算） | 记一条审计后**允许重放** |
+| `@command` | 是 | **不自动重放**，落 failed 交人工核对 |
 
-幂等键 `action:<executionId>:<actionHash>` 只能防**重复提交**，防不了
+幂等键 `action:<executionId>:<commandHash>` 只能防**重复提交**，防不了
 “外部系统已经生效、但本地没记上” —— 所以有副作用的步骤必须交给人。
 
 ## 17.2 单写者：两个推进者不能同时改状态
@@ -1762,7 +1838,7 @@ rec.status          === 'waiting_for_approval'  execution 确实在等审批
 
 ```text
 definition-provider.ts   流程定义从哪来、怎么校验、怎么确认版本没变
-runtime.ts               一个 @agent / @gate / @action / @review 具体怎么执行
+runtime.ts               一个 @task / @gate / @command / @review 具体怎么执行
 runner.ts                状态怎么推进、什么时候落库、冲突怎么办
 ```
 
@@ -1777,15 +1853,15 @@ runner.ts                状态怎么推进、什么时候落库、冲突怎么�
 走向只由两样东西决定：durable 状态里的 `state.current`，以及该节点声明的 `node.routes`。
 
 - `@gate` 的结果来自服务端注册的确定性函数
-- `@action` 的审批资格来自 ApprovalPolicy，不是 SKILL.md 的自然语言
+- `@command` 的审批资格来自 ApprovalPolicy，不是 SKILL.md 的自然语言
 - `@review` 的四个属性只能比服务端基策略更严
-- `@agent` 只能走 `success` / `fail`，且 `success` 要先过服务端注册的完成契约
-- `@agent` 执行期间套着能力边界（**永远**碰不到 MCP 与 shell）——
-  否则它可以绕开 `@action` 直接对外产生副作用
+- `@task` 只能走 `success` / `fail`，且 `success` 要先过服务端注册的完成契约
+- `@task` 执行期间套着能力边界（**永远**碰不到 MCP 与 shell）——
+  否则它可以绕开 `@command` 直接对外产生副作用
 
 ## 17.6 进入等待态的顺序：先落 workflow，再迁移 execution
 
-`@review` / `@action` 进入等待态是**三步**，顺序不能换：
+`@review` / `@command` 进入等待态是**三步**，顺序不能换：
 
 ```text
 1. 建人工任务（拿到 taskId）
@@ -1800,7 +1876,7 @@ execution = waiting_for_approval   +   workflow.stepStatus = running
 ```
 
 恢复时“这一步在等人工”和“这一步要重放”**同时成立** —— 没有任何字段能判断该信哪个。
-信前者会漏掉一步，信后者会重复提交（`@action` 那一步可能已经发出去过）。
+信前者会漏掉一步，信后者会重复提交（`@command` 那一步可能已经发出去过）。
 
 按上面的顺序，崩溃留下的最长是 `stepStatus = waiting` + `execution = running`。
 那是一个**可判定**的状态：任务确实已经建出来了，只需要把它接回来
@@ -1809,7 +1885,7 @@ execution = waiting_for_approval   +   workflow.stepStatus = running
 
 为什么这件事必须由编排器做、而不是让 `ExecutionService` 顺手迁完：两个写者
 （执行器 + 编排器）都改 execution 时，崩溃窗口里的状态是**不可判定**的。
-状态机的所有权必须只有一份 —— 所以 `runtime.runAction()` 的契约是
+状态机的所有权必须只有一份 —— 所以 `runtime.runCommand()` 的契约是
 “只建审批任务、绝不改 execution 状态”。
 
 代价：2 与 3 之间崩溃会留下一条**孤儿人工任务**（流程那边会重新走一遍）。
@@ -1867,13 +1943,13 @@ updateWorkflowState(current = next, stepStatus = pending)   ← CAS
 
 ## 17.7 能力边界属于哪条 execution
 
-`@agent` 的能力边界是**会话级存放、execution 级生效**的（`capability.ts`）：
+`@task` 的能力边界是**会话级存放、execution 级生效**的（`capability.ts`）：
 
 ```ts
 interface AgentCapability { executionId: string; nodeId: string; flow: string; kinds: Set<...> }
 ```
 
-工具授权上下文在建会话时就固定了，而 `@agent` 节点是在会话生命周期**中间**跑的，
+工具授权上下文在建会话时就固定了，而 `@task` 节点是在会话生命周期**中间**跑的，
 没法烘进 session config —— 所以按 `sessionId` 存一份，权限回调每次现取。
 
 但一条会话会先后（甚至排队）承载多条 execution。只按 `sessionId` 取一份，
@@ -1888,7 +1964,7 @@ B 却拿到了 `write` —— 一次**跨 execution 的能力放宽**，而审�
 退回等于把它们重新交回 agent 手上 —— 那正是这一层要挡的东西。拒绝会让问题立刻可见，
 包括“未来的某个 runtime 忘了设 execution 上下文”这种会让边界**静默失效**的改法。
 
-清除时同样要比对 `executionId + nodeId`：`@agent` 的 `finally` 在 turn 槽**外面**跑，
+清除时同样要比对 `executionId + nodeId`：`@task` 的 `finally` 在 turn 槽**外面**跑，
 槽一释放，同一会话里的下一条 execution 就可能已经设上自己的边界了。
 
 ## 17.8 定义只读一次：`read → hash → parse → validate`
@@ -1907,10 +1983,13 @@ B 却拿到了 `write` —— 一次**跨 execution 的能力放宽**，而审�
 所以 `loadSkill()` 只读一次文件，那次读同时用于：匹配技能名、解析 frontmatter、算哈希；
 解析与校验全部消费同一份 `markdown`。
 
-同理，`runAgentStep()` **不再**回头调 `findSkill()` 做存在性检查 —— 那是第二条解析路径
+同理，`runTaskStep()` **不再**回头调 `findSkill()` 做存在性检查 —— 那是第二条解析路径
 （`findSkill` 会把每个候选 SKILL.md 重读一遍、重新解析 frontmatter），
-会让“校验时看到的定义”和“执行时用的定义”变成两份内容。技能是否存在已经在校验期
-查过（`hasSkill`），而且每次 resume 都会重新校验一遍。
+会让“校验时看到的定义”和“执行时用的定义”变成两份内容。
+
+`@task` 的节点 id 只是标签，**不再要求命中某个技能名**（v1 的 `hasSkill` 检查已删除）：
+它和“Agent 不是 Workflow 的一级概念”直接冲突 —— 会让 `@task research`（技能叫
+`investment-research`）无法通过校验。
 
 ## 17.9 注册表在启动时就自洽
 

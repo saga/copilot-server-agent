@@ -9,8 +9,8 @@ export type ApprovalStrategy = 'ANY' | 'ALL' | 'N_OF_M' | 'SEQUENTIAL';
 
 export interface ApprovalPolicy {
   policyId: string;
-  /** 命中的业务动作类型（submit_proxy_vote / submit_trade / publish_report …） */
-  actionType: string;
+  /** 命中的业务命令类型（submit_proxy_vote / submit_trade / publish_report …） */
+  commandType: string;
   strategy: ApprovalStrategy;
   /** N_OF_M 的 N（其他策略可省略：ALL/SEQUENTIAL 取 eligibleRoles 长度，ANY 取 1） */
   requiredCount?: number;

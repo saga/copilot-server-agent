@@ -43,6 +43,19 @@ function expiresAtFrom(policy?: ApprovalPolicy | null): string | undefined {
 }
 
 /**
+ * 从人工任务 payload 里读业务命令类型。
+ *
+ * **兼容层**：改名之前写进去的键是 `actionType`，现在写 `commandType`。
+ * 一条审批任务可能挂着几小时、跨一次部署，两个键都得认 ——
+ * 认不出来的后果是 `policyFor('')` 返回 null，于是回退到任务自带的策略副本，
+ * 也就是**用旧策略重新裁决一次**，而不是按当前注册的策略。
+ */
+function commandTypeOf(task: HumanTask): string {
+  const p = task.payload as { commandType?: unknown; actionType?: unknown } | undefined;
+  return String(p?.commandType ?? p?.actionType ?? '');
+}
+
+/**
  * HumanTaskService：人工任务生命周期（创建 / 审批 / 输入 / 委派 / 取消 / 过期）。
  * 路由层只调用这里，不直接写库、不直接碰 SDK。
  */
@@ -76,7 +89,7 @@ export class HumanTaskService {
    *
    * 为什么需要：`decide()` 是「读决策 → 判资格 → 加决策 → 评估 → 关闭」。没有这层，
    * 两个审批者可能各自读到"还差一票"、各自评估 complete、各自关闭 —— 收敛出两次
-   * `onResolved`（进而把同一个业务动作执行两遍）。
+   * `onResolved`（进而把同一个业务命令执行两遍）。
    *
    * `repository.close()` 的条件写是**跨副本**的最终防线（谁抢到谁触发 onResolved）；
    * 这把锁是进程内的，负责让 `evaluate()` 看到稳定的决策集合。多副本下仍有"最后一个
@@ -254,9 +267,7 @@ export class HumanTaskService {
     const task = await this.getOpenTaskForActor(taskId, input.principal);
     if (task.type !== 'approval') throw new Error('该任务不是审批任务');
     const policy = task.policyId
-      ? (this.deps.approval.policyFor(
-          String(task.payload?.actionType ?? ''),
-        ) ?? this.policyFromTask(task))
+      ? (this.deps.approval.policyFor(commandTypeOf(task)) ?? this.policyFromTask(task))
       : this.policyFromTask(task);
     const decisions = await this.deps.repository.listDecisions(taskId);
     // 一人一票：重复投票先于资格判定（同一个人的第二次点击不该报“顺序未轮到”）
@@ -287,7 +298,7 @@ export class HumanTaskService {
     const resolution: HumanTaskResolution =
       evaluation.outcome === 'approved' ? 'approved' : 'rejected';
     // 条件关闭：并发下只有一个请求能把 task 从 open 改走。只有那一个是"完成收敛的人"，
-    // 由它触发 onResolved —— 否则两个审批者会各自把同一个业务动作执行一遍。
+    // 由它触发 onResolved —— 否则两个审批者会各自把同一个业务命令执行一遍。
     const closed = await this.deps.repository.close(taskId, {
       status: resolution,
       completedAt: new Date().toISOString(),
@@ -378,7 +389,7 @@ export class HumanTaskService {
   private policyFromTask(task: HumanTask): ApprovalPolicy {
     return {
       policyId: task.policyId ?? 'task-inline',
-      actionType: String(task.payload?.actionType ?? 'unknown'),
+      commandType: commandTypeOf(task) || 'unknown',
       strategy: task.strategy ?? 'ANY',
       ...(task.requiredCount ? { requiredCount: task.requiredCount } : {}),
       eligibleRoles: task.eligibleRoles,

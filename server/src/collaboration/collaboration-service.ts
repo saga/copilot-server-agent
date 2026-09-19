@@ -62,7 +62,7 @@ export class CollaborationService {
    *
    * 两件事，缺一不可：
    *   1. `running`/`resuming` 的执行落成 `interrupted` 终态 —— 进程被杀时它永远停在 running，
-   *      而**不能自动重试**（agent 可能已经执行过业务动作，重跑会重复提交）。
+   *      而**不能自动重试**（agent 可能已经执行过业务命令，重跑会重复提交）。
    *   2. 重新 drain 还有 `created` 协作 execution 的 session —— 队列数据在库里是 durable 的，
    *      但"谁在跑"（`SessionCoordinator.chains`）是进程内的，重启后没有任何东西会主动唤醒它。
    *      持久化了队列却没有恢复 worker，等于没 durable。

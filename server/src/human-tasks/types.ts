@@ -3,7 +3,7 @@ import type { ApprovalStrategy, HumanTaskDecision } from '../approval/types.js';
 /**
  * HumanTask：input 与 approval 共用一套抽象（前端只有一个 “My Tasks” 列表）。
  *
- *   type = 'approval' → 审批某个 ActionIntent（服务端按策略裁决）
+ *   type = 'approval' → 审批某个 CommandIntent（服务端按策略裁决）
  *   type = 'input'    → 人工补数据（按 inputSchema 校验，不是自由文本）
  *
  * Human Task 挂在 execution 下，不挂在 session 下：
@@ -33,7 +33,7 @@ export interface HumanTask {
   status: HumanTaskStatus;
   title: string;
   description?: string;
-  /** 审批场景承载 ActionIntent；输入场景承载待补数据描述 */
+  /** 审批场景承载 CommandIntent；输入场景承载待补数据描述 */
   payload: Record<string, unknown>;
   /** 输入任务的字段定义（schema 化，不接受自由文本） */
   inputSchema?: InputTaskSchema;
