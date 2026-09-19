@@ -356,25 +356,149 @@ test('校验：@flow 的 start 也只能有一条（`start -> a` + `start -> b` 
   assert.match(hit!.message, /start/);
 });
 
-test('校验：同一个出口指向同一个目标重复写，不算歧义（parser 已去重）', () => {
+test('校验：同一个出口指向同一个目标重复写 → 只是冗余（warning），不阻断', () => {
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> check',
+    '',
+    '## @gate check',
+    '',
+    '- pass -> done',
+    '- pass -> done',
+    '- fail -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+
+  // 前提：AST 忠实保留两条 —— parser **不再去重**（去重会把这个事实抹掉，
+  // 于是"重复"这件事根本没机会被报出来）
+  const ast = parseSkillFlow(md);
+  assert.deepEqual(
+    ast.nodes.find((n) => n.id === 'check')!.routes.map((r) => `${r.outcome}->${r.target}`),
+    ['pass->done', 'pass->done', 'fail->done'],
+  );
+
+  const r = ok(md);
+  const warn = r.issues.find((i) => i.code === 'route-outcome-redundant');
+  assert.ok(warn, '走向完全一样，流程本身没错 —— 提醒而不是拦住');
+  assert.equal(warn!.severity, 'warning');
+  assert.equal(warn!.line, 8, '指到重复的那一行');
+  assert.match(warn!.message, /第 7 行/, '要说清跟哪一行重了');
+  assert.ok(!r.issues.some((i) => i.code === 'route-outcome-duplicate'), '同目标不算歧义');
+  assert.ok(r.definition, 'warning 不阻断，定义照常给出');
+});
+
+test('校验：固定出口的节点类型不允许"多出来的出口"（假分支）', () => {
   const r = ok(
     flow(
       '## @flow demo',
       '',
-      'start -> check',
+      'start -> research',
       '',
-      '## @gate check',
+      '## @agent research',
       '',
-      '- pass -> done',
-      '- pass -> done',
-      '- fail -> done',
+      '- success -> done',
+      '- fail -> failed',
+      '- retry -> research',
+      '',
+      '## @stop failed',
+      '',
+      '失败。',
       '',
       '## @end done',
       '',
-      'ok',
+      '完成。',
     ),
   );
-  assert.deepEqual(r.issues, [], '重复但完全一致的路由只是啰嗦，不是错误');
+  const hit = r.issues.find((i) => i.code === 'node-unknown-outcome');
+  assert.ok(hit, '@agent 只会返回 success / fail —— `retry` 是一条永远走不到的假分支');
+  assert.equal(hit!.nodeId, 'research');
+  assert.equal(hit!.line, 9, '指到那条 route 自己的行（`- retry -> research`），不是节点标题行');
+  assert.match(hit!.message, /success \/ fail/);
+  assert.equal(r.definition, undefined, '这是 error，不给定义');
+});
+
+test('校验：假分支会被拦住 —— 它可能让一个本该报错的流程看起来可达', () => {
+  // `retry` 只被 `research` 的假出口指着。如果那条假边被当真，
+  // 分析器会认为 `retry` 可达、而且能到 @end，于是整条流程"通过"。
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> research',
+    '',
+    '## @agent research',
+    '',
+    '- success -> done',
+    '- fail -> done',
+    '- retry -> retry',
+    '',
+    '## @agent retry',
+    '',
+    '- success -> done',
+    '- fail -> done',
+    '',
+    '## @end done',
+    '',
+    '完成。',
+  );
+  const r = ok(md);
+  assert.ok(
+    r.issues.some((i) => i.code === 'node-unknown-outcome'),
+    '出口集合必须是封闭的，否则分析器会在一条假边上做判断',
+  );
+  assert.equal(r.definition, undefined);
+});
+
+test('校验：@review 的出口也只认 approve / reject', () => {
+  const r = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> rev',
+      '',
+      '## @review rev',
+      '',
+      '- approve -> done',
+      '- reject -> done',
+      '- pass -> done',
+      '',
+      '## @end done',
+      '',
+      '完成。',
+    ),
+    { registry: ALL_REGISTERED },
+  );
+  const hit = r.issues.find((i) => i.code === 'node-unknown-outcome');
+  assert.ok(hit, '人工审核只会给出 approve / reject');
+  assert.match(hit!.message, /approve \/ reject/);
+});
+
+test('校验：route 指向不存在的节点时指到 **route 那一行**', () => {
+  const r = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> research',
+      '',
+      '## @agent research',
+      '',
+      '说明……',
+      '',
+      '- success -> done',
+      '- fail -> compliance-review-not-found',
+      '',
+      '## @end done',
+      '',
+      '完成。',
+    ),
+  );
+  const hit = r.issues.find((i) => i.code === 'route-target-missing');
+  assert.ok(hit);
+  assert.equal(hit!.line, 10, '指到第 10 行那条 route，而不是第 5 行的节点标题');
+  assert.match(hit!.message, /compliance-review-not-found/);
 });
 
 test('校验：保留属性值不合法 → attr-invalid（带属性行行号）', () => {

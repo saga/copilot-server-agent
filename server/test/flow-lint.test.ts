@@ -60,6 +60,17 @@ test('lint：普通技能（没有 @block）直接跳过，不算错误', () => 
   assert.deepEqual(r.issues, []);
 });
 
+test('lint：块类型拼错（`## @gates`）**不能**被当成"普通技能"跳过', () => {
+  // 这是 lint 最该报的一类：作者写了块、以为生效了，其实整块是空气。
+  // 只看 flows / nodes 两个数组的话它会被算成"没有 @block"，真正的错误被静默吃掉。
+  const r = lint('---\nname: typo\n---\n\n## @gates compliance\n\n拼错的块类型。\n');
+  assert.equal(r.skipped, false, '有 ast.issues 就不算"普通技能"');
+  assert.equal(r.ok, false);
+  const hit = r.issues.find((i) => i.code === 'block-unknown-type');
+  assert.ok(hit, '必须报出拼错的块');
+  assert.match(hit!.message, /@gates compliance/);
+});
+
 test('lint：完整流程通过', () => {
   const r = lint(VALID);
   assert.equal(r.skipped, false);

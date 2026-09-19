@@ -62,8 +62,14 @@ export interface LintResult {
  */
 export function lintSkillFlow(markdown: string, opts: LintOptions = {}): LintResult {
   const ast = parseSkillFlow(markdown);
-  // 普通技能（只有说明、没有 @block）不是"校验失败"，只是不适用
-  if (!ast.flows.length && !ast.nodes.length) return { skipped: true, issues: [], ok: true };
+  // 普通技能（只有说明、没有 @block）不是"校验失败"，只是不适用。
+  //
+  // 但**必须连 `ast.issues` 一起看**：`## @gates compliance` 这种拼错的块既不是 flow、
+  // 也不是节点，只看两个数组的话会被当成"普通技能"跳过 —— 真正的错误被静默吃掉，
+  // 而这恰恰是 lint 最该报的一类（作者写了块，以为生效了）。
+  if (!ast.flows.length && !ast.nodes.length && !ast.issues.length) {
+    return { skipped: true, issues: [], ok: true };
+  }
 
   const validated = validateSkillFlow(ast, {
     ...(opts.flow ? { flow: opts.flow } : {}),

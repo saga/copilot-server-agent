@@ -80,9 +80,17 @@ function stripFrontmatter(markdown: string): string {
 }
 
 /**
- * 段落/列表项里的文本候选（带偏移与首行行号）。
+ * 段落里的文本候选（带偏移与首行行号）。
  *
  * 偏移用于按块归属；行号用于给 route 标出自己在 SKILL.md 的哪一行。
+ *
+ * **只收 `paragraph`，不收 `listItem`**：`- success -> done` 在 mdast 里是
+ * `list > listItem > paragraph`，两级都会被 visit 到，于是同一条 route 会被收两次 ——
+ * 这正是以前需要靠"去重"来掩盖的问题。只认 paragraph 之后，一条 route 天然只出现一次，
+ * 去重就不需要了（而**去重是有害的**，见下面提取路由那段）。
+ *
+ * 列表符号不属于 paragraph 的文本（`toString` 给出的是 `success -> done`），
+ * 所以 `ROUTE` 里的 `[-*]?` 只对"裸行写法"生效 —— 两种写法都能匹配。
  */
 interface TextCandidate {
   offset: number;
@@ -174,10 +182,12 @@ export function parseSkillFlow(markdown: string): FlowAst {
   const tree = unified().use(remarkParse).parse(source) as Root;
 
   // 一次遍历收集所有可用于路由的文本；之后按块的偏移区间归属。
-  // 段落与列表项之外的节点（code / html / blockquote 内的 code）天然被排除。
+  // 只认 `paragraph`：列表项的文本必然包在一个 paragraph 里，所以收 paragraph 就够，
+  // 同时避免 listItem / paragraph 两级各收一次导致的重复。
+  // 段落之外的节点（code / html / blockquote 内的 code）天然被排除。
   const candidates: TextCandidate[] = [];
   visit(tree, (node) => {
-    if (node.type !== 'paragraph' && node.type !== 'listItem') return;
+    if (node.type !== 'paragraph') return;
     const offset = node.position?.start.offset;
     if (offset === undefined) return;
     candidates.push({ offset, text: toString(node), line: node.position?.start.line ?? 1 });
@@ -248,22 +258,26 @@ export function parseSkillFlow(markdown: string): FlowAst {
       ? (body[body.length - 1]!.position?.end.offset ?? bodyStartOffset)
       : bodyStartOffset;
 
-    // 路由：本块偏移区间内的段落/列表项文本。
-    // 行号 = 候选文本首行 + 文本内的第几行 —— 段落与列表项的 `toString()` 按源文件
-    // 的软换行保留 `\n`，所以这个映射对"一行一条 route"的常见写法是精确的。
+    // 路由：本块偏移区间内的段落文本。
+    //
+    // **不做去重** —— AST 要忠实记录"作者写了什么"：写了两条 `- pass -> done`，
+    // AST 里就是两条。去重会把这个事实抹掉，于是"同出口重复"这件事就没法在下游报出来
+    // （而它正是最需要报的一类：runner 的 `findRoute()` 取第一条，第二条静默失效）。
+    // 重复的判定属于语义层 —— 见 flow-validator 的 route-outcome-duplicate / -redundant。
+    //
+    // 行号 = 候选文本首行 + 文本内的第几行 —— paragraph 的 `toString()` 按源文件的
+    // 软换行保留 `\n`，所以这个映射对"一行一条 route"的常见写法是精确的。
     const routes: FlowAstRoute[] = [];
-    const seen = new Set<string>();
     for (const candidate of candidates) {
       if (candidate.offset < bodyStartOffset || candidate.offset >= bodyEndOffset) continue;
       for (const [index, lineText] of candidate.text.split('\n').entries()) {
         const rm = lineText.match(ROUTE);
         if (!rm) continue;
-        const outcome = norm(rm[1]!);
-        const target = norm(rm[2]!);
-        const key = `${outcome}->${target}`;
-        if (seen.has(key)) continue;
-        seen.add(key);
-        routes.push({ outcome, target, line: candidate.line + index });
+        routes.push({
+          outcome: norm(rm[1]!),
+          target: norm(rm[2]!),
+          line: candidate.line + index,
+        });
       }
     }
 

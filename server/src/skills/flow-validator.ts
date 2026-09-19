@@ -21,24 +21,32 @@ import {
  * 输入是"作者写了什么"，输出是"系统确认这是什么、允许执行什么"。中间这一步是
  * 整条流水线里唯一做**授权判断**的地方，所以它也是唯一需要注册表的层。
  *
- * 只做 13 件事：
+ * 只做 14 件事：
  *   1. 恰好一个 @flow（v1 一个技能一条流程）
  *   2. @flow 声明了 start，且 start 不重复
  *   3. 节点 id 唯一
  *   4. 所有 route target 都存在
  *   5. @end / @stop 不允许再 route
  *   6. 非终态节点必须至少有一条 route
- *   7. **同一个出口不能有两条 route** —— 否则 runner 取第一条，后面那条静默失效
- *   8. **保留属性合法**（role/strategy/required/exclude/output/tools），且 @review 必须能拿到业务角色
- *   9. **允许环** —— research → review → research 是研究流程的常态，用可达性而不是 DAG 判定
- *  10. **属性只能比服务端更严**：`role` 必须落在注册表的 eligibleRoles 里，
+ *   7. **出口必须是该节点类型的封闭集合**（`node-unknown-outcome`）：
+ *      `@agent` / `@action` 只有 success / fail，`@review` 只有 approve / reject。
+ *      多写一个出口（`- retry -> retry`）是一条**永远不会走到的假分支**，而分析器
+ *      会把它当真 —— 它可能让一个本该报错的流程看起来可达。
+ *   8. **同一个出口不能有两条 route**（`route-outcome-duplicate`，error）；
+ *      同出口 + 同目标只是冗余（`route-outcome-redundant`，warning）
+ *   9. **保留属性合法**（role/strategy/required/exclude/output/tools），且 @review 必须能拿到业务角色
+ *  10. **允许环** —— research → review → research 是研究流程的常态，用可达性而不是 DAG 判定
+ *  11. **属性只能比服务端更严**：`role` 必须落在注册表的 eligibleRoles 里，
  *      `strategy` 只能 ANY→ALL，`required` 只能加不能减，`exclude` 不能把禁止自批改成允许
  *      （否则一份可编辑的 Markdown 就能把"要 3 个人批"降成"1 个人批"）
- *  11. **`strategy: ALL` 必须真的全员**：生效票数 < 生效角色数 → `review-all-required`
+ *  12. **`strategy: ALL` 必须真的全员**：生效票数 < 生效角色数 → `review-all-required`
  *      （`ALL + required: 1` 只是名字叫 ALL 的 ANY，审计链上却写着 ALL）
- *  12. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
- *  13. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
+ *  13. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
+ *  14. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
  *      `mcp` / `shell` 永久禁止（`agent-tools-forbidden`），其余只能比服务端上限更严
+ *
+ * 所有与 route 有关的问题都指向 **route 自己那一行**（AST 带行号），不是节点标题行 ——
+ * 一个 20 行的节点里让你自己找哪一行有问题，等于没报。
  *
  * **刻意不做**图的分析（可达性、能否到达终态）：那属于 `flow-analyzer.ts`，
  * 输入是校验完的 `FlowDefinition`。这一层只回答"每条边、每个属性合不合法"，
@@ -232,8 +240,15 @@ function buildAttrs(input: {
  * 同一个出口名不能有两条 route。
  *
  * `findRoute()` 是 `routes.find((r) => r.on === outcome)` —— 第一条命中就返回，
- * 后面的**静默被忽略**。作者以为"pass 会去 a 也可能去 b"，实际永远只去 a。
- * 这种"看不出错、但走向不由自己决定"的写法必须在执行前拦住。
+ * 后面的**静默被忽略**。分两种情况，处理方式不同：
+ *
+ *   同一个出口 → **不同**目标   `route-outcome-duplicate`（error）
+ *       作者以为"pass 会去 a 也可能去 b"，实际永远只去 a。这种"看不出错、但走向
+ *       不由自己决定"的写法必须在执行前拦住。
+ *
+ *   同一个出口 → **相同**目标   `route-outcome-redundant`（warning）
+ *       走向完全一样，只是写重了。拦住它没有道理（流程本身没错），但也没必要留 ——
+ *       删掉更清楚。所以只提醒，不阻断。
  *
  * 报错指到**重复的那一条** route 自己的行，而不是节点标题行 —— 一个 20 行的节点里
  * 让你自己找哪两行冲突，等于没报。
@@ -246,19 +261,32 @@ function checkDuplicateOutcomes(
   const seen = new Map<string, FlowAstRoute>();
   for (const route of routes) {
     const previous = seen.get(route.outcome);
-    if (previous) {
+    if (!previous) {
+      seen.set(route.outcome, route);
+      continue;
+    }
+    const nodeIdField = where.nodeId ? { nodeId: where.nodeId } : {};
+    if (previous.target === route.target) {
       issues.push({
-        code: 'route-outcome-duplicate',
+        code: 'route-outcome-redundant',
+        severity: 'warning',
         line: route.line,
-        ...(where.nodeId ? { nodeId: where.nodeId } : {}),
+        ...nodeIdField,
         message:
-          `${where.label} 的出口 "${route.outcome}" 重复：` +
-          `第 ${previous.line} 行的 -> ${previous.target} 与这一行的 -> ${route.target} ` +
-          '不能同时存在（只会走第一条）',
+          `${where.label} 的出口 "${route.outcome}" 在第 ${previous.line} 行已经指向 ` +
+          `${route.target}，这一行是重复的（走向不受影响，删掉更清楚）`,
       });
       continue;
     }
-    seen.set(route.outcome, route);
+    issues.push({
+      code: 'route-outcome-duplicate',
+      line: route.line,
+      ...nodeIdField,
+      message:
+        `${where.label} 的出口 "${route.outcome}" 重复：` +
+        `第 ${previous.line} 行的 -> ${previous.target} 与这一行的 -> ${route.target} ` +
+        '不能同时存在（只会走第一条）',
+    });
   }
 }
 
@@ -439,37 +467,61 @@ export function validateSkillFlow(
 
   // 4/5/6/7. 路由合法性
   for (const node of Object.values(nodes)) {
+    // 一律走 AST 的 route（它带行号）—— 报错要指到出问题的那一行，而不是节点标题行
+    const astRoutes = astNodes[node.id]!.routes;
+    const label = `@${node.type} ${node.id}`;
+    const nodeIdField = { nodeId: node.id };
     const terminal = TERMINAL_TYPES.has(node.type);
-    if (terminal && node.routes.length) {
+    // 固定出口词汇表（gate 是空的：它的出口由注册表声明，见 6c）
+    const allowed = NODE_OUTCOMES[node.type];
+
+    if (terminal && astRoutes.length) {
       issues.push({
         code: 'terminal-has-route',
         line: node.headingLine,
-        nodeId: node.id,
-        message: `@${node.type} ${node.id} 是终态，不允许再有 route（${node.routes.map((r) => `${r.on} -> ${r.to}`).join('、')}）`,
+        ...nodeIdField,
+        message: `${label} 是终态，不允许再有 route（${astRoutes.map((r) => `${r.outcome} -> ${r.target}`).join('、')}）`,
       });
     }
-    if (!terminal && node.routes.length === 0) {
+    if (!terminal && astRoutes.length === 0) {
       issues.push({
         code: 'node-missing-route',
         line: node.headingLine,
-        nodeId: node.id,
-        message: `@${node.type} ${node.id} 没有出口（非终态节点必须至少有一条 route，如 "- success -> next"）`,
+        ...nodeIdField,
+        message: `${label} 没有出口（非终态节点必须至少有一条 route，如 "- success -> next"）`,
       });
     }
-    checkDuplicateOutcomes(astNodes[node.id]!.routes, issues, {
-      nodeId: node.id,
-      label: `@${node.type} ${node.id}`,
-    });
-    for (const route of node.routes) {
-      if (!nodes[route.to]) {
+
+    for (const route of astRoutes) {
+      // 4. target 必须存在
+      if (!nodes[route.target]) {
         issues.push({
           code: 'route-target-missing',
-          line: node.headingLine,
-          nodeId: node.id,
-          message: `@${node.type} ${node.id} 的 route "${route.on} -> ${route.to}" 指向不存在的节点："${route.to}"`,
+          line: route.line,
+          ...nodeIdField,
+          message: `${label} 的 route "${route.outcome} -> ${route.target}" 指向不存在的节点："${route.target}"`,
+        });
+      }
+      // 6a. 固定出口词汇表的节点类型**不允许"多出来的出口"**。
+      //
+      // 少了这一条，`@agent research` 写 `- retry -> retry` 会被放过：运行时 agent 只会
+      // 返回 success / fail，那条 route 永远走不到 —— 一条**假分支**。
+      // 更坏的是分析器会把这条边当真：它可能让 `retry` 看起来可达，
+      // 从而把一个本该报错的流程放行。所以出口集合必须是**严格封闭**的。
+      // （与下面的 6b 是一对：6a 管"不许多的"，6b 管"不许少的"。）
+      if (allowed.length && !allowed.includes(route.outcome)) {
+        issues.push({
+          code: 'node-unknown-outcome',
+          line: route.line,
+          ...nodeIdField,
+          message:
+            `${label} 不支持出口 "${route.outcome}"（${node.type} 只会有出口：${allowed.join(' / ')}）` +
+            '—— 这是一条永远不会走到的假分支',
         });
       }
     }
+
+    checkDuplicateOutcomes(astRoutes, issues, { nodeId: node.id, label });
   }
 
   // 6b. 出口必须写全：@agent/@action 只会有 success|fail，@review 只会有 approve|reject。
