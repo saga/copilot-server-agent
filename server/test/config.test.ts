@@ -104,3 +104,59 @@ test('COPILOT_STATE_BACKEND 非法值启动即失败', () => {
   assert.notEqual(bad.code, 0);
   assert.match(bad.stderr, /COPILOT_STATE_BACKEND 非法/);
 });
+
+/**
+ * 业务角色映射是**启动期**加载的（identity/business-roles.ts）。
+ * 配错必须启动失败：静默忽略等于"这个角色永远解析不出来"，
+ * 而那时的表现是"审批人看不到任务"，比启动失败难排查得多。
+ */
+function loadBusinessRoles(extra: Record<string, string>): { code: number; stdout: string; stderr: string } {
+  const res = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '-e',
+      "const m = await import('./src/identity/business-roles.ts'); console.log(JSON.stringify(m.listBusinessRoles()));",
+    ],
+    { cwd: serverRoot, env: { ...process.env, ...extra }, encoding: 'utf-8' },
+  );
+  return { code: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+}
+
+test('COPILOT_BUSINESS_ROLES：非法配置启动即失败', () => {
+  const cases: Array<[string, RegExp]> = [
+    ['{', /不是合法 JSON/],
+    ['{}', /必须是数组/],
+    ['[{"name":"x"}]', /缺少 id/],
+    ['[{"id":"a","match":"SOME"}]', /只能是 ANY \| ALL/],
+    ['[{"id":"a","match":"ALL","groups":[]}]', /match=ALL 但没有/],
+  ];
+  for (const [raw, pattern] of cases) {
+    const r = loadBusinessRoles({ COPILOT_BUSINESS_ROLES: raw });
+    assert.notEqual(r.code, 0, `"${raw}" 必须启动失败`);
+    assert.match(r.stderr, pattern);
+  }
+});
+
+test('COPILOT_BUSINESS_ROLES：把业务角色映射到 Entra group object ID（ID 归一化成小写）', () => {
+  const r = loadBusinessRoles({
+    COPILOT_BUSINESS_ROLES: JSON.stringify([
+      {
+        id: 'compliance.reviewer',
+        name: '合规审核人',
+        groups: ['3A7F1C2E-0000-0000-0000-000000000001'],
+        match: 'ANY',
+      },
+    ]),
+  });
+  assert.equal(r.code, 0, r.stderr);
+  const roles = JSON.parse(r.stdout.trim().split('\n').at(-1)!) as Array<{
+    id: string;
+    groups: string[];
+  }>;
+  const cr = roles.find((x) => x.id === 'compliance.reviewer')!;
+  assert.deepEqual(cr.groups, ['3a7f1c2e-0000-0000-0000-000000000001']);
+  assert.ok(roles.some((x) => x.id === 'approver'), '内置角色仍然在（配置是覆盖而不是替换）');
+});

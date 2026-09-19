@@ -113,7 +113,8 @@ SessionAccessService.assertCanSend
                  agent turn → 终稿进 agent_message + session_event
 ```
 
-会话角色（owner / member / observer）与业务角色（risk / compliance / …）是两层，不能互相替代：
+会话角色（owner / member / observer）与业务角色（risk / compliance / …）是两层，不能互相替代
+（业务角色本身怎么来的见第 11.1.1 节：SKILL.md 声明角色 → RoleRegistry → Entra/AD group → user）：
 
 | 会话角色 | view | send | manage_members | manage_session | delete |
 |---------|------|------|----------------|----------------|--------|
@@ -185,7 +186,7 @@ Business Authorization  能不能做这个业务动作、要不要人批、谁�
    session 级工具与 MCP，participant 不因自己的 membership 获得任何额外 MCP / skill / workspace /
    data capability；要被加进来，得先满足本会话的 data / capability eligibility。
    也就是 shared session = shared data boundary，这一点在邀请那一刻定死。
-4. 会话成员资格只给**协作访问权**，不给业务授权：审批仍由 `Principal.roles` → `ApprovalPolicy` 决定。
+4. 会话成员资格只给**协作访问权**，不给业务授权：审批仍由 `AuthorizationService.resolveRoles(Principal)` → `ApprovalPolicy` 决定。
    加进共享会话 ≠ 获得高风险动作的执行权。
 5. **session owner 永远不是 execution actor 的隐式替代。** 每次 human-initiated execution 都必须
    记录真实发起人：`agent_execution.user_id` 是**会话 owner**（resume 的归属校验、数据范围），
@@ -766,9 +767,14 @@ SoD 刻意只支持 `exclude: initiator` 这一个值。更复杂的冲突规则
 
 `POST /api/executions` 在**建 execution 之前**就把整份流程校验完，不过就 400 并带上行号：
 
-`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`route-outcome-duplicate`（同一个出口写了两条 route）、`node-unreachable`、`skill-missing`（`@agent` 指向的技能不存在）。
+`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`route-outcome-duplicate`（同一个出口写了两条 route）、`node-unreachable`、`skill-missing`（`@agent` 指向的技能不存在）、`block-attr-unsupported` / `block-attr-unknown` / `block-attr-duplicate`（保留属性名不对、拼错、重复）、`attr-invalid`（属性值不合法）、`role-missing`（引用了未登记的业务角色）、`review-missing-role`（`@review` 拿不到任何角色）。
 
 `route-outcome-duplicate` 是后补的一条：`findRoute()` 是 `routes.find(...)`，第一条命中就返回，后面的**静默失效**。`- pass -> review-a` 加 `- pass -> review-b` 读起来像"两种可能"，实际永远只去 `review-a`。`@flow` 的 `start` 同一条规则 —— 金融流程不该有"看书写顺序决定走向"的不确定性。
+
+保留属性的报错都指到**属性自己那一行**（不是标题行），作者一眼能看到改哪里。属性区的判定规则是
+"只认最前面连续的一段 `name: value`"：正文以 `Note: ...` 开头不会被误判成属性，但如果这一段里
+已经认领到属性，段内认不出的名字（`roles:` 这类拼错）就会报 `block-attr-unknown` ——
+既不误伤正文，也不放过笔误。
 
 顺序有讲究：跑到一半才发现某个 `- approve -> xxx` 指向不存在的节点，那时 execution 可能已经停在等待态，或者已经把业务动作提出去了。`@gate` 的出口名无法静态校验（由服务端实现决定），所以这类节点不参与 `node-missing-outcome` 检查，但运行时找不到匹配出口会立刻失败，不做"只有一个出口就兜底"的猜测。
 
