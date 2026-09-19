@@ -45,7 +45,7 @@ MCP Tool 为什么不能天然等同于 Agent Capability
 搜索 Web，结合业界研究、大厂实践和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接。
 写完后先内部 review：检查主要论点是否有充分依据、是否混淆事实与推论、是否把结论说得过头；发现问题先修改文章。
 最终只输出修改后的完整文章和参考资料，不要输出 review、分析过程、修改建议或生成过程。
-主题：“Capability-based Tool Access：Agent Tool 权限的最小化设计”
+主题：“Agent Behavior Drift：没有改代码，为什么行为也会变”
 
 
 
