@@ -1,6 +1,6 @@
 import type { SessionHooks } from '@github/copilot-sdk';
+import { executionSink } from '../execution/sink.js';
 import { recordHookEvent } from '../hooks/events.js';
-import { executionService } from '../execution/index.js';
 import { createPreToolUseGuard, type ToolPolicyContext } from './tool-policy.js';
 
 /**
@@ -11,8 +11,10 @@ import { createPreToolUseGuard, type ToolPolicyContext } from './tool-policy.js'
  *   onPostToolUseFailure  → 结束时间 + 耗时 + 错误
  *
  * 证据挂在 executionId 下（按 session 的当前 execution 关联），经 ExecutionService
- * 落 ExecutionRepository（PostgreSQL），形成
+ * 落 ExecutionRepository，形成
  *   request → execution → 策略裁决 → 工具执行 → 结果 的审计链。
+ *
+ * 依赖走 `execution/sink.ts` 而不是 wiring —— 本模块被 wiring 间接 import，直接取 wiring 会成环。
  */
 
 type ToolHook = Pick<SessionHooks, 'onPreToolUse' | 'onPostToolUse' | 'onPostToolUseFailure'>;
@@ -37,7 +39,7 @@ export function createToolEvidenceHooks(ctx: ToolPolicyContext): ToolHook {
       const decision = await guard(input, invocation);
       if (decision?.permissionDecision === 'deny') {
         const reason = decision.permissionDecisionReason ?? 'workspace guard';
-        executionService.denyToolCall({
+        executionSink().denyToolCall({
           sessionId: ctx.sessionId,
           toolName: input.toolName,
           args: input.toolArgs,
@@ -46,7 +48,7 @@ export function createToolEvidenceHooks(ctx: ToolPolicyContext): ToolHook {
         recordHookEvent(ctx.sessionId, 'tool-call', `deny ${input.toolName} reason=${reason}`);
         return decision;
       }
-      executionService.beginToolCall({
+      executionSink().beginToolCall({
         sessionId: ctx.sessionId,
         toolName: input.toolName,
         args: input.toolArgs,
@@ -55,7 +57,7 @@ export function createToolEvidenceHooks(ctx: ToolPolicyContext): ToolHook {
       return decision;
     },
     onPostToolUse: async (input) => {
-      const call = await executionService.endToolCall({
+      const call = await executionSink().endToolCall({
         sessionId: ctx.sessionId,
         toolName: input.toolName,
         result: input.toolResult,
@@ -64,7 +66,7 @@ export function createToolEvidenceHooks(ctx: ToolPolicyContext): ToolHook {
       return undefined;
     },
     onPostToolUseFailure: async (input) => {
-      const call = await executionService.endToolCall({
+      const call = await executionSink().endToolCall({
         sessionId: ctx.sessionId,
         toolName: input.toolName,
         error: input.error,

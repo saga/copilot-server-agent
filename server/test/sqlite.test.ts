@@ -1,5 +1,6 @@
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -7,8 +8,13 @@ import { test } from 'node:test';
 
 import { ActionService } from '../src/actions/action-service.js';
 import { ApprovalService } from '../src/approval/approval-service.js';
-import { currentDialect, setTestDb } from '../src/db/connection.js';
+import { currentDialect, getDb, setTestDb } from '../src/db/connection.js';
 import { SqliteDatabase } from '../src/db/sqlite.js';
+import {
+  SqlMessageRepository,
+  SqlParticipantRepository,
+  SqlSessionEventRepository,
+} from '../src/collaboration/sql-repository.js';
 import { ExecutionService } from '../src/execution/execution-service.js';
 import { SqlEventRepository, SqlExecutionRepository } from '../src/execution/sql-repository.js';
 import type { ActionIntent } from '../src/execution/types.js';
@@ -367,6 +373,10 @@ test('默认后端 = SQLite，首次连接自动建表（无需任何迁移命�
     assert.ok(out.tables.includes('human_task_decision'));
     assert.ok(out.tables.includes('execution_event'));
     assert.ok(out.tables.includes('agent_session'));
+    // 协作模型的三张表也必须自动建出来（默认后端不该要求先跑迁移脚本）
+    assert.ok(out.tables.includes('session_participant'));
+    assert.ok(out.tables.includes('agent_message'));
+    assert.ok(out.tables.includes('session_event'));
     assert.ok(existsSync(path.join(dir, 'agent.db')), '库文件应落在 $COPILOT_HOME/agent.db');
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -378,10 +388,11 @@ test('SQLite：session registry 归属与 config 跨重启保留', async () => {
   let db = open(file);
   try {
     const registry = new SessionRegistry(new SqlRegistryStore());
-    await registry.upsert({
+    await registry.create({
       sessionId: 'sess-1',
       owner: OWNER,
       workspacePath: '/workspaces/sess-1',
+      collaborationMode: 'shared',
       config: { model: 'gpt-5', skillDirs: ['/skills/a'] },
     });
 
@@ -392,14 +403,238 @@ test('SQLite：session registry 归属与 config 跨重启保留', async () => {
     const rec = await reopened.get('sess-1');
     assert.ok(rec, '重启后归属记录必须还在');
     assert.equal(rec.tenantId, 't1');
+    assert.equal(rec.collaborationMode, 'shared', 'collaboration_mode 必须往返');
     assert.equal(rec.workspacePath, '/workspaces/sess-1');
     assert.equal(rec.config?.model, 'gpt-5', 'config JSON 必须往返');
     assert.deepEqual(rec.config?.skillDirs, ['/skills/a']);
 
     // 归属校验：别的租户拿不到
-    await assert.rejects(() => reopened.assertAccess('sess-1', { tenantId: 't2', userId: 'x' }), /无权访问/);
+    await assert.rejects(() => reopened.assertOwner('sess-1', { tenantId: 't2', userId: 'x' }), /无权访问/);
+    // 模式不可变：同 id 换模式必须拒绝（不能在原地把 single 改成 shared）
+    await assert.rejects(
+      () => reopened.create({ sessionId: 'sess-1', owner: OWNER, workspacePath: '/w', collaborationMode: 'single' }),
+      /模式不同/,
+    );
     await reopened.remove('sess-1');
     assert.equal(await reopened.get('sess-1'), undefined);
+  } finally {
+    teardown(db, dir);
+  }
+});
+
+/** pragma_table_info 列出真实列名 —— 补列是否生效只能这样验 */
+async function columnsOf(db: SqliteDatabase, table: string): Promise<string[]> {
+  const { rows } = await db.query<{ name: string }>(`select name from pragma_table_info('${table}')`);
+  return rows.map((r) => r.name);
+}
+
+test('SQLite：老库文件缺协作列时自动补列（create table if not exists 补不上新增列）', async () => {
+  const { dir, file } = newWorkdir();
+  const now = new Date().toISOString();
+
+  // 用「旧版 schema」直接建库：这两张表都还没有协作相关的列
+  const ctor = createRequire(import.meta.url)('node:sqlite') as {
+    DatabaseSync: new (p: string) => { exec(sql: string): void; close(): void };
+  };
+  const legacy = new ctor.DatabaseSync(file);
+  legacy.exec(`
+    create table agent_session (
+      session_id text primary key, tenant_id text not null, user_id text not null,
+      workspace_path text not null, status text not null default 'active',
+      config text not null default '{}', created_at text not null,
+      updated_at text not null, last_used_at text);
+    create table agent_execution (
+      execution_id text primary key, session_id text not null, tenant_id text not null,
+      user_id text not null, kind text not null default 'interactive',
+      status text not null default 'created', streaming integer not null default 0,
+      tool_calls text not null default '[]', tool_calls_omitted integer not null default 0,
+      created_at text not null, updated_at text not null);
+    insert into agent_session
+      (session_id, tenant_id, user_id, workspace_path, status, config, created_at, updated_at)
+      values ('old-1', 't1', 'pm-1', '/workspaces/old-1', 'active', '{}', '${now}', '${now}');
+  `);
+  legacy.close();
+
+  const db = open(file);
+  try {
+    assert.ok((await columnsOf(db, 'agent_session')).includes('collaboration_mode'));
+    assert.ok((await columnsOf(db, 'agent_session')).includes('message_sequence'));
+    assert.ok((await columnsOf(db, 'agent_execution')).includes('initiated_by_user_id'));
+    assert.ok((await columnsOf(db, 'agent_execution')).includes('source_message_id'));
+
+    // 老数据行必须拿到 default，而不是 null：否则读出来就是 undefined，模式判定会跑偏
+    const { rows } = await db.query<{ collaboration_mode: string; message_sequence: number }>(
+      "select collaboration_mode, message_sequence from agent_session where session_id = 'old-1'",
+    );
+    assert.equal(rows[0]!.collaboration_mode, 'single');
+    assert.equal(rows[0]!.message_sequence, 0);
+
+    // 升级后老会话照旧可读可写（读路径不必区分「老库新库」）
+    const record = await new SqlRegistryStore().get('old-1');
+    assert.equal(record?.collaborationMode, 'single');
+    assert.equal(record?.workspacePath, '/workspaces/old-1');
+    assert.equal(record?.lastUsedAt, now, 'last_used_at 为空时回落到 created_at');
+  } finally {
+    teardown(db, dir);
+  }
+});
+
+test('SQLite：协作仓储往返（消息幂等 / 序号分配 / 事件游标 / 级联清理）', async () => {  const { dir, file } = newWorkdir();
+  const db = open(file);
+  const now = new Date().toISOString();
+  try {
+    const registry = new SessionRegistry(new SqlRegistryStore());
+    await registry.create({
+      sessionId: 'c-1',
+      owner: OWNER,
+      workspacePath: '/workspaces/c-1',
+      collaborationMode: 'shared',
+    });
+
+    const participants = new SqlParticipantRepository();
+    await participants.upsert({
+      sessionId: 'c-1',
+      tenantId: 't1',
+      userId: 'pm-1',
+      role: 'owner',
+      joinedAt: now,
+    });
+    await participants.upsert({
+      sessionId: 'c-1',
+      tenantId: 't1',
+      userId: 'risk-1',
+      role: 'member',
+      joinedAt: now,
+    });
+    // 同一人重复 upsert 不产生第二行（一人一行，复活而不是叠加）
+    await participants.upsert({
+      sessionId: 'c-1',
+      tenantId: 't1',
+      userId: 'risk-1',
+      role: 'observer',
+      joinedAt: now,
+    });
+    const listed = await participants.list('c-1');
+    assert.equal(listed.length, 2);
+    assert.equal(listed.find((p) => p.userId === 'risk-1')?.role, 'observer');
+    assert.deepEqual(await participants.listActiveSessionIds('t1', 'risk-1'), ['c-1']);
+
+    const messages = new SqlMessageRepository();
+    const base = { sessionId: 'c-1', tenantId: 't1', actorType: 'user' as const, createdAt: now };
+    const m1 = await messages.create({ ...base, actorId: 'pm-1', content: 'A', clientMessageId: 'k1' });
+    const duplicate = await messages.create({
+      ...base,
+      actorId: 'pm-1',
+      content: 'A',
+      clientMessageId: 'k1',
+    });
+    assert.equal(m1.created, true);
+    assert.equal(duplicate.created, false, '同 clientMessageId 必须命中已有消息');
+    assert.equal(duplicate.message.messageId, m1.message.messageId);
+    assert.equal(m1.message.sequence, 1);
+
+    // 序号来自 agent_session.message_sequence 的原子自增，不是时间戳
+    const m2 = await messages.create({ ...base, actorId: 'risk-1', content: 'B' });
+    assert.equal(m2.message.sequence, 2);
+
+    // 并发提交：同一 session 的序号必须互不重复（时间戳方案在这里会并列）
+    const many = await Promise.all(
+      Array.from({ length: 10 }, (_, i) =>
+        messages.create({ ...base, actorId: 'risk-1', content: `并发 ${i}` }),
+      ),
+    );
+    assert.equal(new Set(many.map((r) => r.message.sequence)).size, 10);
+    assert.deepEqual(
+      (await messages.list('c-1')).map((m) => m.sequence),
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      'sequence 必须连续且升序',
+    );
+
+    // clientMessageId 为空时不做去重（NULL 不等于 NULL）
+    const a = await messages.create({ ...base, content: 'no-key' });
+    const b = await messages.create({ ...base, content: 'no-key' });
+    assert.notEqual(a.message.messageId, b.message.messageId);
+
+    await messages.attachExecution(m1.message.messageId, 'ex-1');
+    assert.equal((await messages.get(m1.message.messageId))?.executionId, 'ex-1');
+
+    const events = new SqlSessionEventRepository();
+    const e1 = await events.append({ sessionId: 'c-1', type: 'message.created', actorType: 'user', createdAt: now });
+    const e2 = await events.append({
+      sessionId: 'c-1',
+      type: 'execution.queued',
+      actorType: 'system',
+      executionId: 'ex-1',
+      messageId: m1.message.messageId,
+      payload: { apiKey: 'sk-live-abcdef123456', kept: 1 },
+      createdAt: now,
+    });
+    assert.equal(e1.sequence, 1);
+    assert.equal(e2.sequence, 2);
+    assert.match(e1.eventId, /^\d+$/, 'SQLite 的 event_id 是自增整数');
+    assert.equal(e2.executionId, 'ex-1');
+    assert.equal(e2.messageId, m1.message.messageId);
+
+    assert.deepEqual((await events.listAfter('c-1', 1)).map((e) => e.type), ['execution.queued']);
+    assert.deepEqual(await events.listAfter('c-1', 2), []);
+
+    // 删会话级联清参与人 / 消息 / 事件（而 execution 不带 FK，自己删自己）
+    await getDb().query(`delete from agent_session where session_id = ${currentDialect().ph(1)}`, ['c-1']);
+    assert.deepEqual(await participants.list('c-1'), []);
+    assert.deepEqual(await messages.list('c-1'), []);
+    assert.deepEqual(await events.listAfter('c-1', 0), []);
+  } finally {
+    teardown(db, dir);
+  }
+});
+
+test('SQLite：execution 的发起人与来源消息必须读得回来（写进去 ≠ 读得到）', async () => {
+  const { dir, file } = newWorkdir();
+  const db = open(file);
+  try {
+    const { execution } = wire();
+    const exec = await execution.create({
+      sessionId: 's-attr',
+      owner: OWNER,
+      initiatedByUserId: 'risk-1',
+      kind: 'interactive',
+      sourceMessageId: 'msg-1',
+    });
+
+    // 写入路径正确不代表读回路径正确：列写了但 toRecord 没映射，运行期才炸
+    // （shared 会话的队列要靠 sourceMessageId 从会话消息恢复输入）。
+    const back = await execution.get(exec.executionId);
+    assert.equal(back?.userId, 'pm-1', 'userId 是数据归属（会话 owner）');
+    assert.equal(back?.initiatedByUserId, 'risk-1', 'initiatedByUserId 是发起人');
+    assert.equal(back?.sourceMessageId, 'msg-1');
+
+    // 列表路径同样要带上，否则 GET /api/executions 看不到是谁发起的
+    const [listed] = await execution.list({ sessionId: 's-attr' });
+    assert.equal(listed?.initiatedByUserId, 'risk-1');
+    assert.equal(listed?.sourceMessageId, 'msg-1');
+
+    // 缺省时 initiated_by_user_id 回落成 owner（single 模式两者恒相同）
+    const plain = await execution.create({ sessionId: 's-attr', owner: OWNER });
+    assert.equal((await execution.get(plain.executionId))?.initiatedByUserId, 'pm-1');
+
+    // 队列取活按 created 状态取，且顺序确定（created_at, execution_id）
+    assert.equal((await execution.nextQueued('s-attr'))?.executionId, exec.executionId);
+  } finally {
+    teardown(db, dir);
+  }
+});
+
+test('SQLite：created 的排队项可以直接落 failed（跑不起来时不该留在队头）', async () => {
+  const { dir, file } = newWorkdir();
+  const db = open(file);
+  try {
+    const { execution } = wire();
+    const exec = await execution.create({ sessionId: 's-stuck', owner: OWNER, kind: 'job' });
+    assert.equal(exec.status, 'created');
+    await execution.fail(exec.executionId, new Error('缺少来源消息'));
+    const after = await execution.get(exec.executionId);
+    assert.equal(after?.status, 'failed');
+    assert.match(after?.error ?? '', /缺少来源消息/);
   } finally {
     teardown(db, dir);
   }

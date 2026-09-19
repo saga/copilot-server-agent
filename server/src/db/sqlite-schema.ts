@@ -22,6 +22,10 @@ create table if not exists agent_session (
   user_id text not null,
   workspace_path text not null,
   status text not null default 'active',
+  -- single | shared：会话的访问模型，创建时确定、生命周期内不变
+  collaboration_mode text not null default 'single',
+  -- session 级消息序号分配器（单人模式不使用）
+  message_sequence integer not null default 0,
   config text not null default '{}',
   created_at text not null,
   updated_at text not null,
@@ -31,11 +35,31 @@ create table if not exists agent_session (
 create index if not exists idx_agent_session_owner
   on agent_session(tenant_id, user_id);
 
+-- 参与人：single 模式只登记 owner 一行，shared 登记 owner + members。
+-- 两种模式用同一张表，访问判定不需要按模式分叉。
+create table if not exists session_participant (
+  session_id text not null references agent_session(session_id) on delete cascade,
+  tenant_id text not null,
+  user_id text not null,
+  role text not null,
+  status text not null default 'active',
+  joined_at text not null,
+  left_at text,
+  primary key (session_id, user_id)
+);
+
+create index if not exists idx_session_participant_user
+  on session_participant(tenant_id, user_id, status);
+
 create table if not exists agent_execution (
   execution_id text primary key,
   session_id text not null,
   tenant_id text not null,
   user_id text not null,
+  -- 发起人：shared 会话里是发消息的 participant，绝不是 session owner
+  initiated_by_user_id text,
+  -- 触发本次执行的 session 消息（审计链 session message → execution）
+  source_message_id text,
   kind text not null default 'interactive',
   status text not null default 'created',
   input text,
@@ -123,4 +147,61 @@ create table if not exists execution_event (
 );
 
 create index if not exists idx_execution_event on execution_event(execution_id, sequence);
+
+-- 协作 transcript：应用层的会话消息（人类 + agent），不是 Copilot history 的替代品。
+-- sequence 由 agent_session.message_sequence 分配（时间戳在并发下会并列，不能做唯一次序）。
+-- client_message_id 去重：客户端重试同一条消息不会产生第二次 execution。
+create table if not exists agent_message (
+  message_id text primary key,
+  session_id text not null references agent_session(session_id) on delete cascade,
+  tenant_id text not null,
+  sequence integer not null,
+  actor_type text not null,
+  actor_id text,
+  client_message_id text,
+  content text not null,
+  execution_id text,
+  created_at text not null,
+  unique(session_id, sequence),
+  unique(session_id, client_message_id)
+);
+
+create index if not exists idx_agent_message_session on agent_message(session_id, sequence);
+
+-- 协作事件流：这个 session 对所有参与者发生了什么（与 execution_event 的职责不同：
+-- 后者是「这次 execution 发生了什么」的审计证据链）。
+create table if not exists session_event (
+  event_id integer primary key autoincrement,
+  session_id text not null references agent_session(session_id) on delete cascade,
+  sequence integer not null,
+  type text not null,
+  actor_type text not null,
+  actor_id text,
+  execution_id text,
+  message_id text,
+  payload text,
+  created_at text not null,
+  unique(session_id, sequence)
+);
+
+create index if not exists idx_session_event on session_event(session_id, sequence);
 `;
+
+/**
+ * 已有库文件的补列语句。
+ *
+ * `create table if not exists` 对**已存在**的表什么都不做：老版本建的 `agent.db` 直接升上来，
+ * 会在运行期报 `table agent_execution has no column named initiated_by_user_id`。
+ * SQLite 没有 `add column if not exists`，所以由执行器先查 `pragma_table_info` 再决定是否 alter
+ * （见 `db/sqlite.ts` 的 `applyColumnUpgrades`），重复启动安全。
+ *
+ * 与 `migrations/002_collaboration.sql` 的 `add column if not exists` 一一对应：
+ * 新增列时两处都要加，否则两个后端会在运行期漂移。
+ * 这里只允许出现「CREATE TABLE 里已经声明过的列」——`test/schema.test.ts` 会校验。
+ */
+export const SQLITE_COLUMN_UPGRADES: readonly string[] = [
+  "alter table agent_session add column collaboration_mode text not null default 'single'",
+  'alter table agent_session add column message_sequence integer not null default 0',
+  'alter table agent_execution add column initiated_by_user_id text',
+  'alter table agent_execution add column source_message_id text',
+];

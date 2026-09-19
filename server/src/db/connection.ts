@@ -17,6 +17,14 @@ let sqlite: SqliteDatabase | null = null;
 let override: SqlExecutor | null = null;
 
 /**
+ * 状态后端。比 `currentBackend()` 多一个 `memory`：
+ * `COPILOT_STATE_BACKEND=memory` 时所有仓储换成内存实现（不落盘，仅临时验证）。
+ * 类型放在这里而不是 wiring：诊断包等模块要引用它，而它们不能运行时 import wiring
+ * （wiring 在装配时就要拿到那些模块的单例，会成环）。
+ */
+export type StateBackend = DbBackend | 'memory';
+
+/**
  * 覆盖连接实例（**仅供测试**）。
  * 让用例在临时 SQLite 文件上跑同一套 SQL 仓储，从而验证列名/方言与「重启后数据仍在」，
  * 而不必改全局 config 或起真库。传 null 恢复默认行为。
@@ -27,6 +35,11 @@ export function setTestDb(executor: SqlExecutor | null): void {
 
 export function currentBackend(): DbBackend {
   return config.databaseUrl ? 'postgres' : 'sqlite';
+}
+
+/** 生效的状态后端（含 `COPILOT_STATE_BACKEND=memory` 的强制内存模式） */
+export function currentStateBackend(): StateBackend {
+  return config.stateBackend === 'memory' ? 'memory' : currentBackend();
 }
 
 export function currentDialect(): SqlDialect {

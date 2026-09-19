@@ -36,7 +36,10 @@ export function isTerminal(status: ExecutionStatus): boolean {
 
 /** 状态机：非法迁移直接抛错（业务状态必须确定，不允许任意跳变） */
 export const ALLOWED_TRANSITIONS: Record<ExecutionStatus, readonly ExecutionStatus[]> = {
-  created: ['running', 'cancelled'],
+  // created → failed：排队项在开跑之前就确定跑不起来（缺来源消息、库出错等）。
+  // 它必须在终态落地 —— 留在 created 就等于永远排在队头，调度器会反复取到同一条。
+  // 与 cancelled 的区别：cancelled 是有人取消，failed 是自己跑不起来。
+  created: ['running', 'cancelled', 'failed'],
   running: ['waiting_for_input', 'waiting_for_approval', 'completed', 'failed', 'cancelled'],
   waiting_for_input: ['resuming', 'cancelled', 'expired'],
   waiting_for_approval: ['resuming', 'rejected', 'cancelled', 'expired'],
@@ -96,6 +99,14 @@ export interface ExecutionRecord {
   sessionId: string;
   tenantId: string;
   userId: string;
+  /**
+   * 本次 execution 由谁发起。
+   * shared 会话里 userId 是会话 owner（数据归属），发起人可能是任一参与人：
+   * 审计要回答「这轮是谁让 agent 跑的」，不能把 owner 当成 actor。
+   */
+  initiatedByUserId?: string;
+  /** 触发本次 execution 的会话消息（agent_message.messageId），可回溯到原始输入 */
+  sourceMessageId?: string;
 
   kind: ExecutionKind;
   status: ExecutionStatus;
@@ -144,6 +155,8 @@ export interface ExecutionEvent {
 
 export interface ExecutionFilter {
   sessionId?: string;
+  /** 限定在若干 session 内（shared 会话的可见性判定用：调用方能看哪些 session） */
+  sessionIds?: string[];
   tenantId?: string;
   userId?: string;
   status?: ExecutionStatus;

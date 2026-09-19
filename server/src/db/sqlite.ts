@@ -10,7 +10,7 @@ import {
   type SqlExecutor,
   type SqlRow,
 } from './dialect.js';
-import { SQLITE_SCHEMA_SQL } from './sqlite-schema.js';
+import { SQLITE_COLUMN_UPGRADES, SQLITE_SCHEMA_SQL } from './sqlite-schema.js';
 
 /**
  * SQLite 后端（默认）。用 Node 内置的 `node:sqlite`，不引入任何原生依赖。
@@ -91,7 +91,25 @@ export class SqliteDatabase implements SqlExecutor {
     this.db.exec('pragma foreign_keys = ON');
     this.db.exec('pragma busy_timeout = 5000');
     this.db.exec(SQLITE_SCHEMA_SQL);
+    this.applyColumnUpgrades();
     this.loadExtensions();
+  }
+
+  /**
+   * 给已存在的表补上新增列（老库文件升级路径）。
+   * 逐条查 pragma_table_info，缺了才 alter —— 相当于 SQLite 版的 `add column if not exists`。
+   */
+  private applyColumnUpgrades(): void {
+    for (const statement of SQLITE_COLUMN_UPGRADES) {
+      const parsed = /^alter table (\w+) add column (\w+)/i.exec(statement.trim());
+      if (!parsed) continue;
+      const [, table, column] = parsed;
+      const existing = this.db
+        .prepare(`select name from pragma_table_info('${table}')`)
+        .all() as Array<{ name: string }>;
+      if (existing.some((row) => row.name === column)) continue;
+      this.db.exec(statement);
+    }
   }
 
   /** 可选扩展（如 sqlite-vec）：配了路径才加载，失败只记日志不影响启动 */

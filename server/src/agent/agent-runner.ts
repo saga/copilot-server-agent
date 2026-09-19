@@ -1,5 +1,6 @@
 import type { CopilotSession } from '@github/copilot-sdk';
-import { executionService, type LlmUsageSample } from '../execution/index.js';
+import { executionSink } from '../execution/sink.js';
+import type { LlmUsageSample } from '../execution/usage.js';
 import { EXECUTION_EVENT_TYPES } from '../execution/types.js';
 import type { AgentTurnHandlers, AgentTurnResult } from './agent-events.js';
 
@@ -9,6 +10,8 @@ import type { AgentTurnHandlers, AgentTurnResult } from './agent-events.js';
  * route/service 不再出现 session.on(...) / sendAndWait / setModel —— 将来换
  * backend（Copilot / Claude Agent SDK / OpenAI Agents）只改这里，
  * 路由、workflow、HITL 都不用动。
+ *
+ * 写证据走 `execution/sink.ts` 而不是 wiring —— 本模块被 wiring 间接 import，直接取 wiring 会成环。
  */
 
 export interface RunTurnInput {
@@ -25,11 +28,11 @@ export interface RunTurnInput {
 function attachUsageListener(session: CopilotSession, executionId: string): () => void {
   const offUsage = session.on('assistant.usage', (evt) => {
     const data = (evt as unknown as { data?: LlmUsageSample }).data;
-    if (data) void executionService.addUsage(executionId, data);
+    if (data) void executionSink().addUsage(executionId, data);
   });
   const offInfo = session.on('session.usage_info', (evt) => {
     const data = (evt as unknown as { data?: { tokenLimit?: number } }).data;
-    void executionService.setContextWindow(executionId, data?.tokenLimit);
+    void executionSink().setContextWindow(executionId, data?.tokenLimit);
   });
   return () => {
     offUsage();
@@ -41,7 +44,7 @@ export async function runTurn(input: RunTurnInput): Promise<AgentTurnResult> {
   const { session, executionId, prompt, model, handlers } = input;
   let chars = 0;
 
-  await executionService.appendEvent({
+  await executionSink().appendEvent({
     executionId,
     type: EXECUTION_EVENT_TYPES.agentStarted,
     actorType: 'agent',

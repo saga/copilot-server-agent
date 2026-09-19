@@ -34,6 +34,11 @@ export interface ExecutionRepository {
     patch: Partial<ExecutionRecord>,
   ): Promise<ExecutionRecord | undefined>;
   list(filter?: ExecutionFilter): Promise<ExecutionRecord[]>;
+  /**
+   * 队列里的下一条：同一 session 内最早创建、仍未开始的 execution。
+   * `created` 状态本身就是队列项，不需要另建队列表。
+   */
+  nextCreated(sessionId: string): Promise<ExecutionRecord | undefined>;
   stats(): Promise<ExecutionStats>;
 }
 

@@ -1,7 +1,8 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { humanTaskService } from '../execution/index.js';
-import { principalOf, requireAdmin, sendServiceError } from './shared.js';
+import { executionService, humanTaskService } from '../wiring.js';
+import { config } from '../config.js';
+import { assertSessionVisible, principalOf, requireAdmin, sendServiceError } from './shared.js';
 
 export const humanTaskRouter = Router();
 
@@ -51,14 +52,27 @@ humanTaskRouter.get('/all', requireAdmin, async (req, res, next) => {
   }
 });
 
+/**
+ * GET /api/human-tasks/:id — 单个任务 + 决策记录。
+ *
+ * 读路径额外要求「能访问任务所属的会话」：任务挂在 execution 上，execution 挂在 session 上，
+ * 不校验就靠猜 taskId 就能读到别的会话的审批内容。
+ * 审批/输入/委派/取消不做这一层 —— 那些由 ApprovalPolicy 的资格判定把关：
+ * 审批人不一定在共享会话里（风险/合规岗常常不在），把成员资格当审批资格会误伤。
+ */
 humanTaskRouter.get('/:id', async (req, res, next) => {
   try {
-    const task = await humanTaskService.get(String(req.params.id));
-    if (!task) return res.status(404).json({ error: `human task 不存在："${req.params.id}"` });
+    const id = String(req.params.id);
+    const task = await humanTaskService.get(id);
+    if (!task) return res.status(404).json({ error: `human task 不存在："${id}"` });
+    if (config.trustIdentityHeaders) {
+      const execution = await executionService.get(task.executionId);
+      if (execution) await assertSessionVisible(execution.sessionId, principalOf(req));
+    }
     const decisions = await humanTaskService.repository.listDecisions(task.taskId);
     return res.json({ task, decisions });
   } catch (err) {
-    return next(err);
+    return sendServiceError(res, err, next);
   }
 });
 

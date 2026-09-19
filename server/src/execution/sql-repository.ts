@@ -34,6 +34,12 @@ function toRecord(r: ExecutionRow): ExecutionRecord {
     sessionId: String(r.session_id),
     tenantId: String(r.tenant_id),
     userId: String(r.user_id),
+    // 发起人与数据归属是两个字段：userId 是会话 owner，initiatedByUserId 是发起人。
+    // 读回来必须带上，否则 shared 会话的队列从 created 恢复输入时会拿不到 sourceMessageId。
+    ...(typeof r.initiated_by_user_id === 'string'
+      ? { initiatedByUserId: r.initiated_by_user_id }
+      : {}),
+    ...(typeof r.source_message_id === 'string' ? { sourceMessageId: r.source_message_id } : {}),
     kind: (r.kind ?? 'interactive') as ExecutionRecord['kind'],
     status: r.status as ExecutionRecord['status'],
     createdAt: iso(r.created_at) ?? new Date(0).toISOString(),
@@ -69,6 +75,8 @@ const COLUMNS = [
   'session_id',
   'tenant_id',
   'user_id',
+  'initiated_by_user_id',
+  'source_message_id',
   'kind',
   'status',
   'input',
@@ -102,6 +110,8 @@ function toValues(rec: ExecutionRecord): unknown[] {
     rec.sessionId,
     rec.tenantId,
     rec.userId,
+    rec.initiatedByUserId ?? null,
+    rec.sourceMessageId ?? null,
     rec.kind,
     rec.status,
     jsonParam(rec.input),
@@ -176,6 +186,15 @@ export class SqlExecutionRepository implements ExecutionRepository {
       where.push(`${col} = ${dialect.ph(params.length)}`);
     };
     if (filter.sessionId) push('session_id', filter.sessionId);
+    if (filter.sessionIds) {
+      if (!filter.sessionIds.length) return [];
+      // 动态占位：数量取决于调用方可访问的 session 数
+      const placeholders = filter.sessionIds.map((id) => {
+        params.push(id);
+        return dialect.ph(params.length);
+      });
+      where.push(`session_id in (${placeholders.join(', ')})`);
+    }
     if (filter.tenantId) push('tenant_id', filter.tenantId);
     if (filter.userId) push('user_id', filter.userId);
     if (filter.status) push('status', filter.status);
@@ -190,8 +209,22 @@ export class SqlExecutionRepository implements ExecutionRepository {
     return rows.map(toRecord);
   }
 
-  async stats(): Promise<ExecutionStats> {
+  /** 队列里最早创建、仍未开始的那条（created 状态即排队中） */
+  async nextCreated(sessionId: string): Promise<ExecutionRecord | undefined> {
     const dialect = d();
+    // 队列取活：FIFO。created_at 是毫秒级 ISO 串，同一毫秒内会并列，
+    // 因此再按 execution_id 定序 —— 它是确定的，两个后端因此给出同一个答案。
+    const { rows } = await getDb().query<ExecutionRow>(
+      `select * from agent_execution
+       where session_id = ${dialect.ph(1)} and status = 'created'
+       order by created_at asc, execution_id asc limit 1`,
+      [sessionId],
+    );
+    const row = rows[0];
+    return row ? toRecord(row) : undefined;
+  }
+
+  async stats(): Promise<ExecutionStats> {    const dialect = d();
     const { rows } = await getDb().query<SqlRow>(
       `select
          ${dialect.asInt('count(*)')} as tracked,

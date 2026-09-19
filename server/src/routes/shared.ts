@@ -2,8 +2,11 @@ import type { NextFunction, Request, Response } from 'express';
 import { z } from 'zod';
 import type { MCPServerConfig } from '@github/copilot-sdk';
 import { config } from '../config.js';
+import { serviceErrorStatus } from '../middleware/error-status.js';
 import { ownerFromHeaders } from '../services/session-service.js';
-import { principalFromHeaders } from '../services/principal.js';
+import { principalFromHeaders, type Principal } from '../services/principal.js';
+import type { ResolvedSessionAccess } from '../services/session-access.js';
+import { sessionAccessService } from '../wiring.js';
 
 /**
  * 路由公共件：管理鉴权、身份解析、请求 schema。
@@ -25,14 +28,38 @@ export function ownerOf(req: Request) {
   return ownerFromHeaders(req.headers);
 }
 
-/** 归属/不存在类错误 → 403/404（避免每个路由重复 if） */
+/**
+ * execution / human task 的可见性跟着它所属的 session 走：
+ * shared 会话里，参与者能看到同会话中别人发起的 execution（这正是协作的语义）。
+ * 归属过滤（tenantId/userId）不足以表达这一点，所以统一按 session 判定。
+ * principal 由调用方传入：避免在这里重新解析请求头。
+ */
+export async function assertSessionVisible(sessionId: string, principal: Principal): Promise<void> {
+  await sessionAccessService.assertCanView(sessionId, principal);
+}
+
+/** 调用方可见的 sessionId 集合（自己拥有的 + 自己参与的 active 会话） */
+export function visibleSessionIds(principal: Principal): Promise<string[]> {
+  return sessionAccessService.visibleSessionIds(principal);
+}
+
+/** 能否向该 session 提交工作：shared 会话里 observer 只读，送不进去 */
+export async function assertSessionSendable(
+  sessionId: string,
+  principal: Principal,
+): Promise<ResolvedSessionAccess> {
+  return sessionAccessService.assertCanSend(sessionId, principal);
+}
+
+/**
+ * 权限/归属/校验类错误 → 403/404/400（避免每个路由重复 if）。
+ * 判定规则集中在 middleware/error-status.ts，与兜底 errorHandler 共用一份，防止两处漂移。
+ * 认不出的错误继续 next(err)，由兜底按 500 处理。
+ */
 export function sendServiceError(res: Response, err: unknown, next: NextFunction): unknown {
   const message = err instanceof Error ? err.message : String(err);
-  if (/无权访问/.test(message)) return res.status(403).json({ error: message });
-  if (/不存在|无法恢复|无法删除/.test(message)) return res.status(404).json({ error: message });
-  if (/非法|缺少|必须|已关闭|已过期|不能重复|不是/.test(message)) {
-    return res.status(400).json({ error: message });
-  }
+  const status = serviceErrorStatus(message);
+  if (status) return res.status(status).json({ error: message });
   return next(err);
 }
 
@@ -94,12 +121,24 @@ export const sessionConfigSchema = z.object({
 
 export const createSessionSchema = sessionConfigSchema.extend({
   sessionId: sessionIdSchema.optional(),
+  /**
+   * 访问模型（缺省 single）。
+   * 命名刻意避开 SDK 的 `mode: "empty"`：那是 runtime/工具模式，这是业务会话模式，两者不能混。
+   */
+  collaborationMode: z.enum(['single', 'shared']).default('single'),
 });
 
 export const chatSchema = z.object({
   prompt: z.string().min(1, 'prompt 不能为空'),
   streaming: z.boolean().optional().default(false),
   model: z.string().optional(),
+  /** 客户端幂等键（shared 必需场景）：重试同一条消息不会产生第二次 execution */
+  clientMessageId: z.string().min(1).max(128).optional(),
+});
+
+export const addParticipantSchema = z.object({
+  userId: z.string().min(1, 'userId 不能为空').max(128),
+  role: z.enum(['member', 'observer']).optional().default('member'),
 });
 
 export const actionSchema = z.object({

@@ -34,12 +34,21 @@ export interface ExecutionServiceDeps {
 
 export interface CreateExecutionInput {
   sessionId: string;
+  /**
+   * 数据归属 = 会话 owner（不是发起人）。
+   * 它决定 resume 时的归属校验能否通过：shared 会话的发起人只是 participant，
+   * 拿他去做 owner 校验会被 registry 拒掉。
+   */
   owner: SessionOwner;
+  /** 谁让这轮 agent 跑起来；缺省等于 owner（single 模式下两者恒相同） */
+  initiatedByUserId?: string;
   kind?: ExecutionKind;
   prompt?: string;
   model?: string;
   streaming?: boolean;
   input?: unknown;
+  /** 会话消息 id（shared：execution 挂到触发它的那条 message 上） */
+  sourceMessageId?: string;
 }
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -82,6 +91,11 @@ export class ExecutionService {
     return this.deps.repository.list(filter);
   }
 
+  /** 队列里的下一条：同一 session 内最早创建、仍未开始（shared 会话的 drain 靠它取活） */
+  nextQueued(sessionId: string): Promise<ExecutionRecord | undefined> {
+    return this.deps.repository.nextCreated(sessionId);
+  }
+
   stats(): Promise<ExecutionStats> {
     return this.deps.repository.stats();
   }
@@ -110,6 +124,8 @@ export class ExecutionService {
       sessionId: input.sessionId,
       tenantId: input.owner.tenantId,
       userId: input.owner.userId,
+      initiatedByUserId: input.initiatedByUserId ?? input.owner.userId,
+      ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}),
       kind: input.kind ?? 'interactive',
       status: 'created',
       createdAt: now,
@@ -364,7 +380,7 @@ export class ExecutionService {
         ...(opts.resourceVersion ? { resourceVersion: opts.resourceVersion } : {}),
       },
       policy: verdict.policy,
-      initiatedBy: rec.userId,
+      initiatedBy: rec.initiatedByUserId ?? rec.userId,
     });
     await this.transition(executionId, 'waiting_for_approval', {
       currentHumanTaskId: task.taskId,
@@ -414,7 +430,7 @@ export class ExecutionService {
       ...(input.eligibleRoles ? { eligibleRoles: input.eligibleRoles } : {}),
       ...(input.eligibleUsers ? { eligibleUsers: input.eligibleUsers } : {}),
       ...(input.payload ? { payload: input.payload } : {}),
-      initiatedBy: rec.userId,
+      initiatedBy: rec.initiatedByUserId ?? rec.userId,
     });
     await this.transition(input.executionId, 'waiting_for_input', {
       currentHumanTaskId: task.taskId,
@@ -516,7 +532,7 @@ export class ExecutionService {
         actionHash: hashAction(intent),
       },
       policy: verdict.policy,
-      initiatedBy: rec.userId,
+      initiatedBy: rec.initiatedByUserId ?? rec.userId,
     });
     await this.transition(executionId, 'waiting_for_approval', { currentHumanTaskId: task.taskId });
     await this.eventLog.append({

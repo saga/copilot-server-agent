@@ -1,9 +1,11 @@
-import { executionService } from '../execution/index.js';
+import { executionSink, hasExecutionSink } from '../execution/sink.js';
 
 /**
  * Hook 事件环：内置 hook 处理器把关键事件记在这里，供 GET /api/hooks 查询与审计。
  * 只保留最近 N 条、纯内存（进程重启即清空；要持久审计请接外部日志）。
  * executionId 在记录时按 session 的当前 execution 补齐，调用方不用自己传。
+ *
+ * 依赖走 `execution/sink.ts` 而不是 wiring —— 本模块被 wiring 间接 import，直接取 wiring 会成环。
  */
 export type HookEventKind =
   | 'session-start'
@@ -27,7 +29,8 @@ const MAX_EVENTS = 200;
 const ring: HookEvent[] = [];
 
 export function recordHookEvent(sessionId: string, kind: HookEventKind, detail: string): void {
-  const executionId = executionService.activeFor(sessionId);
+  // 装配前（如单测直接调用）只记事件、不挂 executionId，不因此抛错
+  const executionId = hasExecutionSink() ? executionSink().activeFor(sessionId) : undefined;
   ring.push({
     ts: new Date().toISOString(),
     sessionId,

@@ -31,11 +31,7 @@ export type {
 export { LlmUsageAccumulator } from './usage.js';
 export type { LlmUsageSample, UsageRecord } from './usage.js';
 export { preview, redactSecrets, truncate, REDACTED } from './redact.js';
-export {
-  actionService,
-  approvalService,
-  executionService,
-  humanTaskService,
-  stateBackend,
-  type StateBackend,
-} from '../wiring.js';
+
+// 注意：单例（executionService / humanTaskService / actionService / approvalService / stateBackend）
+// 由 `wiring.ts` 装配并从那里导入。这里刻意不 re-export，否则 execution 层会把 wiring 拉进
+// 自己的依赖图，形成 session-service → execution → wiring → session-service 的循环。

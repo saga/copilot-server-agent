@@ -38,7 +38,7 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | POST | `/api/mcp/test` `{ name? , server? }`（二选一） | MCP 连通性自检（不建会话、不执行命令；local 查可执行文件，http 发 8s 超时 GET） |
 | GET | `/api/debug` | 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime） |
 | GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计；带 `executionId`） |
-| GET | `/api/executions` `?sessionId=&status=&limit=` | execution 记录（usage + tool 证据）与统计 |
+| GET | `/api/executions` `?sessionId=&status=&limit=` | execution 记录（usage + tool 证据）与统计。多租户下按**可见会话**收窄（自己拥有的 + 自己参与的） |
 | GET | `/api/executions/:id` | 单条 execution（含 `toolCalls` / `usage` / `actionIntent` / 终态） |
 | GET | `/api/executions/:id/events` | **审计时间线**：谁批准、何时、依据什么 hash、后来为什么执行 |
 | GET | `/api/executions/:id/tasks` | 该 execution 挂起/已决的人工任务 |
@@ -52,12 +52,23 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | POST | `/api/human-tasks/:id/input` `{ values }` | 人工补数据（按 `inputSchema` 校验，不是自由文本） |
 | POST | `/api/human-tasks/:id/delegate` `{ toUserId, reason? }` | 委派（留痕 from/to/by/at + reason） |
 | POST | `/api/human-tasks/:id/cancel` | 取消任务 |
-| POST | `/api/sessions` `{ model?, sessionId?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers?, hooks?, sessionContext?, agentStopChecklist? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话） |
-| GET | `/api/sessions` | **当前调用方**的会话（按 Session Registry 归属过滤；刚建未对话的会话 runtime 尚未落盘，可能不在列表） |
-| GET | `/api/sessions/:id` | 单个会话元信息（越权 `403`） |
-| POST | `/api/sessions/:id/resume` `{ 与创建相同的重配项 }` | 恢复会话 → `{ sessionId, resumed }`（BYOK 凭证服务端自动重传；越权 `403`） |
-| POST | `/api/sessions/:id/chat` `{ prompt, streaming?, model? }` | 每次请求 = 一个 execution。`streaming:false` 返回 `{ sessionId, executionId, content, usage }`；`true` 返回 SSE（`execution/delta/message/subagent/done/error`）。同一 session 的 turn 串行；客户端断开即 `abort` 当前 turn，execution 记 `cancelled` |
+| POST | `/api/sessions` `{ model?, sessionId?, collaborationMode?, systemMessage?, agents?, customAgents?, agent?, skillDirs?, disabledSkills?, noBuiltinSkills?, defaultAgentExcludedTools?, mcp?, mcpServers?, disabledMcpServers?, hooks?, sessionContext?, agentStopChecklist? }` | 创建会话 → `{ sessionId }`（传 `sessionId` 即为可恢复会话）。`collaborationMode: "single" \| "shared"` 缺省 `single`，创建后不可修改 |
+| GET | `/api/sessions` | **当前调用方**的会话（自己拥有的 + 自己参与的；刚建未对话的会话 runtime 尚未落盘，可能不在列表） |
+| GET | `/api/sessions/:id` | 单个会话元信息，含 `collaborationMode` / `owner` / `participants`（越权 `403`） |
+| POST | `/api/sessions/:id/resume` `{ 与创建相同的重配项 }` | 恢复会话 → `{ sessionId, resumed }`（BYOK 凭证服务端自动重传；越权 `403`）。**不接受 `collaborationMode`**（传了 400：模式不可变） |
+| POST | `/api/sessions/:id/chat` `{ prompt, streaming?, model?, clientMessageId? }` | 每次请求 = 一个 execution。**single**：`streaming:false` 返回 `{ sessionId, executionId, content, usage }`，`true` 返回 SSE（`execution/delta/message/subagent/done/error`）；**shared**：落消息 → 入队 → `202 { sessionId, collaborationMode, messageId, executionId, status, reused, eventsUrl }`，结果走 `eventsUrl` |
+| GET | `/api/sessions/:id/participants` | 参与人列表 `{ participants: [{ userId, role, status, joinedAt, leftAt? }] }`（需 `view`） |
+| POST | `/api/sessions/:id/participants` `{ userId, role? }` | owner 邀请成员（`role: member \| observer`，需 `manage_members`；single 会话 400）→ `201 { participant }` |
+| DELETE | `/api/sessions/:id/participants/:userId` | 移除成员（置 `removed` 留痕；不能移除 owner） |
+| POST | `/api/sessions/:id/leave` | 成员自己退出（置 `left`；owner 不能退出） |
+| GET | `/api/sessions/:id/messages` `?limit=` | 会话 transcript（人类 + agent，按 `sequence` 升序） |
+| GET | `/api/sessions/:id/events` | **协作事件流（SSE）**：`participant.*` / `message.created` / `execution.queued\|started\|completed\|failed` / `assistant.message` / `assistant.delta`。支持 `?after=<sequence>` 或 `Last-Event-ID` 断线续传 |
 | DELETE | `/api/sessions/:id` | 默认断开内存附着（保留磁盘，可 resume）；`?permanent=true` 彻底删除，不可恢复。两者都排队在当前 agent turn 之后执行 |
+
+状态码约定：**越权一律 `403`**（如 `无权发消息到 session`、`无权管理成员`、`无权删除`）、
+对象不存在 `404`、请求写错 `400`（参数非法、模式不可变、不能移除/退出 owner 等业务规则）、
+其余未识别错误 `500`。判定规则集中在 `server/src/middleware/error-status.ts`，路由与兜底共用一份，
+逐条文案由 `server/test/http-errors.test.ts` 覆盖（详见 `docs/architecture.md` §10）。
 
 前端示例见 `client/src/lib/api.ts`（`api.health/createSession/chat/chatStream`）和 `client/src/components/Chat.tsx`。
 
@@ -91,8 +102,46 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 
 参考官方 session-persistence / mcp 两篇文档：
 
-- **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 按归属列会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。归属与 execution 同库（默认 SQLite），重启后不会退化成“谁先访问谁认领”。
+- **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 按「自己拥有的 + 自己参与的」列会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。归属与 execution 同库（默认 SQLite），重启后不会退化成“谁先访问谁认领”。
 - **MCP**（`server/src/mcp/registry.ts`）：内置 `filesystem` 预设（官方 server，授权目录限定仓库根，可用 `COPILOT_MCP_FS_DIR` 改、`COPILOT_MCP_FILESYSTEM=false` 关）；运维经 `COPILOT_MCP_SERVERS`（JSON）预置额外 servers；前端建会话用 `mcp: [...]` 按名启用、`disabledMcpServers` 精确禁用。安全门：内联 `local/stdio` MCP = 在服务器执行任意命令，默认 400 拒绝（`COPILOT_ALLOW_INLINE_MCP_LOCAL=true` 才放行）；内联 `http/sse` 默认允许。`GET /api/mcp` 只返回元信息，headers/env 密钥永不外泄。
+
+## Session 访问模型（single / shared）
+
+会话的访问模型在创建时确定，**生命周期内不变**：
+
+| | `single`（缺省） | `shared` |
+|---|---|---|
+| 谁能进 | 只有 owner | owner + participants（member / observer） |
+| 提交路径 | 直接执行（HTTP → session lock → agent turn） | 消息落库 → execution(`created`) 入队 → `202` |
+| 结果怎么拿 | SSE（`POST /:id/chat`） | 会话事件流（`GET /:id/events`，带游标） |
+| Copilot runtime | 每个会话一个 | **仍是每个会话一个**，同一时刻最多一个 agent turn |
+
+```bash
+# 建共享会话 → 拉两个人 → 各发一条
+curl -X POST localhost:3001/api/sessions -H 'content-type: application/json' \
+  -d '{"sessionId":"user-pm-task-42","collaborationMode":"shared"}'
+curl -X POST localhost:3001/api/sessions/user-pm-task-42/participants \
+  -H 'content-type: application/json' -d '{"userId":"risk-1","role":"member"}'
+curl -X POST localhost:3001/api/sessions/user-pm-task-42/chat \
+  -H 'content-type: application/json' -d '{"prompt":"查一下这笔的持仓","clientMessageId":"cli-1"}'
+# → 202 { sessionId, messageId, executionId, status, reused, eventsUrl }
+# 结果订阅 GET /api/sessions/user-pm-task-42/events（支持 ?after=<sequence> / Last-Event-ID 续传）
+```
+
+- 字段叫 `collaborationMode` 而不是 `mode`：后者是 SDK 的 runtime/工具模式（`mode: "empty"`），两者不能混。
+- **会话角色 vs 业务角色**：`owner / member / observer` 决定「能不能进这个会话、能不能发消息」；
+  `risk / compliance / …` 决定「能不能批准某笔业务」。加进共享会话 ≠ 获得高风险动作的执行权。
+  observer 只读，member 能发消息但不能管成员，owner 全能。
+- **成员资格由 owner 控制**（邀请制）：参与者共享同一个 conversation / workspace / data scope
+  与 session 级工具、MCP 能力，所以「这个人的数据权限是否覆盖本会话的数据范围」在邀请那一刻判定。
+- **队列就是 execution 表**：`status='created'` 即「排队中」，同一 session 串行、跨 session 并行
+  （另有全局闸门）。不用另建队列表 —— 多一张表就多一处不一致要维护。
+- **幂等**：`clientMessageId` 命中的重试沿用已有消息与 execution，不会跑两次 agent turn。
+- **发起人 ≠ owner**：`agent_execution.user_id` 记会话 owner（resume 归属校验用），
+  `initiated_by_user_id` 记发起人（审计与「发起人不能自批」）。
+- **可见性跟着会话走**：shared 会话里参与者能看到同会话中别人发起的 execution 与待办任务。
+- `replicas: 1` 是这份模型的前提（进程内队列与事件广播）。多副本要换 DB 租约 + runtime affinity，
+  见 [`docs/architecture.md`](docs/architecture.md) 第 7 节。
 
 ## 并发隔离与多租户安全
 
@@ -102,8 +151,10 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 |----|------|---------|
 | attach lock | `sessionAttachLocks` | 并发首访只 resume 一次，避免同一 runtime session 双附着 |
 | chat lock | `withSessionLock` 覆盖整个 `sendAndWait()` | `session.send()` 只是入队就返回，锁必须持续到 `session.idle`，否则同一 session 两个 turn 会同时写 workspace |
+| 会话队列 | `SessionCoordinator`（per-session 链式 drain） | shared 会话的多个请求排成一条线：`created` 的 execution 即队列项，同一 session 同一时刻只跑一个 turn，跨 session 并行 |
 | lifecycle lock | `disconnect` / `permanent delete` 走同一个 session lock | 不在 agent 正在写文件时删 workspace / 删 runtime session |
-| Session Registry | `server/src/services/session-registry.ts`（`SqlRegistryStore`，与 execution 同库） | 重启后归属不丢，杜绝“谁先访问谁认领” |
+| Session Registry | `server/src/services/session-registry.ts`（`SqlRegistryStore`，与 execution 同库） | 重启后归属不丢，杜绝“谁先访问谁认领”。写入按意图拆开（`create` / `saveConfig` / `touch` / `setCollaborationMode`），不用万能 upsert —— 那会在「Bob resume Alice 的共享会话」时把 owner 覆盖成 Bob |
+| 会话访问判定 | `server/src/services/session-access.ts` | 唯一回答「谁能进这个会话、能做什么」的地方（single 看 owner，shared 看 active participant） |
 | 全局并发闸门 | `server/src/services/concurrency.ts` | `COPILOT_MAX_CONCURRENT_EXECUTIONS`：限制同时运行的 agent turn，避免 N 个用户烧满 runtime |
 | 工具授权 | `server/src/services/tool-policy.ts` | 取代 `approveAll`：write 限 workspace、bash 按策略、MCP 按会话启用名单、URL 过 SSRF + 域名 allowlist |
 | 执行前守卫 | `onPreToolUse`（强制 hook，请求关不掉） | 写类工具路径必须在 session workspace |
@@ -111,7 +162,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 
 要点：
 
-- **归属**：`x-tenant-id` / `x-user-id` 只有在网关/IAP 会剥离客户端自带头时才可信 —— 由 `COPILOT_TRUST_IDENTITY_HEADERS=true` 显式开启（默认关闭 = 单租户，所有请求按 `default/default`）。归属判定统一走 `assertOwnership()`，路由不再各写一份。
+- **归属**：`x-tenant-id` / `x-user-id` 只有在网关/IAP 会剥离客户端自带头时才可信 —— 由 `COPILOT_TRUST_IDENTITY_HEADERS=true` 显式开启（默认关闭 = 单租户，所有请求按 `default/default`）。归属校验（`assertOwner`，只回答「你是 owner 吗」）与「你能做什么」（`SessionAccessService.assertCan*`）是两件事，后者是唯一的访问判定入口，路由不再各写一份。
 - **SSE**：流式仍然是 SSE，但 lock 内用 `sendAndWait()`；delta 事件照样实时出来。监听器也在锁内注册，避免并发请求互收对方增量。
 - **断开**：客户端断开 = `session.abort()` 当前 turn（不是断开 session），之后还能继续对话。
 - **workspace 是软隔离**：`workingDirectory` 只是默认 cwd，`bash` 仍能 `cd` 出去。策略层按 `possiblePaths` 拦截、写类工具按路径拦截；不可信代码场景仍需 per-request container。
@@ -133,26 +184,34 @@ COPILOT_DB_PATH=/var/lib/copilot/agent.db npm run dev:server   # 需要改路径
 ```bash
 npm i pg                                                     # 可选依赖，不用 PG 时不需要装
 psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
+psql "$DATABASE_URL" -f server/src/db/migrations/002_collaboration.sql
 DATABASE_URL=postgres://user:pass@host:5432/copilot npm run dev:server
 ```
 
-五张表：`agent_session`、`agent_execution`、`human_task`、`human_task_decision`、`execution_event`。
-两种后端**共用同一份 SQL 仓储实现**（`execution|human-tasks/sql-repository.ts`），
+八张表：`agent_session`、`session_participant`、`agent_message`、`session_event`、
+`agent_execution`、`human_task`、`human_task_decision`、`execution_event`。
+两种后端**共用同一份 SQL 仓储实现**（`execution|human-tasks|collaboration/sql-repository.ts`），
 差异只有方言，收敛在 `server/src/db/dialect.ts`：占位符、JSON 列编解码、布尔/时间戳表示、
 JSON 数组命中判定、聚合取整。业务层只认 `repository.ts` 里的接口，换存储不改代码。
+
+两种后端都支持**已有库文件的升级**：PG 侧是 `002` 里的 `add column if not exists`；
+SQLite 侧是 `create table if not exists` 补不上新增列，所以启动时按 `SQLITE_COLUMN_UPGRADES`
+逐条查 `pragma_table_info`、缺列才 `alter table`。老 `agent.db` 直接升上来不会缺列
+（`test/sqlite.test.ts` 用一份旧版 DDL 建库来验这条路径）。
 
 依赖装配在 `server/src/wiring.ts`（唯一一处决定后端的地方），启动日志会打印实际后端：
 
 ```text
 [wiring] durable state = SQLite：/Users/you/.copilot/agent.db
-[wiring] durable state = PostgreSQL（execution/human task/approval/event/ownership）
+[wiring] durable state = PostgreSQL（execution/human task/approval/event/ownership/collaboration）
 ```
 
-`COPILOT_STATE_BACKEND=memory` 可强制内存实现（不落盘，重启即丢，仅临时验证）。
+`COPILOT_STATE_BACKEND=memory` 可强制内存实现（不落盘，重启即丢，仅临时验证）：
+execution / human task / 归属表 / 协作表全部换成内存实现。
 
 **SQLite 的部署约束**：单文件、单写者，因此必须单副本部署（`k8s/deployment.yaml` 已固定
-`replicas: 1`），库文件必须落在持久卷上。需要多副本时切 PostgreSQL —— 但注意 session 锁与
-session 对象仍是进程内的，多副本还需分布式锁。
+`replicas: 1`），库文件必须落在持久卷上。需要多副本时切 PostgreSQL —— 但注意 session 锁、
+会话队列、session 对象与 session 事件广播仍是进程内的，多副本还需分布式锁与 runtime affinity。
 
 ## Execution Record（执行审计）
 
@@ -168,6 +227,8 @@ session ── execution #1 ── LLM ── tool ── tool
 ```jsonc
 {
   "executionId": "ex_…", "sessionId": "…", "tenantId": "…", "userId": "…",
+  "initiatedByUserId": "…",     // 谁让 agent 跑的（shared 会话里可能是别的参与者）
+  "sourceMessageId": "msg_…",   // 触发本次执行的会话消息（shared）
   "startedAt": "…", "completedAt": "…", "durationMs": 4646,
   "status": "completed",        // created|running|waiting_for_input|waiting_for_approval|resuming
                                 // |completed|failed|cancelled|rejected|expired
@@ -250,6 +311,7 @@ agent 侧入口（可选）：`scripts/governance-mcp.mjs` 是 stdio MCP server�
 npm run check:versions     # SDK / runtime / K8s 镜像 tag 四处版本必须一致
 npm run verify:agent-tools # custom agent 工具是否真能调用（只认 tool.execution_start）
 npm run test               # execution 审计（脱敏/usage/tool 证据）+ 配置 smoke（非法值必须启动失败）
+                           # + 两份 DDL 逐列比对 + SQLite 端到端（含老库补列）+ 协作模型（访问矩阵/幂等/队列串行/事件游标）
 ```
 
 SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移会触发协议不兼容，且本服务依赖若干 SDK workaround。`verify:agent-tools` 对应 SDK issue #2356 —— 只看 `subagent.selected` 不够，必须看到 `tool.execution_start`。
@@ -274,18 +336,21 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 ## 服务端结构
 
 - `server/src/services/session-service.ts` — `SessionService` 单例（Client 生命周期 + 会话管理 + attach/chat/lifecycle 三把锁 + 诊断包）
-- `server/src/services/session-registry.ts` — 持久归属表 + resume 用会话配置（凭证不落库）
+- `server/src/services/session-registry.ts` — 持久归属表 + `collaboration_mode` + resume 用会话配置（凭证不落库）；内存实现只给 `COPILOT_STATE_BACKEND=memory` 与单测
+- `server/src/services/session-access.ts` — `SessionAccessService`：唯一的会话访问判定入口（谁能进、能做什么）
+- `server/src/services/turn-runner.ts` — `withTurnSlot`：turn 槽 = 全局闸门 + session 锁 + execution 上下文
 - `server/src/services/tool-policy.ts` — 工具授权 policy + `onPreToolUse` workspace 守卫
 - `server/src/services/tool-evidence.ts` — 工具证据 hook（toolCallId / 裁决 / 耗时 / 脱敏结果）
+- `server/src/collaboration/` — `collaboration-service.ts`（按模式分派提交）、`session-coordinator.ts`（per-session 队列调度）、`message-service.ts`、`participant-service.ts`、`session-event-service.ts`、`sql-repository.ts`(+memory)、`types.ts`
 - `server/src/execution/` — `execution-service.ts`（生命周期 + 状态机 + HITL）、`sql-repository.ts`（SQLite/PG 共用的 SQL 仓储）、`memory-repository.ts`（单测用）、`events.ts`（审计时间线）、`hash.ts`（actionHash）、`usage.ts`、`redact.ts`
 - `server/src/human-tasks/` — HumanTask + Decision（审批与人工输入统一抽象）、`assignment.ts`（资格判定）
 - `server/src/approval/` — `approval-policy.ts`（ANY/ALL/N_OF_M/SEQUENTIAL）、`approval-service.ts`（谁能批、几票、顺序）
 - `server/src/actions/` — `action-registry.ts`（server-controlled executor）、`action-service.ts`（业务动作策略裁决 + hash/版本复核）
-- `server/src/agent/` — `agent-runner.ts`（Copilot SDK 事件收口）、`agent-context.ts`（turn 级 execution 上下文）
-- `server/src/db/` — `connection.ts`（后端选择）、`dialect.ts`（SQL 方言钩子）、`sqlite.ts` + `sqlite-schema.ts`（默认后端，schema 内嵌自动应用）、`postgres.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql`（PG 版 DDL）
+- `server/src/agent/` — `agent-runner.ts`（Copilot SDK 事件收口）、`agent-execution.ts`（一个 execution 跑一轮 turn）、`agent-context.ts`（turn 级 execution 上下文）
+- `server/src/db/` — `connection.ts`（后端选择）、`dialect.ts`（SQL 方言钩子）、`sqlite.ts` + `sqlite-schema.ts`（默认后端，schema 内嵌自动应用 + 补列升级）、`postgres.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql` + `002_collaboration.sql`（PG 版 DDL）
 - `server/src/wiring.ts` — 依赖装配（唯一决定 SQLite / PostgreSQL / 内存的地方）
 - `server/src/services/workspace-service.ts` — session workspace（路径是 sessionId 的确定性哈希）
-- `server/src/routes/` — `api.ts`（挂载）+ `sessions.ts` / `executions.ts` / `human-tasks.ts` / `meta.ts` / `shared.ts`
+- `server/src/routes/` — `api.ts`（挂载）+ `sessions.ts` / `session-collaboration.ts` / `executions.ts` / `human-tasks.ts` / `meta.ts` / `shared.ts`
 
 ## 前提
 

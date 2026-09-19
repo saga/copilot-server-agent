@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { config } from '../config.js';
 import { sessionService } from '../services/session-service.js';
 import { concurrencyState } from '../services/concurrency.js';
-import { stateBackend } from '../execution/index.js';
+import { executionService } from '../wiring.js';
 import { listProviderStatus } from '../providers/index.js';
 import {
   listMcp,
@@ -96,10 +96,10 @@ metaRouter.get('/hooks', requireAdmin, (req, res) => {
 /** GET /api/debug — 诊断包（含 durable state 后端与并发状态） */
 metaRouter.get('/debug', requireAdmin, async (_req, res, next) => {
   try {
+    // execution 统计与状态后端由这里注入：session-service 不能 import wiring（会成环）
     res.json({
-      ...(await sessionService.getDebugInfo()),
+      ...(await sessionService.getDebugInfo({ executions: await executionService.stats() })),
       concurrency: concurrencyState(),
-      stateBackend,
     });
   } catch (err) {
     next(err);

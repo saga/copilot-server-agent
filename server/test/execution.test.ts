@@ -135,7 +135,7 @@ test('execution：状态机拒绝非法迁移', async () => {
 test('tool evidence hook：workspace 外写入被 deny 并留证据', async () => {
   const workspace = mkdtempSync(path.join(tmpdir(), 'evidence-'));
   // hook 走 wiring 里的单例 service（内存仓储）：验证 pre/post 与 execution 的端到端关联
-  const { executionService: service } = await import('../src/execution/index.js');
+  const { executionService: service } = await import('../src/wiring.js');
   const exec = await service.create({ sessionId: 'ev-1', owner: OWNER });
   await service.start(exec.executionId);
   service.setActive('ev-1', exec.executionId);

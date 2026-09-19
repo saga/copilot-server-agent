@@ -41,6 +41,7 @@ export class MemoryExecutionRepository implements ExecutionRepository {
   async list(filter: ExecutionFilter = {}): Promise<ExecutionRecord[]> {
     const matched = [...this.records.values()].filter((r) => {
       if (filter.sessionId && r.sessionId !== filter.sessionId) return false;
+      if (filter.sessionIds && !filter.sessionIds.includes(r.sessionId)) return false;
       if (filter.tenantId && r.tenantId !== filter.tenantId) return false;
       if (filter.userId && r.userId !== filter.userId) return false;
       if (filter.status && r.status !== filter.status) return false;
@@ -48,6 +49,15 @@ export class MemoryExecutionRepository implements ExecutionRepository {
     });
     const limit = Math.max(1, Math.min(500, filter.limit ?? 50));
     return matched.slice(-limit).map(clone);
+  }
+
+  /** 队列里最早创建、仍未开始的那条（created 状态即排队中） */
+  async nextCreated(sessionId: string): Promise<ExecutionRecord | undefined> {
+    // 与 SQL 实现同一定序：created_at 并列时看 execution_id（见 sql-repository.nextCreated）
+    const queued = [...this.records.values()]
+      .filter((r) => r.sessionId === sessionId && r.status === 'created')
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.executionId.localeCompare(b.executionId));
+    return queued[0] ? clone(queued[0]) : undefined;
   }
 
   async stats(): Promise<ExecutionStats> {
