@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { sessionService } from '../services/session-service.js';
-import { isShuttingDown } from '../shutdown.js';
+import { isShuttingDown, lifecycleState } from '../lifecycle.js';
 import type { HealthResponse } from '../types.js';
 
 export const healthRouter = Router();
@@ -26,10 +26,18 @@ healthRouter.get('/live', (_req, res) => {
   return res.status(200).json({ status: 'ok', uptime: process.uptime() });
 });
 
-/** readiness：runtime 必须能 ping 通；drain 期间直接 503 让 K8s 摘流 */
+/**
+ * readiness：runtime 能 ping 通才算就绪。
+ *
+ * `starting` 期间也返回 503 —— durable 状态恢复还没跑完，此时放流量进来会和恢复流程
+ * 抢同一批 execution（见 `lifecycle.ts`、`index.ts`）。
+ */
 healthRouter.get('/ready', async (_req, res) => {
-  if (isShuttingDown()) {
-    return res.status(503).json({ status: 'draining', copilot: 'draining' });
+  const state = lifecycleState();
+  if (state !== 'ready') {
+    return res
+      .status(503)
+      .json({ status: state, copilot: state === 'draining' ? 'draining' : 'pending' });
   }
   try {
     const client = await sessionService.getClient();

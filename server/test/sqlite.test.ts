@@ -198,6 +198,8 @@ test('SQLite：人工输入的 input_values 落库，重启后可读且回填 ex
       executionId,
       tenantId: OWNER.tenantId,
       title: '补充投票取向',
+      // 提交按 isAssignee 判定，所以必须显式给出 assignee（不写就退到默认角色 approver）
+      eligibleRoles: ['portfolio_manager'],
       inputSchema: {
         fields: [
           { name: 'vote', type: 'select', required: true, options: ['FOR', 'AGAINST', 'ABSTAIN'] },

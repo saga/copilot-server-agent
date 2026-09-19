@@ -31,6 +31,7 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | `{ status, uptime, copilot: connected\|idle\|error }`（`idle` = client 尚未建连的懒加载态，不是故障；判连接可用性看 `/api/health/ready`） |
+| GET | `/api/health/ready` | 就绪探针：启动恢复跑完前 `503 { status: "starting" }`，关闭中 `503 { status: "draining" }`，就绪 `200 { status: "ready" }`。给编排层用 —— 别在恢复还没跑完时就把流量放进来。注意 `server.close()` 会**同时关掉监听套接字**，所以关闭期新发起的探测多半拿到的是**连接被拒**而不是 503；两者都表达"未就绪"，要保证探测一定看到 503 得配 `preStop` 宽限期 |
 | GET | `/api/providers` | 通道列表 `{ providers: [{ id, displayName, defaultModel, configured, active, hint? }] }` |
 | GET | `/api/models` | 当前通道可用模型列表 `{ provider, models }`（前端模型选择器用） |
 | GET | `/api/agents` | agent 预设 + 技能目录 + 可发现技能（建会话表单用） |
@@ -43,7 +44,7 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | GET | `/api/executions/:id/events` | **审计时间线**：谁批准、何时、依据什么 hash、后来为什么执行；同样跟着会话可见性 |
 | GET | `/api/executions/:id/tasks` | 该 execution 挂起/已决的人工任务 |
 | POST | `/api/executions` `{ sessionId, kind?, input?, prompt? }` | 建后台执行单元 → `202 { executionId, status }`（HTTP 不等 agent）；需 `send` |
-| POST | `/api/executions/:id/run` `{ prompt }` | 后台跑一次 agent turn → `202`；需 `send`（能看见 ≠ 能让它跑起来）。等待审批时用 events 端点跟踪 |
+| POST | `/api/executions/:id/run` `{ prompt }` | 后台跑一次 agent turn → `202`；指挥权同 `cancel`/`actions`（owner 或该 execution 发起人；observer `403`）。等待审批时用 events 端点跟踪 |
 | POST | `/api/executions/:id/cancel` | 取消（running / waiting 都可）。owner 可取消任意，member 只能取消自己发起的，observer `403` |
 | POST | `/api/executions/:id/actions` | **agent 提议业务动作**：服务端策略裁决 → 自动放行 / 建审批（202 + `taskId`）/ 拒绝（403）。执行权在 server；指挥权同 `cancel` |
 | GET | `/api/human-tasks` `?status=&type=` | 我的任务（审批 + 待补输入；资格服务端算） |
@@ -135,9 +136,10 @@ curl -X POST localhost:3001/api/sessions/user-pm-task-42/chat \
   observer 只读；member 能发消息，但不能管成员、不能改会话配置；owner 全能。
 - **改会话配置是 owner 专属**（`manage_session`）：`resume` 可以重配 model / agents / MCP / hooks /
   systemMessage，那是全体参与者共用的能力边界 —— member 能发言不等于能改所有人的工具集与数据范围。
-- **指挥一次 execution 另算**：取消、提业务动作由 owner 或**该 execution 的发起人**发起
-  （member 只能动自己发的），observer 不可；`/executions/:id/run` 另按 `send` 判定 ——
-  能看见不等于能让执行跑起来。
+- **指挥一次 execution 另算**：取消、提业务动作、以及**手动跑一次 turn**（`/executions/:id/run`）
+  由 owner 或**该 execution 的发起人**发起（member 只能动自己发的），observer 不可 ——
+  能看见不等于能让执行跑起来。上一版 `/run` 只判 `send`，结果是 member 能把别人发起的 execution
+  跑起来、却取消不了它，三档判定现已统一。
 - **成员资格由 owner 控制**（邀请制）：session 级能力（conversation / workspace / data scope /
   工具与 MCP）是**全体参与者的共同边界** —— participant 不因自己的 membership 拿到额外
   MCP / skill / workspace / data capability。所以「这个人的数据权限是否覆盖本会话的数据范围」
@@ -147,7 +149,9 @@ curl -X POST localhost:3001/api/sessions/user-pm-task-42/chat \
   （`queue_sequence`）定序，保证**用户看到的顺序 = agent 处理的顺序**；手工建的后台 job 没有来源
   消息，不参与协作调度。
 - **崩溃恢复**：启动时 `running`/`resuming` 的 execution 落终态 `interrupted`（**不自动重试** ——
-  那次 turn 可能已经把业务动作做出去了），仍排队的按序重新 drain。
+  那次 turn 可能已经把业务动作做出去了），仍排队的按序重新 drain。恢复**在开始接流量之前**跑完：
+  启动顺序是建 app → `recoverPending()` → 起 sweeper → `listen`，`/api/health/ready` 在恢复
+  完成前返回 `503 starting`。
 - **人工补数据的续跑还没闭合**：`POST /api/human-tasks/:id/input` 把 execution 置到 `resuming`
   就停了 —— 没有组件把 `inputValues` 拼回 prompt、继续 agent turn，`resuming` 是个没有出边的
   悬挂态（要靠 `interrupted` 在重启时兜底）。审批（approval）不同：批准后由服务端执行器直接执行
@@ -375,7 +379,8 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 - `server/src/wiring.ts` — 依赖装配（唯一决定 SQLite / PostgreSQL / 内存的地方）
 - `server/src/services/workspace-service.ts` — session workspace（路径是 sessionId 的确定性哈希）
 - `server/src/routes/` — `api.ts`（挂载）+ `sessions.ts` / `session-collaboration.ts` / `executions.ts` / `human-tasks.ts` / `meta.ts` / `shared.ts`
-- `server/src/index.ts` — 启动流程：`listen` 之后跑 `recoverPending()`（`running`/`resuming` → `interrupted`，排队项重新 drain）
+- `server/src/index.ts` — 启动流程：`recoverPending()`（`running`/`resuming` → `interrupted`，排队项重新 drain）→ 起 sweeper → `listen` → `markReady()`。恢复在接流量之前跑完，`/api/health/ready` 在完成前返回 503
+- `server/src/lifecycle.ts` — 生命周期状态（`starting` / `ready` / `draining`），健康路由据此判就绪；单独成模块以免 `index ↔ health` 循环依赖
 
 ## 前提
 

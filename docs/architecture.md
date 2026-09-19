@@ -163,7 +163,12 @@ Business Authorization  能不能做这个业务动作、要不要人批、谁�
 
 `view` 是"看得见"，`command` 是"能动手"。observer 有 `view` 不等于有 `run / cancel / propose-action`：
 只判 `view` 会让 observer 取消别人的执行、或对别人的 execution 提 `submit_proxy_vote` 这类业务意图。
-`POST /executions/:id/run` 另按 `send` 判定 —— 能看见不等于能让执行跑起来。
+
+**`run` / `cancel` / `propose-action` 三个端点走同一档判定**，不各判各的。
+`/run` 早期只判 `send`，结果是 member 能把别人发起的 execution 跑起来、却取消不了它 ——
+"owner 或发起人才能指挥 execution"这句话就不成立了。三种命令统一为
+`assertCanCommandExecution`，规则只有一条，端点之间不会再漂移。
+
 本层通过与否**都不影响第三层**：高风险动作照旧要过 ActionPolicy 与人工审批（见第 6 节），
 只是连会话门都进不来的请求根本走不到那一层。
 
@@ -220,13 +225,19 @@ execution 上只留脱敏预览，不能当输入用。同一会话并发恒为 
 （外层还有全局 semaphore 兜底）。
 
 **启动恢复**：`SessionCoordinator.chains` 是进程内状态，Pod 重启后内存里的 worker 就没了 ——
-队列（DB 行）还在，但没人会去 drain 它。所以 `index.ts` 在 `listen` 之后跑一次
-`CollaborationService.recoverPending()`：
+队列（DB 行）还在，但没人会去 drain 它。所以 `index.ts` 的启动顺序是
+**建 app → `recoverPending()` → 起 sweeper → `listen`**，恢复在开始接流量之前跑完：
 
 - `running` / `resuming` → 终态 `interrupted`（**不自动重试**）。理由：崩溃时那次 turn
   可能已经把业务动作做出去了（下单、投票、发邮件），自动重跑会二次执行。标志"服务中断过、
   结果未知、需要人看一眼"，重跑必须由人显式发起。
 - `created`（排队项）→ 按 `queue_sequence` 重新入队 drain。
+
+**就绪信号**：`index.ts` 维护一个生命周期状态（`starting → ready → draining`，见 `lifecycle.ts`），
+`GET /api/health/ready` 只在 `ready` 时返回 200 —— 恢复没跑完时是 `503 starting`，
+编排层据此"先别放流量"。关闭时先置 `draining`（同样是 503）再 `server.close()`；但 `close()`
+会一并关掉监听套接字，所以关闭期**新**发起的探测通常拿到的是连接被拒而非 503，
+两种都表达"未就绪"。要让探测必定看到 503，得靠 `preStop` 宽限期把摘流与关端口错开。
 
 多副本下这份"谁在跑"仍是进程内状态，需要 DB 租约 + runtime affinity，见第 7 节。
 
@@ -258,6 +269,10 @@ execution_event.sequence   ← agent_execution.event_sequence     update ... set
 agent 的终稿正文由 `runTurn()` 的**返回值**写入 transcript，且在 execution 落 `completed`
 **之前**完成。不能用 `void` 开一个异步回调去写：那样它和 `execution.complete()` 谁先落库不确定，
 时间线会错位（完成事件先于它自己的正文）。流式 `onMessage` 只服务实时 UI，不承担持久化。
+
+**共享会话的 `model` 要显式转发给 `runTurn`**：模型在创建 execution 时选定、存在 execution 行上，
+跑 turn 时必须把它交给 `runTurn({ model })`（内部 `session.setModel`）。漏传不会报错 ——
+只会静默退回 SDK 默认模型，用户选的模型没生效，且从返回结果上看不出区别。
 
 **SSE 断线续传要先订阅再回放**（`subscribeWithReplay`）：先 subscribe（新事件进缓冲区）→
 再按 `after` 从库里回放 → 最后 flush 缓冲区并按 sequence 去重。反过来的
@@ -351,6 +366,28 @@ ExecutionService.onHumanTaskResolved → transition(resuming)
 
 approval 不需要这个 runner：批准后由 server 侧执行器直接执行动作并收尾 ——
 `runAction` 内部一次走完 `waiting_for_approval → resuming → running → completed`。
+
+**提交输入要过 assignee 判定**：`submitInput` 与 `approve` / `reject` / `delegate` / `cancel`
+一样按 `isAssignee`（角色命中 / 显式指派 / 被委派，三者之一）放行。只凭 task id 就能写值，
+等于把"谁能补这个字段"交给调用方自己声明 —— 补进去的值会直接进 execution 并把它推到 `resuming`。
+没显式指定 assignee 的输入任务退到默认角色 `approver`（`COPILOT_DEFAULT_ROLES`）：
+本地单租户够用，但信任身份头的部署里角色来自网关，创建方必须显式给出 eligible 集合。
+
+### 5.3 任务收敛恰好一次
+
+`human_task` 的关闭是**条件写**：`update ... set status = ? where task_id = ? and status = 'open'`。
+并发审批下只有一个请求能把任务从 `open` 改走，**只有它**触发 `onResolved`
+（→ hash/版本复核 → `runAction` → 落终态）。四条关闭路径（`decide` / `submitInput` /
+`cancel` / `sweepExpired`）共用这一个原语，各自恰好触发一次。
+
+没有这层时，两个审批者会各自判定"票已凑齐"、各自关闭、各自触发一次 `onResolved` ——
+approval 分支由此把**同一个业务动作执行两遍**（`runAction` 在服务端真的下单/投票）。
+`unique(task_id, approver_id)` 防的是"同一个人重复投票"，防不住"两个不同的人同时关闭同一个任务"。
+
+进程内还有一把 per-task 串行锁，覆盖「读决策 → 判资格 → 加决策 → 评估 → 关闭」整段，
+并在插入决策后重读一次：它让 `evaluate()` 看到稳定的决策集合，避免两个投票者各自只读到
+"还差一票"于是**谁都不关闭**（漏收敛）。跨副本时这把锁不生效 —— 条件写仍然保证"不会重复执行"，
+但存在"最后一个投票者读到的集合偏旧 → 没人关闭"的漏收敛窗口，兜底是任务过期扫描与人工重提。
 
 ## 6. 授权分层（Session Access → Execution Command → Business Action → Approval）
 
@@ -535,7 +572,7 @@ exec 里，老库文件就会在建出 `queue_sequence` 之前引用它 → `no 
 | `POST /:id/resume` | `manage_session` | collaborationMode 不可变（传了 400） |
 | `DELETE /:id` | `delete` | — |
 | `POST /executions` | `send` | — |
-| `POST /executions/:id/run` | `send` | execution 当前状态（状态机约束，见第 4 节） |
+| `POST /executions/:id/run` | — | command 判定（与下面两条同档）+ execution 当前状态（见第 4 节） |
 | `POST /executions/:id/cancel` | — | command 判定：owner 任意 / member 仅自己发起 / observer 不可 |
 | `POST /executions/:id/actions` | — | command 判定 + Business Action Policy（未登记 → 403、需审批 → 202 + taskId） |
 
@@ -596,7 +633,8 @@ server/src/
 ├── middleware/  error-status.ts（错误→状态码的单一真相源） errorHandler.ts（兜底）
 ├── providers/ agents/ skills/ mcp/ hooks/
 ├── wiring.ts    依赖装配（SQLite / PostgreSQL / Memory）
-└── index.ts     启动：listen 之后跑 collaborate.recoverPending()（崩溃恢复）
+├── lifecycle.ts 生命周期状态（starting / ready / draining）→ 健康就绪判定
+└── index.ts     启动：recoverPending()（崩溃恢复）→ 起 sweeper → listen → markReady()
 ```
 
 ## 12. 明确不做

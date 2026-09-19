@@ -301,6 +301,8 @@ test('人工输入：按 schema 校验，不接受自由文本', async () => {
     executionId: exec.executionId,
     tenantId: OWNER.tenantId,
     title: '补充投票取向',
+    // 必须显式给出 assignee：提交时按 isAssignee 判定（见下方"只有 eligible 的人能提交"）
+    eligibleRoles: ['portfolio_manager'],
     inputSchema: {
       fields: [
         { name: 'vote', type: 'select', required: true, options: ['FOR', 'AGAINST', 'ABSTAIN'] },
@@ -322,4 +324,109 @@ test('人工输入：按 schema 校验，不接受自由文本', async () => {
   });
   assert.equal(done.status, 'approved');
   assert.deepEqual(done.inputValues, { vote: 'FOR', comment: 'ok' });
+});
+
+test('人工输入：只有 eligible 的人能提交（角色 / 显式指派 / 委派；越权一律拒绝）', async () => {
+  const { execution, humanTasks } = wire();
+  const exec = await execution.create({ sessionId: 's7', owner: OWNER, kind: 'job' });
+  await execution.start(exec.executionId);
+  await execution.transition(exec.executionId, 'waiting_for_input', { waitReason: 'input' });
+
+  const makeTask = (over: { eligibleRoles?: string[]; eligibleUsers?: string[] } = {}) =>
+    humanTasks.createInputTask({
+      executionId: exec.executionId,
+      tenantId: OWNER.tenantId,
+      title: '补充投票取向',
+      inputSchema: {
+        fields: [{ name: 'vote', type: 'select', required: true, options: ['FOR', 'AGAINST'] }],
+      },
+      ...over,
+    });
+
+  // 角色命中
+  const byRole = await makeTask({ eligibleRoles: ['risk'] });
+  const roleDone = await humanTasks.submitInput(byRole.taskId, {
+    principal: RISK,
+    values: { vote: 'FOR' },
+  });
+  assert.equal(roleDone.status, 'approved');
+
+  // 显式指派到人：角色不命中也能提交
+  const byUser = await makeTask({ eligibleUsers: ['ops-1'] });
+  const userDone = await humanTasks.submitInput(byUser.taskId, {
+    principal: OPS,
+    values: { vote: 'AGAINST' },
+  });
+  assert.equal(userDone.status, 'approved');
+
+  // 被委派的人可以代为提交
+  const delegated = await makeTask({ eligibleRoles: ['risk'] });
+  await humanTasks.delegate(delegated.taskId, { principal: RISK, toUserId: 'risk-2' });
+  const delegatedDone = await humanTasks.submitInput(delegated.taskId, {
+    principal: { tenantId: 't1', userId: 'risk-2', roles: [] },
+    values: { vote: 'FOR' },
+  });
+  assert.equal(delegatedDone.status, 'approved');
+
+  // 不在 eligible 范围内：拒绝，且任务保持 open、值不落库
+  const forbidden = await makeTask({ eligibleRoles: ['risk'] });
+  await assert.rejects(
+    () => humanTasks.submitInput(forbidden.taskId, { principal: OPS, values: { vote: 'FOR' } }),
+    /无权提交该人工输入/,
+  );
+  const after = (await humanTasks.get(forbidden.taskId))!;
+  assert.equal(after.status, 'open', '越权提交不能把任务推下去');
+  assert.equal(after.inputValues, undefined, '越权提交不能写值');
+});
+
+test('并发审批：条件关闭 + 同一 task 串行，onResolved 只触发一次', async () => {
+  const approval = new ApprovalService({ allowInitiatorApproval: false });
+  const repository = new MemoryHumanTaskRepository();
+  let resolved = 0;
+  const humanTasks = new HumanTaskService({
+    repository,
+    approval,
+    onResolved: async () => {
+      resolved += 1;
+    },
+  });
+  const COMPLIANCE = { tenantId: 't1', userId: 'comp-1', roles: ['compliance'] };
+
+  // actionType 故意不注册：decide() 会优先取**注册策略**（policyFor(actionType)），
+  // 用它就会盖掉这里的 inline 策略，测不到本用例要测的收敛逻辑。
+  const makeTask = (strategy: ApprovalPolicy['strategy'], title: string) =>
+    humanTasks.createApprovalTask({
+      executionId: `ex-${title}`,
+      tenantId: 't1',
+      title,
+      payload: { actionType: 'custom_test_action' },
+      policy: {
+        policyId: `p-${title}`,
+        actionType: 'custom_test_action',
+        strategy,
+        eligibleRoles: ['risk', 'compliance'],
+        allowInitiator: false,
+      },
+    });
+
+  // ALL：两票齐了才算完成。并发下若两边各自只读到"自己那一票"，就双双判定未完成 →
+  // 谁也关不掉（漏收敛）；若都判定完成 → 各关一次（重复收敛，业务动作执行两遍）。
+  const all = await makeTask('ALL', 'all');
+  const results = await Promise.allSettled([
+    humanTasks.approve(all.taskId, { principal: RISK }),
+    humanTasks.approve(all.taskId, { principal: COMPLIANCE }),
+  ]);
+  assert.ok(results.every((r) => r.status === 'fulfilled'), '两票都应被接受');
+  assert.equal((await humanTasks.get(all.taskId))!.status, 'approved');
+  assert.equal((await repository.listDecisions(all.taskId)).length, 2, '两票都要留痕');
+  assert.equal(resolved, 1, 'ALL 只应触发一次 onResolved');
+
+  // ANY：一票即关闭。并发下只有抢到条件关闭的那一个触发 onResolved，另一个应被"已关闭"挡住。
+  const any = await makeTask('ANY', 'any');
+  await Promise.allSettled([
+    humanTasks.approve(any.taskId, { principal: RISK }),
+    humanTasks.approve(any.taskId, { principal: COMPLIANCE }),
+  ]);
+  assert.equal((await humanTasks.get(any.taskId))!.status, 'approved');
+  assert.equal(resolved, 2, 'ANY 只应再触发一次（累计 2）');
 });

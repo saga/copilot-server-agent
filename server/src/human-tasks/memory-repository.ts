@@ -30,6 +30,15 @@ export class MemoryHumanTaskRepository implements HumanTaskRepository {
     return clone(next);
   }
 
+  /** 条件关闭：任务已不是 open 就返回 undefined（与 SQL 版 `where status = 'open'` 对齐） */
+  async close(taskId: string, patch: Partial<HumanTask>): Promise<HumanTask | undefined> {
+    const t = this.tasks.get(taskId);
+    if (!t || t.status !== 'open') return undefined;
+    const next = { ...t, ...clone(patch) };
+    this.tasks.set(taskId, next);
+    return clone(next);
+  }
+
   async list(filter: HumanTaskFilter = {}): Promise<HumanTask[]> {
     const limit = Math.max(1, Math.min(500, filter.limit ?? 50));
     const matched = [...this.tasks.values()].filter((t) => {

@@ -181,3 +181,33 @@ test('tool evidence hook：workspace 外写入被 deny 并留证据', async () =
   assert.equal((await service.get(exec.executionId))!.toolCalls.at(-1)!.isError, true);
   service.clearActive('ev-1');
 });
+
+test('execution.created 的 actor 是发起人，不是会话 owner', async () => {
+  const service = makeService();
+  // shared 会话典型形态：owner 是 alice，实际发起这次执行的是 member bob。
+  // 审计若记成 owner，就等于把"谁触发了这次执行"抹掉（owner ≠ actor）。
+  const exec = await service.create({
+    sessionId: 's-actor',
+    owner: { tenantId: 't1', userId: 'alice' },
+    initiatedByUserId: 'bob',
+    kind: 'job',
+  });
+  assert.equal(exec.userId, 'alice', 'user_id 仍是会话 owner（数据归属 / resume 校验）');
+  assert.equal(exec.initiatedByUserId, 'bob');
+
+  const created = (await service.events(exec.executionId, 10)).find(
+    (e) => e.type === 'execution.created',
+  )!;
+  assert.equal(created.actorId, 'bob', 'created 事件记的是发起人');
+
+  // 未显式给发起人时退到 owner —— 单租户/自建自跑场景行为不变
+  const own = await service.create({
+    sessionId: 's-actor-2',
+    owner: { tenantId: 't1', userId: 'alice' },
+    kind: 'job',
+  });
+  const ownCreated = (await service.events(own.executionId, 10)).find(
+    (e) => e.type === 'execution.created',
+  )!;
+  assert.equal(ownCreated.actorId, 'alice');
+});

@@ -132,9 +132,10 @@ executionRouter.get('/:id/tasks', async (req, res, next) => {
  * POST /api/executions/:id/run — 后台跑一次 agent turn（202，不等结果）。
  * HITL 场景（审批可能几小时）不能靠 SSE 长连接，客户端用 events 端点轮询/SSE。
  *
- * 权限要 `send` 而不是 `view`：能看见这个 session 不代表能让执行跑起来。
- * observer 是只读角色，不应该能启动别人的执行；这条也是 shared 会话的调度入口
- * （正常路径由 CollaborationService → SessionCoordinator 自动 dispatch）。
+ * 权限与 cancel / actions 同一档：`assertCanCommandExecution`（owner 任意 / member 只能
+ * 跑自己发起的 / observer 不可）。**不能只判 `send`** —— 那等于"能在这个会话发言就能让
+ * 别人的 execution 跑起来"，与 cancel/actions 的规则自相矛盾，也让文档里
+ * "owner 或发起人才能指挥 execution" 不成立。
  */
 executionRouter.post('/:id/run', async (req, res, next) => {
   try {
@@ -142,7 +143,7 @@ executionRouter.post('/:id/run', async (req, res, next) => {
     const id = String(req.params.id);
     const record = await executionService.get(id);
     if (!record) return res.status(404).json({ error: `execution 不存在："${id}"` });
-    await assertSessionSendable(record.sessionId, principalOf(req));
+    await sessionAccessService.assertCanCommandExecution(record.sessionId, principalOf(req), record);
     await executionService.start(id);
     // 取 session → turn 槽 → 收尾 统一由调度器做，不阻塞 HTTP
     sessionCoordinator.runDetached(record, body.prompt);

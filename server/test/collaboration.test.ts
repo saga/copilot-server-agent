@@ -613,15 +613,29 @@ test('共享会话：member 不能 resume 改会话配置（能力边界属于 o
   );
 });
 
-test('共享会话：observer 不能启动 execution（run 要 send，不是 view）', async () => {
+test('共享会话：observer 既不能发言也不能指挥 execution（run 与 cancel/actions 同档）', async () => {
   const s = makeStack();
   await s.openSession('sess-run', 'shared');
   await s.participantService.add('sess-run', ALICE, { userId: 'carol', role: 'observer' });
+  await s.participantService.add('sess-run', ALICE, { userId: 'bob', role: 'member' });
 
   // observer 能看见这个会话
   assert.equal((await s.access.assertCanView('sess-run', CAROL)).role, 'observer');
-  // 但看得见不等于能让执行跑起来
+  // 但看得见不等于能发言
   await assert.rejects(() => s.access.assertCanSend('sess-run', CAROL), /无权发消息到/);
+
+  // `/run` 与 `/cancel`、`/actions` 现在是同一档判定。此前 `/run` 只判 `send`，
+  // 于是 member 能把别人发起的 execution 跑起来，而 cancel 它却不行 —— 语义自相矛盾。
+  const submitted = await s.collaboration.submitMessage({
+    sessionId: 'sess-run',
+    principal: BOB,
+    prompt: 'bob 发起',
+  });
+  if (submitted.mode !== 'shared') throw new Error('应为 shared');
+  await assert.rejects(
+    () => s.access.assertCanCommandExecution('sess-run', CAROL, submitted.execution),
+    /无权操作该 execution/,
+  );
 });
 
 test('共享会话：execution 指挥权按 发起人/owner 收窄，observer 与旁观 member 都不可', async () => {
@@ -866,6 +880,59 @@ test('启动恢复：running 的执行落成 interrupted 终态，且绝不自�
   assert.ok(sessionTypes.includes(EVT.executionInterrupted), '会话事件流要有 interrupted');
   const auditTypes = (await s.executions.events(exec.executionId, 50)).map((e) => e.type);
   assert.ok(auditTypes.includes('execution.interrupted'), '审计链也要有');
+});
+
+test('启动恢复：单条记录的事件写入失败，不得中断整轮恢复（队列重排仍要跑）', async () => {
+  const s = makeStack();
+  await s.openSession('sess-bad', 'shared');
+  await s.openSession('sess-good', 'shared');
+
+  // sess-bad：一条崩在 running 的执行。它的会话已不存在（会话行被删），
+  // 于是写 interrupted 事件时序号分配器会抛错。
+  const bad = await s.executions.create({
+    sessionId: 'sess-bad',
+    owner: { tenantId: 't1', userId: 'alice' },
+    initiatedByUserId: 'alice',
+    kind: 'job',
+  });
+  await s.executions.start(bad.executionId);
+  assert.equal((await s.executions.get(bad.executionId))?.status, 'running');
+
+  // sess-good：一条重启前入队的协作项，恢复时应当被重新 drain
+  const { message } = await s.messages.fromUser({
+    sessionId: 'sess-good',
+    tenantId: 't1',
+    userId: 'alice',
+    content: '重启前入队',
+  });
+  const queued = await s.executions.create({
+    sessionId: 'sess-good',
+    owner: { tenantId: 't1', userId: 'alice' },
+    initiatedByUserId: 'alice',
+    kind: 'interactive',
+    sourceMessageId: message.messageId,
+    queueSequence: message.sequence,
+  });
+
+  // 让 sess-bad 的事件写入失败：坏记录不能把后面的队列重排一起带走
+  const original = s.sessionEventRepository.append.bind(s.sessionEventRepository);
+  s.sessionEventRepository.append = (input) => {
+    if (input.sessionId === 'sess-bad') {
+      return Promise.reject(new Error('session 不存在："sess-bad"'));
+    }
+    return original(input);
+  };
+
+  const result = await s.collaboration.recoverPending();
+  assert.equal(result.interrupted, 1, '状态照常落 interrupted（先于事件写入）');
+  assert.equal((await s.executions.get(bad.executionId))?.status, 'interrupted');
+  assert.equal(result.sessions, 1, '坏记录不能连坐，队列重排必须照跑');
+
+  const deadline = Date.now() + 3000;
+  while ((await s.executions.get(queued.executionId))?.status !== 'completed') {
+    if (Date.now() > deadline) throw new Error('恢复 drain 超时（被坏记录连坐了）');
+    await sleep(5);
+  }
 });
 
 // ---------- 顺序一致性 ----------

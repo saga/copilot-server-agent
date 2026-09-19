@@ -67,7 +67,7 @@ export class CollaborationService {
    *      但"谁在跑"（`SessionCoordinator.chains`）是进程内的，重启后没有任何东西会主动唤醒它。
    *      持久化了队列却没有恢复 worker，等于没 durable。
    *
-   * 单副本前提下由 index.ts 在 listen 之后调用；多副本需要先落实 DB 租约，否则会重复 drain。
+   * 单副本前提下由 index.ts 在 **listen 之前**调用；多副本需要先落实 DB 租约，否则会重复 drain。
    */
   async recoverPending({ reason }: { reason?: string } = {}): Promise<{
     interrupted: number;
@@ -75,13 +75,22 @@ export class CollaborationService {
   }> {
     const interrupted = await this.deps.executions.recoverInterrupted(reason);
     for (const rec of interrupted) {
-      await this.deps.events.append({
-        sessionId: rec.sessionId,
-        type: EVT.executionInterrupted,
-        actorType: 'system',
-        executionId: rec.executionId,
-        payload: { phase: 'startup' },
-      });
+      // 逐条 try/catch：状态已经落成 interrupted，补不上这一条审计事件只影响时间线完整性，
+      // 不该让**整轮恢复**中断 —— 否则一条坏记录会连带跳过下面的队列重排（记录里的 session
+      // 可能已被删，事件序号分配器会直接抛错）。
+      try {
+        await this.deps.events.append({
+          sessionId: rec.sessionId,
+          type: EVT.executionInterrupted,
+          actorType: 'system',
+          executionId: rec.executionId,
+          payload: { phase: 'startup' },
+        });
+      } catch (err) {
+        console.error(
+          `[collaboration] 恢复事件写入失败 execution=${rec.executionId}：${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
 
     const sessionIds = await this.deps.executions.queuedSessionIds();

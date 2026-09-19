@@ -86,6 +86,19 @@ export class SqlHumanTaskRepository implements HumanTaskRepository {
   }
 
   async update(taskId: string, patch: Partial<HumanTask>): Promise<HumanTask | undefined> {
+    return this.applyPatch(taskId, patch, false);
+  }
+
+  /** 条件关闭：`where status = 'open'`，没抢到返回 undefined（并发审批只允许一个人收敛） */
+  async close(taskId: string, patch: Partial<HumanTask>): Promise<HumanTask | undefined> {
+    return this.applyPatch(taskId, patch, true);
+  }
+
+  private async applyPatch(
+    taskId: string,
+    patch: Partial<HumanTask>,
+    requireOpen: boolean,
+  ): Promise<HumanTask | undefined> {
     const dialect = d();
     const sets: string[] = [];
     const params: unknown[] = [];
@@ -118,10 +131,16 @@ export class SqlHumanTaskRepository implements HumanTaskRepository {
         col(column, v);
       }
     }
-    if (!sets.length) return this.get(taskId);
+    if (!sets.length) return requireOpen ? undefined : this.get(taskId);
     params.push(taskId);
+    const idPh = dialect.ph(params.length);
+    // `status = 'open'` 是这一枪的判据：并发下只有一个请求能把它从 open 改走，
+    // 于是只有那一个拿到返回行 —— 它是"完成收敛的人"，由它触发 onResolved。
+    const where = requireOpen
+      ? `where task_id = ${idPh} and status = 'open'`
+      : `where task_id = ${idPh}`;
     const { rows } = await getDb().query<TaskRow>(
-      `update human_task set ${sets.join(', ')} where task_id = ${dialect.ph(params.length)} returning *`,
+      `update human_task set ${sets.join(', ')} ${where} returning *`,
       params,
     );
     return rows[0] ? toTask(rows[0]) : undefined;

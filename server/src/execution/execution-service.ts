@@ -180,7 +180,9 @@ export class ExecutionService {
       executionId: stored.executionId,
       type: EVT.created,
       actorType: 'user',
-      actorId: input.owner.userId,
+      // 记**发起人**而不是会话 owner：shared 会话里 owner 可能是 alice 而发起人是 bob，
+      // 审计写成 owner 就等于把"谁触发了这次执行"抹掉（owner ≠ actor，见架构文档 3.4）。
+      actorId: stored.initiatedByUserId,
       payload: { sessionId: input.sessionId, kind: stored.kind },
     });
     return stored;

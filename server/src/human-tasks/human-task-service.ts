@@ -3,7 +3,7 @@ import { config } from '../config.js';
 import type { ApprovalService } from '../approval/approval-service.js';
 import type { ApprovalPolicy } from '../approval/types.js';
 import type { Principal } from '../services/principal.js';
-import { approverRoleFor, isAssignee } from './assignment.js';
+import { isAssignee } from './assignment.js';
 import type { HumanTaskRepository } from './repository.js';
 import type { HumanTask, HumanTaskFilter, InputTaskSchema } from './types.js';
 
@@ -27,6 +27,12 @@ export interface HumanTaskServiceDeps {
 
 const TTL_MS = config.humanTaskTtlSeconds > 0 ? config.humanTaskTtlSeconds * 1000 : 0;
 
+/**
+ * 输入任务没显式指定 assignee 时的兜底角色。
+ * 本地单租户下 `Principal.roles` 默认就是它（`COPILOT_DEFAULT_ROLES`，见 services/principal.ts）。
+ */
+const DEFAULT_INPUT_ROLES = ['approver'];
+
 function expiresAtFrom(policy?: ApprovalPolicy | null): string | undefined {
   const seconds = policy?.timeoutSeconds ?? config.humanTaskTtlSeconds;
   if (!seconds || seconds <= 0) return undefined;
@@ -38,10 +44,36 @@ function expiresAtFrom(policy?: ApprovalPolicy | null): string | undefined {
  * 路由层只调用这里，不直接写库、不直接碰 SDK。
  */
 export class HumanTaskService {
+  /** task → 队尾（链式 promise，保证不丢唤醒） */
+  private readonly taskLocks = new Map<string, Promise<unknown>>();
+
   constructor(private readonly deps: HumanTaskServiceDeps) {}
 
   get repository(): HumanTaskRepository {
     return this.deps.repository;
+  }
+
+  /**
+   * 同一 human task 上的复合操作串行化。
+   *
+   * 为什么需要：`decide()` 是「读决策 → 判资格 → 加决策 → 评估 → 关闭」。没有这层，
+   * 两个审批者可能各自读到"还差一票"、各自评估 complete、各自关闭 —— 收敛出两次
+   * `onResolved`（进而把同一个业务动作执行两遍）。
+   *
+   * `repository.close()` 的条件写是**跨副本**的最终防线（谁抢到谁触发 onResolved）；
+   * 这把锁是进程内的，负责让 `evaluate()` 看到稳定的决策集合。多副本下仍有"最后一个
+   * 投票者读到的集合偏旧 → 没人关闭"的漏收敛窗口，靠任务过期扫描兜底（见
+   * docs/architecture.md 第 5 节）。
+   */
+  private async withTaskLock<T>(taskId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.taskLocks.get(taskId) ?? Promise.resolve();
+    const current = previous.then(fn, fn);
+    this.taskLocks.set(taskId, current);
+    try {
+      return await current;
+    } finally {
+      if (this.taskLocks.get(taskId) === current) this.taskLocks.delete(taskId);
+    }
   }
 
   async get(taskId: string): Promise<HumanTask | undefined> {
@@ -100,6 +132,16 @@ export class HumanTaskService {
     timeoutSeconds?: number;
   }): Promise<HumanTask> {
     const now = new Date().toISOString();
+    const eligibleRoles = input.eligibleRoles?.length ? input.eligibleRoles : DEFAULT_INPUT_ROLES;
+    // 没显式指定 assignee 就退到默认角色 —— 本地单租户够用，但信任身份头的部署里
+    // 角色来自网关，多半没人叫 `approver`，任务会变成"谁都不能提交"。
+    // submitInput 现在按 isAssignee 判定，不接受这种默认，所以这里把隐患喊出来。
+    if (!input.eligibleRoles?.length && !input.eligibleUsers?.length && config.trustIdentityHeaders) {
+      console.warn(
+        `[human-task] input 任务 "${input.title}" 未指定 eligibleRoles/eligibleUsers：` +
+          `只有默认角色 ${DEFAULT_INPUT_ROLES.join('/')} 能提交，而该部署的角色来自网关`,
+      );
+    }
     const task: HumanTask = {
       taskId: `task_${randomUUID()}`,
       executionId: input.executionId,
@@ -110,7 +152,7 @@ export class HumanTaskService {
       ...(input.description ? { description: input.description } : {}),
       payload: input.payload ?? {},
       inputSchema: input.inputSchema,
-      eligibleRoles: input.eligibleRoles ?? ['approver'],
+      eligibleRoles: [...eligibleRoles],
       eligibleUsers: input.eligibleUsers ?? [],
       ...(input.initiatedBy ? { initiatedBy: input.initiatedBy } : {}),
       ...(expiresAtFrom(
@@ -145,6 +187,14 @@ export class HumanTaskService {
     taskId: string,
     input: { principal: Principal; comment?: string; decision: 'approve' | 'reject' },
   ): Promise<{ task: HumanTask; evaluation: ReturnType<ApprovalService['evaluate']> }> {
+    // 同一 task 的收敛尝试串行：并发审批不能各自读到"还差我一票"、再各自关闭任务
+    return this.withTaskLock(taskId, () => this.decideLocked(taskId, input));
+  }
+
+  private async decideLocked(
+    taskId: string,
+    input: { principal: Principal; comment?: string; decision: 'approve' | 'reject' },
+  ): Promise<{ task: HumanTask; evaluation: ReturnType<ApprovalService['evaluate']> }> {
     const task = await this.mustGetOpen(taskId);
     if (task.type !== 'approval') throw new Error('该任务不是审批任务');
     const policy = task.policyId
@@ -163,7 +213,7 @@ export class HumanTaskService {
       initiatedBy: task.initiatedBy,
       decisions,
     });
-    const decision = await this.deps.repository.addDecision({
+    await this.deps.repository.addDecision({
       decisionId: `dec_${randomUUID()}`,
       taskId,
       approverId: input.principal.userId,
@@ -172,22 +222,26 @@ export class HumanTaskService {
       ...(input.comment ? { comment: input.comment } : {}),
       createdAt: new Date().toISOString(),
     });
-    const all = [...decisions, decision];
+    // 插入后重读：跨副本时并发的另一票可能刚提交，只拿自己的预读会漏算、导致永不收敛
+    const all = await this.deps.repository.listDecisions(taskId);
     const evaluation = this.deps.approval.evaluate(policy, all);
     if (!evaluation.complete) {
-      const updated = { ...task, decisions: all };
-      return { task: updated, evaluation };
+      return { task: { ...task, decisions: all }, evaluation };
     }
-    const status: HumanTask['status'] = evaluation.outcome === 'approved' ? 'approved' : 'rejected';
-    const closed = (await this.deps.repository.update(taskId, {
-      status,
+    const resolution: HumanTaskResolution =
+      evaluation.outcome === 'approved' ? 'approved' : 'rejected';
+    // 条件关闭：并发下只有一个请求能把 task 从 open 改走。只有那一个是"完成收敛的人"，
+    // 由它触发 onResolved —— 否则两个审批者会各自把同一个业务动作执行一遍。
+    const closed = await this.deps.repository.close(taskId, {
+      status: resolution,
       completedAt: new Date().toISOString(),
-    }))!;
-    await this.deps.onResolved?.(
-      { ...closed, decisions: all },
-      evaluation.outcome === 'approved' ? 'approved' : 'rejected',
-      all,
-    );
+    });
+    if (!closed) {
+      // 另一并发请求先收敛了：本请求不再触发 onResolved，按真实状态返回
+      const latest = (await this.deps.repository.get(taskId)) ?? task;
+      return { task: { ...latest, decisions: all }, evaluation };
+    }
+    await this.deps.onResolved?.({ ...closed, decisions: all }, resolution, all);
     return { task: { ...closed, decisions: all }, evaluation };
   }
 
@@ -198,12 +252,23 @@ export class HumanTaskService {
   ): Promise<HumanTask> {
     const task = await this.mustGetOpen(taskId);
     if (task.type !== 'input') throw new Error('该任务不是输入任务');
+    // 与 approve / reject / delegate / cancel 对齐：不在 eligible 范围内的人不能提交输入。
+    // 只凭 task id 就能写值，等于把"谁能补这个字段"交给调用方自己声明 —— 金融场景下
+    // 这既绕开了 assignment，也让 execution 能被无关的人推到 resuming。
+    if (!isAssignee(task, input.principal)) {
+      throw new Error('无权提交该人工输入（不在 eligible 范围内）');
+    }
     const values = this.validateInput(task, input.values);
-    const closed = (await this.deps.repository.update(taskId, {
+    const closed = await this.deps.repository.close(taskId, {
       status: 'approved',
       inputValues: values,
       completedAt: new Date().toISOString(),
-    }))!;
+    });
+    if (!closed) {
+      // 读到 open 与关闭之间被别人抢先关掉：本次不再触发 onResolved
+      const latest = await this.deps.repository.get(taskId);
+      throw new Error(`human task 已关闭（${latest?.status ?? 'unknown'}）`);
+    }
     await this.deps.onResolved?.(closed, 'input_submitted', []);
     return closed;
   }
@@ -232,10 +297,12 @@ export class HumanTaskService {
     if (!task) throw new Error(`human task 不存在："${taskId}"`);
     if (task.status !== 'open') return task;
     if (!isAssignee(task, input.principal)) throw new Error('无权取消该任务');
-    const closed = (await this.deps.repository.update(taskId, {
+    const closed = await this.deps.repository.close(taskId, {
       status: 'cancelled',
       completedAt: new Date().toISOString(),
-    }))!;
+    });
+    // 并发下可能已被别人关闭：那次已经触发过 onResolved，这里不再重复
+    if (!closed) return (await this.deps.repository.get(taskId)) ?? task;
     await this.deps.onResolved?.(closed, 'cancelled', []);
     return closed;
   }
@@ -245,7 +312,8 @@ export class HumanTaskService {
     const expired = await this.deps.repository.listExpired(nowIso);
     const out: HumanTask[] = [];
     for (const task of expired) {
-      const closed = await this.deps.repository.update(task.taskId, {
+      // 条件关闭：扫描期间可能已被审批/取消抢先收敛，那种情况 onResolved 已由对方触发
+      const closed = await this.deps.repository.close(task.taskId, {
         status: 'expired',
         completedAt: nowIso,
       });
