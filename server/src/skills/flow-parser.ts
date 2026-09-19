@@ -3,17 +3,34 @@ import { toString } from 'mdast-util-to-string';
 import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import { visit } from 'unist-util-visit';
+import type {
+  FlowAst,
+  FlowAstAttr,
+  FlowAstFlow,
+  FlowAstNode,
+  FlowAstRoute,
+} from './flow-ast.js';
 import {
   ALL_ATTR_NAMES,
   NODE_ATTRS,
   type FlowBlockType,
   type FlowIssue,
   type FlowNodeType,
-  type FlowRoute,
 } from '../workflow/types.js';
 
 /**
- * Skill Flow 的解析器：`SKILL.md` → Flow blocks。
+ * Skill Flow 的**语法层**：`SKILL.md` → `FlowAst`。
+ *
+ * 职责边界（这一层只回答"作者写了什么"）：
+ *
+ *   ✅ 认出 `## @<type> <id>` 块、切出正文、切出保留属性、提取路由
+ *   ✅ 词法层面的报错：块类型不认识、缺 id、标题层级不对、属性名不认识/重复
+ *   ❌ 不做任何语义判断：角色有没有登记、gate 有没有注册、route 指向的节点存不存在、
+ *      流程能不能走到 @end —— 那些全部属于 `flow-validator.ts` / `flow-analyzer.ts`
+ *
+ * 为什么这个边界值得守：一旦 parser 开始"顺手"做语义判断，`FlowAst` 就不再是
+ * "作者写了什么"的忠实记录，而变成"作者写的、且服务端认可的部分"。那时
+ * "你写的第 12 行不合法"这种报错就无从生成 —— 因为那一行已经被丢掉了。
  *
  * 只认 `## @<type> <id>` 的**二级**标题（`## @gate compliance`）：
  * - `#` / `###` 不会被当成 flow block（同时会报一条 issue，避免"写了却没生效"）
@@ -25,8 +42,8 @@ import {
  * 路由只从段落与列表项里取，` ``` ` 里的 `- pass -> x` 不算。
  *
  * 另外解析正文最前面的**保留属性**（`role: compliance.reviewer`）：只有 `@review` /
- * `@action` 支持，且必须写在正文最前面。属性区会被从正文里剥掉，所以它不会混进
- * 描述或 prompt；值的合法性由 flow-validator 判定。
+ * `@action` / `@agent` 支持，且必须写在正文最前面。属性区会被从正文里剥掉，所以它
+ * 不会混进描述或 prompt；值的合法性由 flow-validator 判定。
  */
 
 /** `## @agent research` / `## @flow investment-review` */
@@ -62,42 +79,16 @@ function stripFrontmatter(markdown: string): string {
   return '\n'.repeat(match[0].split('\n').length - 1) + markdown.slice(match[0].length);
 }
 
-export interface ParsedFlowAttr {
-  /** 小写属性名 */
-  name: string;
-  /** 原样值（值的合法性由校验器判定） */
-  value: string;
-  /** 该属性行在 SKILL.md 里的行号（1-based）—— 报错直接指到这一行 */
-  line: number;
-}
-
-export interface ParsedFlowBlock {
-  type: FlowBlockType;
-  id: string;
-  /** 节点正文（原样 Markdown，**已剥掉开头的保留属性行**） */
-  markdown: string;
-  /** `## @xxx` 所在行（1-based）—— 报错时指向这一行，作者一眼能定位 */
-  headingLine: number;
-  /** 正文内容的首行 / 末行（1-based）；正文为空时都等于 headingLine */
-  startLine: number;
-  endLine: number;
-  routes: FlowRoute[];
-  /** 保留属性（只有 @review / @action 会有非空值） */
-  attrs: ParsedFlowAttr[];
-  /** 仅 `@flow`：`start -> research` 的目标 */
-  start?: string;
-}
-
-export interface ParsedSkillFlow {
-  blocks: ParsedFlowBlock[];
-  /** 解析期问题（未知块类型、缺 id、标题层级不对等） */
-  issues: FlowIssue[];
-}
-
-/** 段落/列表项里的文本候选（带偏移，用于按块归属） */
+/**
+ * 段落/列表项里的文本候选（带偏移与首行行号）。
+ *
+ * 偏移用于按块归属；行号用于给 route 标出自己在 SKILL.md 的哪一行。
+ */
 interface TextCandidate {
   offset: number;
   text: string;
+  /** 该候选文本首行在 SKILL.md 里的行号（1-based） */
+  line: number;
 }
 
 /** 节点 id 与出口名统一小写：避免 `pass -> Compliance-Review` 这种大小写不一致的静默失配 */
@@ -124,7 +115,7 @@ function splitAttrs(input: {
   type: FlowBlockType;
   nodeId: string;
   issues: FlowIssue[];
-}): { attrs: ParsedFlowAttr[]; bodyLines: string[] } {
+}): { attrs: FlowAstAttr[]; bodyLines: string[] } {
   const { bodyLines, startLine, type, nodeId, issues } = input;
   const known = NODE_ATTRS[type as FlowNodeType] ?? [];
   const label = `@${type}${nodeId ? ` ${nodeId}` : ''}`;
@@ -137,11 +128,10 @@ function splitAttrs(input: {
   }
 
   const intendsAttrs =
-    zone.some((a) => known.includes(a.name)) ||
-    zone.some((a) => ALL_ATTR_NAMES.includes(a.name));
+    zone.some((a) => known.includes(a.name)) || zone.some((a) => ALL_ATTR_NAMES.includes(a.name));
   if (!intendsAttrs) return { attrs: [], bodyLines };
 
-  const attrs: ParsedFlowAttr[] = [];
+  const attrs: FlowAstAttr[] = [];
   const seen = new Set<string>();
   for (const a of zone) {
     const nodeIdField = nodeId ? { nodeId } : {};
@@ -173,10 +163,12 @@ function splitAttrs(input: {
 }
 
 /**
- * 解析 SKILL.md 里的全部 flow blocks。
- * 结构性问题（缺 @flow、路由指向不存在的节点等）由 flow-validator 判定，这里只做词法解析。
+ * 解析 SKILL.md，产出 `FlowAst`。
+ *
+ * 结构性问题（缺 @flow、路由指向不存在的节点、流程走不到终点等）由
+ * `flow-validator.ts` / `flow-analyzer.ts` 判定，这里只做词法解析。
  */
-export function parseSkillFlow(markdown: string): ParsedSkillFlow {
+export function parseSkillFlow(markdown: string): FlowAst {
   const source = stripFrontmatter(markdown);
   const lines = source.split('\n');
   const tree = unified().use(remarkParse).parse(source) as Root;
@@ -188,11 +180,12 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
     if (node.type !== 'paragraph' && node.type !== 'listItem') return;
     const offset = node.position?.start.offset;
     if (offset === undefined) return;
-    candidates.push({ offset, text: toString(node) });
+    candidates.push({ offset, text: toString(node), line: node.position?.start.line ?? 1 });
   });
 
   const issues: FlowIssue[] = [];
-  const blocks: ParsedFlowBlock[] = [];
+  const nodes: FlowAstNode[] = [];
+  const flows: FlowAstFlow[] = [];
   const children = tree.children;
 
   for (let i = 0; i < children.length; i++) {
@@ -255,20 +248,22 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
       ? (body[body.length - 1]!.position?.end.offset ?? bodyStartOffset)
       : bodyStartOffset;
 
-    // 路由：本块偏移区间内的段落/列表项文本
-    const routes: FlowRoute[] = [];
+    // 路由：本块偏移区间内的段落/列表项文本。
+    // 行号 = 候选文本首行 + 文本内的第几行 —— 段落与列表项的 `toString()` 按源文件
+    // 的软换行保留 `\n`，所以这个映射对"一行一条 route"的常见写法是精确的。
+    const routes: FlowAstRoute[] = [];
     const seen = new Set<string>();
     for (const candidate of candidates) {
       if (candidate.offset < bodyStartOffset || candidate.offset >= bodyEndOffset) continue;
-      for (const lineText of candidate.text.split('\n')) {
+      for (const [index, lineText] of candidate.text.split('\n').entries()) {
         const rm = lineText.match(ROUTE);
         if (!rm) continue;
-        const on = norm(rm[1]!);
-        const to = norm(rm[2]!);
-        const key = `${on}->${to}`;
+        const outcome = norm(rm[1]!);
+        const target = norm(rm[2]!);
+        const key = `${outcome}->${target}`;
         if (seen.has(key)) continue;
         seen.add(key);
-        routes.push({ on, to });
+        routes.push({ outcome, target, line: candidate.line + index });
       }
     }
 
@@ -280,29 +275,32 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
       });
     }
 
-    const block: ParsedFlowBlock = {
-      type,
-      id: norm(id),
-      markdown: bodyMarkdown,
-      headingLine,
-      startLine,
-      endLine,
-      routes,
-      attrs,
-    };
     if (type === 'flow') {
-      const start = routes.find((r) => r.on === 'start')?.to;
-      if (start) block.start = start;
+      const start = routes.find((r) => r.outcome === 'start')?.target;
+      const flow: FlowAstFlow = { id: norm(id), line: headingLine, routes };
+      if (start) flow.start = start;
       else if (id) {
         issues.push({
           code: 'flow-missing-start',
           line: headingLine,
-          message: `@flow ${id} 没有声明入口（写法：start -> <节点 id>）`,
+          message: `@flow ${norm(id)} 没有声明入口（写法：start -> <节点 id>）`,
         });
       }
+      flows.push(flow);
+      continue;
     }
-    blocks.push(block);
+
+    nodes.push({
+      type: type as FlowNodeType,
+      id: norm(id),
+      body: bodyMarkdown,
+      line: headingLine,
+      startLine,
+      endLine,
+      attrs,
+      routes,
+    });
   }
 
-  return { blocks, issues };
+  return { flows, nodes, issues };
 }

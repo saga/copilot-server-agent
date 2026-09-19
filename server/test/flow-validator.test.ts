@@ -3,9 +3,11 @@ import { test } from 'node:test';
 
 import { parseSkillFlow } from '../src/skills/flow-parser.js';
 import { validateSkillFlow } from '../src/skills/flow-validator.js';
+import { analyzeFlow } from '../src/skills/flow-analyzer.js';
 import { loadSkill, skillSearchDirs } from '../src/skills/index.js';
 import { businessRoleLookup } from '../src/identity/business-roles.js';
 import { flowRegistryLookup } from '../src/workflow/registry.js';
+import type { FlowDefinition, FlowIssue } from '../src/workflow/types.js';
 
 /**
  * Flow 静态校验：**在跑之前**把问题全报出来。
@@ -16,10 +18,28 @@ import { flowRegistryLookup } from '../src/workflow/registry.js';
  * 这两类必须在建 execution 时就 400。
  *
  * 同时确认**允许环**：research → review → research 是研究流程的常态，不能按 DAG 判。
+ *
+ * 分层之后这里有两套入口：
+ *   `semantics()`  只跑语义校验（AST → FlowDefinition）—— 测这一层的边界
+ *   `ok()`         跑完整流水线（校验 + 控制流分析）—— 测作者看到的结果
+ * 生产路径（definition-provider）用的是后者。
  */
 
-const ok = (md: string, opts: Parameters<typeof validateSkillFlow>[1] = {}) =>
+/** 只跑语义校验：回答"允许执行什么" */
+const semantics = (md: string, opts: Parameters<typeof validateSkillFlow>[1] = {}) =>
   validateSkillFlow(parseSkillFlow(md), opts);
+
+/** 完整流水线：语义校验 + 控制流分析（与 definition-provider.load 一致） */
+const ok = (md: string, opts: Parameters<typeof validateSkillFlow>[1] = {}) => {
+  const ast = parseSkillFlow(md);
+  const validated = validateSkillFlow(ast, opts);
+  const issues: FlowIssue[] = [...validated.issues];
+  if (validated.definition) issues.push(...analyzeFlow(validated.definition));
+  return { definition: validated.definition, issues };
+};
+
+/** 定义一定存在时取出来（断言里的 `!` 太吵） */
+const def = (r: { definition?: FlowDefinition }): FlowDefinition => r.definition!;
 
 /** 拼流程用的小工具（只是 join，避免一长串 '...' 逗号列表看错行） */
 const flow = (...lines: string[]): string => lines.join('\n');
@@ -301,8 +321,17 @@ test('校验：同一个出口写了两条 route 必须报错（否则后一条�
   assert.ok(hit, '"pass" 出现两次必须报错，而不是取第一条');
   assert.equal(hit!.nodeId, 'check');
   assert.match(hit!.message, /pass/);
-  assert.match(hit!.message, /done 与 failed/, '要把两条目标都写出来，作者才知道删哪条');
-  assert.equal(dupGate.definition, undefined, '有 issue 就不给定义');
+  assert.match(
+    hit!.message,
+    /-> done[\s\S]*-> failed/,
+    '要把两条目标都写出来，作者才知道删哪条',
+  );
+  assert.equal(
+    hit!.line,
+    8,
+    '指到**重复的那一条** route 自己的行（第 8 行），而不是节点标题行 —— 否则等于没报',
+  );
+  assert.equal(dupGate.definition, undefined, '有 error 就不给定义');
 });
 
 test('校验：@flow 的 start 也只能有一条（`start -> a` + `start -> b` 是歧义入口）', () => {

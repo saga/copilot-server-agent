@@ -1,13 +1,23 @@
 /**
  * Skill Flow：`SKILL.md` 里的轻量编排层。
  *
- * 刻意不定义第二套 Workflow DSL，也不引入 BPMN / XState：
+ * 刻意不定义第二套 Workflow DSL，也不引入 BPMN / XState。四层，各答一个问题：
  *
- *   SKILL.md（Markdown AST）
- *        ↓  remark-parse
- *   FlowDefinition（本文件的类型）
- *        ↓
- *   WorkflowRunner ── 复用现有 Execution / HumanTask / Action 体系
+ *   SKILL.md
+ *        ↓  remark-parse（语法层）
+ *   FlowAst            作者**写了**什么 —— skills/flow-ast.ts
+ *        ↓  语义校验（注册表 / 角色 / 分支契约 / 属性只能更严）
+ *   FlowDefinition     系统确认这是什么、允许执行什么（本文件）
+ *        ↓  控制流分析（可达性 / 能否到达终态）—— skills/flow-analyzer.ts
+ *   WorkflowRunner     状态怎么推进 —— 复用现有 Execution / HumanTask / Action 体系
+ *
+ * 为什么不合成一层：`FlowAst` 必须能携带**不合法的内容**（`strategy: all`、指向不存在
+ * 节点的 route），否则"你写的第 12 行不合法"这种带行号的报错就无从生成；而
+ * `FlowDefinition` 必须是"已验证 + 已归一化 + 可执行"的。两个模型各自承担一条不变量，
+ * 中间那次转换就是校验器。
+ *
+ * 也不再加第五层（CST / IR / SSA）：控制流分析需要的只是一张邻接表
+ * （`Map<string, Set<string>>`），它就是 `flow-analyzer.ts` 里的一个局部变量。
  *
  * 节点只有 6 种，没有 parallel / timer / subprocess / expression：
  *
@@ -127,13 +137,35 @@ export interface FlowContext {
  */
 export const MAX_FLOW_STEPS = 100;
 
-/** 解析/校验问题（带 SKILL.md 行号） */
+/**
+ * 问题级别。
+ *
+ * `error`   挡住执行 —— 建 execution 时 400，`definition-provider` 不产出定义
+ * `warning` 只是提醒 —— 流程照跑，但作者应该看一眼（例如整条流程没有任何成功出口）
+ *
+ * 缺省按 `error` 处理：新增一条检查时**默认是拦的**，要放宽必须显式写 `warning`。
+ * 反过来（缺省 warning）会让新加的检查静默失效。
+ */
+export type FlowIssueSeverity = 'error' | 'warning';
+
+/** 解析/校验/分析问题（带 SKILL.md 行号） */
 export interface FlowIssue {
   code: string;
   message: string;
   /** SKILL.md 内的 1-based 行号；0 表示与具体行无关 */
   line: number;
   nodeId?: string;
+  /** 缺省 = 'error' */
+  severity?: FlowIssueSeverity;
+}
+
+export function isBlockingIssue(issue: FlowIssue): boolean {
+  return (issue.severity ?? 'error') === 'error';
+}
+
+/** 有没有**挡住执行**的问题（warning 不算） */
+export function hasBlockingIssue(issues: readonly FlowIssue[]): boolean {
+  return issues.some(isBlockingIssue);
 }
 
 /**

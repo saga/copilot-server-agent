@@ -26,6 +26,22 @@ Principal { userId, roles, groups }
 
 ## Skill Flow（`@flow` / `@agent` / `@gate` / `@review` / `@action` / `@stop` / `@end`）
 - 定义写在 `SKILL.md` 里，Markdown AST 解析（remark），**没有第二套 YAML/BPMN DSL**。
+- 🧱 **四层流水线（不要合并、也不要再加第五层）**：
+  `flow-parser.ts` → `FlowAst`（作者写了什么）→ `flow-validator.ts` → `FlowDefinition`
+  （允许执行什么）→ `flow-analyzer.ts`（图的形状）→ `runner.ts`。
+  类型在 `skills/flow-ast.ts`。CFG 只是 `flow-analyzer.ts` 里的 `Map<string, Set<string>>`，
+  **不建 cfg.ts**。
+- ⚠️ **AST 必须能携带不合法的内容**：`FlowAstAttr.value` 是原样字符串（不是
+  `'ANY'|'ALL'`），否则 `strategy: all` 报不出"第 12 行不合法"；route 指向不存在的节点、
+  未注册的 role 也照收。`@flow` 是 `flows[]`（可能 0 个或 2 个）。
+  AST route 用 `{outcome, target, line}`，`FlowDefinition` 用 `{on, to}`，中间是接缝。
+- `FlowIssue.severity?: 'error' | 'warning'`，**缺省 error**；`hasBlockingIssue()` 判定。
+  三条控制流检查**刻意不重叠**：`node-unreachable`（start 走不到）、
+  `no-terminal-path`（可达节点到不了终态）、`no-success-path`（**整条流程没有 @end**，
+  warning）。环本身不报错。
+- 结构错误存在时**不跑分析器**（边指向不存在节点会得出"这节点出不去"的错误结论）。
+- 离线 lint：`npm --prefix server run flow:lint -- <SKILL.md|技能目录|技能根目录>`，
+  用**与生产同一份**注册表与配置；输出 `path:line ERROR|WARN code  message`，error 退出码 1。
 - `@subagent` 是 `@agent` 的旧名（parser 归一化）；**别动** SDK 的 `subagent.*` 事件，那是另一回事。
 - `@agent <id>` 的 **id 必须等于技能目录名**（`findSkill` 按目录找），否则 `skill-missing`。
 - 三个文件分工：`workflow/runner.ts`（状态机）/ `workflow/runtime.ts`（节点怎么执行）/

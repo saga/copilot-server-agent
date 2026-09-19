@@ -1,9 +1,10 @@
-import type { ParsedFlowAttr, ParsedFlowBlock, ParsedSkillFlow } from './flow-parser.js';
+import type { FlowAst, FlowAstAttr, FlowAstNode, FlowAstRoute } from './flow-ast.js';
 import { BUSINESS_ROLE_ID } from '../identity/business-roles.js';
 import {
   FLOW_CONTRACT_ID,
   NODE_OUTCOMES,
   WORKFLOW_AGENT_ALLOWED_KINDS,
+  hasBlockingIssue,
   isFlowPermissionKind,
   requiredVotes,
   type FlowDefinition,
@@ -11,32 +12,38 @@ import {
   type FlowNode,
   type FlowNodeAttrs,
   type FlowPermissionKind,
-  type FlowRoute,
   type ReviewBasePolicy,
 } from '../workflow/types.js';
 
 /**
- * Flow 静态校验。**在执行之前**把问题全部报出来，不要跑到一半才发现路由指向不存在的节点。
+ * Flow **语义校验**：`FlowAst` → `FlowDefinition`。
  *
- * 只做 14 件事（刻意不做 DAG 校验）：
+ * 输入是"作者写了什么"，输出是"系统确认这是什么、允许执行什么"。中间这一步是
+ * 整条流水线里唯一做**授权判断**的地方，所以它也是唯一需要注册表的层。
+ *
+ * 只做 13 件事：
  *   1. 恰好一个 @flow（v1 一个技能一条流程）
  *   2. @flow 声明了 start，且 start 不重复
  *   3. 节点 id 唯一
  *   4. 所有 route target 都存在
  *   5. @end / @stop 不允许再 route
  *   6. 非终态节点必须至少有一条 route
- *   7. 所有节点从 start 可达
- *   8. **同一个出口不能有两条 route** —— 否则 runner 取第一条，后面那条静默失效
- *   9. **保留属性合法**（role/strategy/required/exclude/output/tools），且 @review 必须能拿到业务角色
- *  10. **允许环** —— research → review → research 是研究流程的常态，用可达性而不是 DAG 判定
- *  11. **属性只能比服务端更严**：`role` 必须落在注册表的 eligibleRoles 里，
+ *   7. **同一个出口不能有两条 route** —— 否则 runner 取第一条，后面那条静默失效
+ *   8. **保留属性合法**（role/strategy/required/exclude/output/tools），且 @review 必须能拿到业务角色
+ *   9. **允许环** —— research → review → research 是研究流程的常态，用可达性而不是 DAG 判定
+ *  10. **属性只能比服务端更严**：`role` 必须落在注册表的 eligibleRoles 里，
  *      `strategy` 只能 ANY→ALL，`required` 只能加不能减，`exclude` 不能把禁止自批改成允许
  *      （否则一份可编辑的 Markdown 就能把"要 3 个人批"降成"1 个人批"）
- *  12. **`strategy: ALL` 必须真的全员**：生效票数 < 生效角色数 → `review-all-required`
+ *  11. **`strategy: ALL` 必须真的全员**：生效票数 < 生效角色数 → `review-all-required`
  *      （`ALL + required: 1` 只是名字叫 ALL 的 ANY，审计链上却写着 ALL）
- *  13. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
- *  14. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
+ *  12. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
+ *  13. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
  *      `mcp` / `shell` 永久禁止（`agent-tools-forbidden`），其余只能比服务端上限更严
+ *
+ * **刻意不做**图的分析（可达性、能否到达终态）：那属于 `flow-analyzer.ts`，
+ * 输入是校验完的 `FlowDefinition`。这一层只回答"每条边、每个属性合不合法"，
+ * 不回答"这张图长什么样" —— 两件事的变化原因不同（前者跟着授权模型走，
+ * 后者跟着业务建模需求走），混在一起会让每条新检查都要重新理解整张图。
  *
  * `@agent <skill>` 指向的技能是否存在由调用方补校验（校验器不认识技能目录）；
  * `role:` 指向的业务角色是否已登记同理（见 `opts.hasRole`）。
@@ -85,7 +92,7 @@ export interface ValidateSkillFlowOptions {
 }
 
 export interface FlowValidationResult {
-  /** 仅在没有任何 issue 时给出 */
+  /** 在没有任何 **error** 时给出（warning 不阻断，随 issues 一起交回） */
   definition?: FlowDefinition;
   issues: FlowIssue[];
 }
@@ -106,7 +113,7 @@ const TERMINAL_TYPES = new Set(['stop', 'end']);
  * 因为那一步要等所有节点的属性都归一化完、注册表也可用。
  */
 function buildAttrs(input: {
-  block: ParsedFlowBlock;
+  block: FlowAstNode;
   nodeId: string;
   hasRole?: (id: string) => boolean;
   hasOutput?: (id: string) => boolean;
@@ -116,7 +123,7 @@ function buildAttrs(input: {
   const attrs: FlowNodeAttrs = {};
   const nodeIdField = nodeId ? { nodeId } : {};
 
-  const bad = (attr: ParsedFlowAttr, detail: string): void => {
+  const bad = (attr: FlowAstAttr, detail: string): void => {
     issues.push({
       code: 'attr-invalid',
       line: attr.line,
@@ -227,28 +234,31 @@ function buildAttrs(input: {
  * `findRoute()` 是 `routes.find((r) => r.on === outcome)` —— 第一条命中就返回，
  * 后面的**静默被忽略**。作者以为"pass 会去 a 也可能去 b"，实际永远只去 a。
  * 这种"看不出错、但走向不由自己决定"的写法必须在执行前拦住。
+ *
+ * 报错指到**重复的那一条** route 自己的行，而不是节点标题行 —— 一个 20 行的节点里
+ * 让你自己找哪两行冲突，等于没报。
  */
 function checkDuplicateOutcomes(
-  routes: FlowRoute[],
-  line: number,
+  routes: readonly FlowAstRoute[],
   issues: FlowIssue[],
   where: { nodeId?: string; label: string },
 ): void {
-  const seen = new Map<string, string>();
+  const seen = new Map<string, FlowAstRoute>();
   for (const route of routes) {
-    const previous = seen.get(route.on);
+    const previous = seen.get(route.outcome);
     if (previous) {
       issues.push({
         code: 'route-outcome-duplicate',
-        line,
+        line: route.line,
         ...(where.nodeId ? { nodeId: where.nodeId } : {}),
         message:
-          `${where.label} 的出口 "${route.on}" 重复：` +
-          `${previous} 与 ${route.to} 不能同时存在（只会走第一条）`,
+          `${where.label} 的出口 "${route.outcome}" 重复：` +
+          `第 ${previous.line} 行的 -> ${previous.target} 与这一行的 -> ${route.target} ` +
+          '不能同时存在（只会走第一条）',
       });
       continue;
     }
-    seen.set(route.on, route.to);
+    seen.set(route.outcome, route);
   }
 }
 
@@ -340,11 +350,11 @@ function checkNarrowing(input: {
 }
 
 export function validateSkillFlow(
-  parsed: ParsedSkillFlow,
+  ast: FlowAst,
   opts: ValidateSkillFlowOptions = {},
 ): FlowValidationResult {
-  const issues: FlowIssue[] = [...parsed.issues];
-  const flowBlocks = parsed.blocks.filter((b) => b.type === 'flow');
+  const issues: FlowIssue[] = [...ast.issues];
+  const flowBlocks = ast.flows;
 
   // 1. 恰好一个 @flow
   if (flowBlocks.length === 0) {
@@ -358,7 +368,7 @@ export function validateSkillFlow(
   if (flowBlocks.length > 1) {
     issues.push({
       code: 'flow-duplicate',
-      line: flowBlocks[1]!.headingLine,
+      line: flowBlocks[1]!.line,
       message: `v1 只支持一个 @flow，发现 ${flowBlocks.length} 个（${flowBlocks.map((b) => b.id).join(', ')}）`,
     });
     return { issues };
@@ -368,7 +378,7 @@ export function validateSkillFlow(
   if (opts.flow && flowBlock.id !== opts.flow.toLowerCase()) {
     issues.push({
       code: 'flow-name-mismatch',
-      line: flowBlock.headingLine,
+      line: flowBlock.line,
       message: `SKILL.md 里的流程是 "${flowBlock.id}"，但请求的是 "${opts.flow}"`,
     });
   }
@@ -378,37 +388,40 @@ export function validateSkillFlow(
   if (!start) {
     // @flow 缺 start 时 parser 已经报过一条
     if (!issues.some((i) => i.code === 'flow-missing-start')) {
-      issues.push({ code: 'flow-missing-start', line: flowBlock.headingLine, message: '@flow 没有声明入口（start -> <节点 id>）' });
+      issues.push({ code: 'flow-missing-start', line: flowBlock.line, message: '@flow 没有声明入口（start -> <节点 id>）' });
     }
     return { issues };
   }
 
-  const nodeBlocks = parsed.blocks.filter((b) => b.type !== 'flow');
+  const nodeBlocks = ast.nodes;
 
   // 2b. `start` 也只能有一条：`start -> a` 与 `start -> b` 同时存在时 runner 取第一条，
   // 第二条静默失效 —— 金融流程不该有这种"看书写顺序决定走向"的不确定性。
-  checkDuplicateOutcomes(flowBlock.routes, flowBlock.headingLine, issues, {
+  checkDuplicateOutcomes(flowBlock.routes, issues, {
     nodeId: flowBlock.id,
     label: `@flow ${flowBlock.id}`,
   });
 
   // 3. 节点 id 唯一
   const nodes: Record<string, FlowNode> = {};
+  /** 归一化后的节点 → 它在 AST 里的原样（重复出口要指到 route 自己的行，只有 AST 有行号） */
+  const astNodes: Record<string, FlowAstNode> = {};
   for (const block of nodeBlocks) {
     if (!block.id) continue; // parser 已报 block-missing-id
     if (nodes[block.id]) {
       issues.push({
         code: 'node-duplicate',
-        line: block.headingLine,
+        line: block.line,
         nodeId: block.id,
         message: `节点 id 重复："${block.id}"（已出现在第 ${nodes[block.id]!.headingLine} 行）`,
       });
       continue;
     }
+    astNodes[block.id] = block;
     nodes[block.id] = {
       id: block.id,
-      type: block.type as FlowNode['type'],
-      body: block.markdown,
+      type: block.type,
+      body: block.body,
       attrs: buildAttrs({
         block,
         nodeId: block.id,
@@ -416,14 +429,15 @@ export function validateSkillFlow(
         ...(opts.registry?.hasOutput ? { hasOutput: opts.registry.hasOutput } : {}),
         issues,
       }),
-      routes: block.routes,
+      // AST 用作者视角的 outcome/target，可执行模型用紧凑的 on/to；这一次映射是两层的接缝
+      routes: block.routes.map((r) => ({ on: r.outcome, to: r.target })),
       startLine: block.startLine,
-      headingLine: block.headingLine,
+      headingLine: block.line,
       endLine: block.endLine,
     };
   }
 
-  // 4/5/6/8. 路由合法性
+  // 4/5/6/7. 路由合法性
   for (const node of Object.values(nodes)) {
     const terminal = TERMINAL_TYPES.has(node.type);
     if (terminal && node.routes.length) {
@@ -442,7 +456,7 @@ export function validateSkillFlow(
         message: `@${node.type} ${node.id} 没有出口（非终态节点必须至少有一条 route，如 "- success -> next"）`,
       });
     }
-    checkDuplicateOutcomes(node.routes, node.headingLine, issues, {
+    checkDuplicateOutcomes(astNodes[node.id]!.routes, issues, {
       nodeId: node.id,
       label: `@${node.type} ${node.id}`,
     });
@@ -511,32 +525,13 @@ export function validateSkillFlow(
     }
   }
 
-  // 7. 可达性（允许环，所以只查可达、不做 DAG）
-  if (nodes[start]) {
-    const reachable = new Set<string>();
-    const queue = [start];
-    while (queue.length) {
-      const id = queue.shift()!;
-      if (reachable.has(id)) continue;
-      reachable.add(id);
-      for (const route of nodes[id]?.routes ?? []) {
-        if (nodes[route.to]) queue.push(route.to);
-      }
-    }
-    for (const node of Object.values(nodes)) {
-      if (!reachable.has(node.id)) {
-        issues.push({
-          code: 'node-unreachable',
-          line: node.headingLine,
-          nodeId: node.id,
-          message: `@${node.type} ${node.id} 从 start "${start}" 不可达（没有任何 route 指向它）`,
-        });
-      }
-    }
-  } else {
+  // 7. 可达性与"能不能到达终态"**不在这里** —— 那是 flow-analyzer.ts 的活。
+  // 这一层只保证"每条边都指向存在的节点"，图长什么样由分析器看。
+  // 唯一的例外是 start 本身解析不了：那时没有任何入口，图无从谈起。
+  if (!nodes[start]) {
     issues.push({
       code: 'start-missing-node',
-      line: flowBlock.headingLine,
+      line: flowBlock.line,
       message: `入口 "start -> ${start}" 指向不存在的节点："${start}"`,
     });
   }
@@ -650,6 +645,8 @@ export function validateSkillFlow(
     }
   }
 
-  if (issues.length) return { issues };
+  // 只有 **error** 阻断：warning 是"流程能跑，但你该看一眼"。
+  // 定义照常产出，warning 随 issues 一起交回调用方（lint 打印，运行时忽略）。
+  if (hasBlockingIssue(issues)) return { issues };
   return { definition: { id: flowBlock.id, start, nodes }, issues };
 }

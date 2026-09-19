@@ -85,7 +85,13 @@ output: non-empty
 完成。
 `;
 
-/** 自环流程：gate 永远返回 again，用来看步数上限兜底 */
+/**
+ * 自环流程：gate **运行时**永远返回 again，用来看步数上限兜底。
+ *
+ * 注意它必须有一条通向 `@end` 的 route：`no-terminal-path` 会在**静态**就拦下
+ * "没有任何出口的环"，那样就测不到运行时的兜底了。这两条闸门分工不同 ——
+ * 静态分析器只能证明"图上没有出口"，证明不了"审核人永远不同意"。
+ */
 const SPIN_MD = `---
 name: flow-spin
 description: 环不收敛
@@ -100,6 +106,11 @@ start -> demo-spin
 永远再来一次。
 
 - again -> demo-spin
+- stop -> done
+
+## @end done
+
+done
 `;
 
 /** 出口写错：@action 只写了 success（校验器必须在跑之前拦住） */
@@ -261,7 +272,9 @@ registerFlowGate({
 
 registerFlowGate({
   name: 'demo-spin',
-  outcomes: ['again'],
+  // `stop` 必须声明：gate 的出口词汇表是静态契约，写了 route 却没声明 = 一条永不走到的分支。
+  // 这个 gate 实际只返回 again，声明 stop 只是让流程有一个"理论上能出去"的出口。
+  outcomes: ['again', 'stop'],
   async evaluate() {
     return { outcome: 'again' };
   },

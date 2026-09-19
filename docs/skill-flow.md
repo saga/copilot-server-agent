@@ -203,6 +203,148 @@ Business mutation
 
 ---
 
+### 1.7 实现分层：三个模型，各答一个问题
+
+Skill Flow 的实现是**四层流水线**，每层只回答一个问题。这不是抽象洁癖 —— 每一层都
+对应一条**必须单独成立**的不变量，混在一起就没法分别保证。
+
+```text
+                        SKILL.md
+                            │
+                            ▼
+                   ┌─────────────────┐
+                   │  flow-parser    │  语法层
+                   └────────┬────────┘
+                            ▼
+                        FlowAst                 「作者**写了**什么」
+                            │                   → skills/flow-ast.ts
+                            ▼
+                   ┌─────────────────┐
+                   │ flow-validator  │  语义层（唯一需要注册表的层）
+                   └────────┬────────┘
+                            ▼
+                     FlowDefinition             「系统确认这是什么、允许执行什么」
+                            │                   → workflow/types.ts
+                            ▼
+                   ┌─────────────────┐
+                   │  flow-analyzer  │  控制流层
+                   └────────┬────────┘
+                            ▼
+                       issues / warnings
+                            │
+                            ▼
+                     WorkflowRunner
+```
+
+| 层 | 输入 → 输出 | 回答 | 不做 |
+| --- | --- | --- | --- |
+| `flow-parser.ts` | Markdown → `FlowAst` | 作者写了什么 | 任何语义判断 |
+| `flow-validator.ts` | `FlowAst` → `FlowDefinition` | 允许执行什么 | 图的分析 |
+| `flow-analyzer.ts` | `FlowDefinition` → issues | 图的形状对不对 | 授权判断 |
+| `runner.ts` | `FlowDefinition` → 状态推进 | 怎么跑 | 定义从哪来 / 节点怎么执行 |
+
+#### 为什么 AST 必须允许携带"不合法的内容"
+
+这是整个分层能不能成立的关键。`FlowAst` 里的 `strategy` 值就是原样的字符串，
+**不是** `'ANY' | 'ALL'`：
+
+```ts
+interface FlowAstAttr {
+  name: string;
+  value: string;   // 原样值 —— `strategy: all` 也要能被记下来
+  line: number;    // 属性自己的行号
+}
+```
+
+如果 AST 提前把值"类型化"，那么 `strategy: maybe` 这种写法只有两个下场：强制转换
+（把合法性的判定偷偷搬进语法层），或者丢掉。两者都会让校验器**报不出**
+"你写的第 12 行不合法" —— 因为那一行已经不存在了。
+
+同理，route 指向不存在的节点、`role:` 是个没登记的角色，AST 都照收不误。
+
+#### 为什么不让 parser 顺手做语义判断
+
+一旦 parser 开始"顺手"过滤，`FlowAst` 就不再是"作者写了什么"的忠实记录，而变成
+"作者写的、且服务端认可的部分"。那时下游既拿不到问题，也说不出位置。
+
+#### 为什么 `FlowDefinition` 不叫 AST
+
+`FlowDefinition` 是**经过语义验证后的可执行模型**，它保证：
+
+```text
+route.target 一定存在
+属性一定合法且已归一化
+@gate / @review / @action 一定已注册
+```
+
+两个模型各自承担一条不变量，中间那次转换（校验器）就是"把 AST 提升为可执行模型"。
+
+#### 为什么不再加一层（CST / IR / CFG 模型）
+
+控制流分析需要的只是一张邻接表：
+
+```ts
+type Graph = Map<string, Set<string>>;
+```
+
+它就是 `flow-analyzer.ts` 里的一个局部变量，**不单独建 `cfg.ts`**。
+一旦为图单独建模型，下一步就会有人想给它加节点属性、再加一层 lowering，
+而这里真正需要的只是"能不能走到"。
+
+#### 问题级别：`error` 阻断，`warning` 不阻断
+
+```ts
+interface FlowIssue {
+  code: string;
+  message: string;
+  line: number;
+  nodeId?: string;
+  severity?: 'error' | 'warning';   // 缺省 = error
+}
+```
+
+缺省是 `error`（新增检查默认拦住），要放宽必须显式写 `warning` —— 反过来会让新加的
+检查静默失效。
+
+三条控制流检查刻意**互不重叠**，否则同一个问题会被说两遍：
+
+| code | 级别 | 含义 |
+| --- | --- | --- |
+| `node-unreachable` | error | 从 start 走不到这个节点，它永远不会被执行 |
+| `no-terminal-path` | error | 从这个节点出发无法到达任何终态 —— 走进来就出不去 |
+| `no-success-path` | warning | 整条流程**没有任何 `@end`**，只可能以失败收尾 |
+
+`no-success-path` 只查"有没有 `@end` 这个节点"，不查"到不到得了"：后者与
+`node-unreachable` 完全重叠（`@end` 到不了 ⇔ 它不可达），再报一条只是让人以为有两处要改。
+
+**环本身不报错**（`research → review → research` 是打回重做的常态），真正要拦的是
+**没有出口的环** —— 那恰好被 `no-terminal-path` 覆盖，用"活跃性"表达比"找环"更准，
+也少一个概念。
+
+#### 离线 lint
+
+```bash
+npm --prefix server run flow:lint -- server/skills
+```
+
+```text
+server/skills/x/SKILL.md:18 ERROR node-missing-outcome  @agent research 缺少出口 fail 的 route
+server/skills/x/SKILL.md:31 ERROR gate-outcome-unrouted  @gate compliance 声明的出口 review 没有 route
+server/skills/x/SKILL.md:47 ERROR no-terminal-path  @gate retry 无法到达任何终态（@end / @stop）
+
+✖ 3 errors —— 1 个 flow 已检查，2 个非 flow 技能已跳过
+```
+
+它不是"另写一套校验"：调用的就是运行时那三个函数，用的是**同一份**服务端注册表
+（`flowRegistryLookup` / `businessRoleLookup`）与同一份配置。如果 lint 与运行时判定
+有分歧，它给出的"通过"就是假的。
+
+结构错误存在时**不报图的问题** —— 一条边指向不存在的节点时，分析器会得出
+"这个节点出不去"这种**错误**结论。先修结构，再跑一次看逻辑，与编译器"先报语法
+再报类型"是同一个节奏。
+
+---
+
 # 2. 保留关键字总览
 
 当前只保留下面 7 个：

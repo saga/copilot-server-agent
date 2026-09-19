@@ -1,8 +1,14 @@
 import { loadSkill, type LoadedSkill } from '../skills/index.js';
 import { parseSkillFlow } from '../skills/flow-parser.js';
 import { validateSkillFlow, type FlowRegistryLookup } from '../skills/flow-validator.js';
+import { analyzeFlow } from '../skills/flow-analyzer.js';
 import { businessRoleLookup } from '../identity/index.js';
-import type { FlowDefinition, FlowIssue, FlowPermissionKind } from './types.js';
+import {
+  hasBlockingIssue,
+  type FlowDefinition,
+  type FlowIssue,
+  type FlowPermissionKind,
+} from './types.js';
 
 /**
  * **流程定义来源**：把"一条流程从哪来"从编排器里拆出来。
@@ -18,10 +24,20 @@ import type { FlowDefinition, FlowIssue, FlowPermissionKind } from './types.js';
  *
  * 刻意**不**做成一个大的 `WorkflowEngine` 接口：定义来源与节点执行是两个独立的
  * 变化轴（见 `runtime.ts`），合成一个接口只会让两边互相牵扯。
+ *
+ * ## 流水线（三段，各答一个问题）
+ *
+ *   parseSkillFlow     作者写了什么      → FlowAst
+ *   validateSkillFlow  允许执行什么      → FlowDefinition（语义 + 授权，需要注册表）
+ *   analyzeFlow        图的形状对不对    → issues（可达性 / 能否到达终态）
+ *
+ * 三段都跑，**只有 error 阻断**（warning 随结果交回，由 lint 打印）。
+ * 分析器也在这里跑而不是只在 lint 里跑：`node-unreachable` 与 `no-terminal-path`
+ * 在运行时同样是"跑到一半才发现"的问题，不该降级成离线提示。
  */
 
 export type FlowLoadResult =
-  | { ok: true; skill: LoadedSkill; definition: FlowDefinition }
+  | { ok: true; skill: LoadedSkill; definition: FlowDefinition; warnings: FlowIssue[] }
   | { ok: false; issues: FlowIssue[] };
 
 export interface FlowDefinitionProvider {
@@ -84,8 +100,8 @@ export class SkillFileDefinitionProvider implements FlowDefinitionProvider {
       };
     }
     // 解析与校验都只消费 skill.markdown —— 与上面那个 sourceHash 同一份字节
-    const parsed = parseSkillFlow(skill.markdown);
-    const validated = validateSkillFlow(parsed, {
+    const ast = parseSkillFlow(skill.markdown);
+    const validated = validateSkillFlow(ast, {
       flow: input.flow,
       ...(this.opts.registry ? { registry: this.opts.registry } : {}),
       // `@agent <id>` 指向的技能是否存在：用与 loadSkill 相同的匹配器，
@@ -97,7 +113,17 @@ export class SkillFileDefinitionProvider implements FlowDefinitionProvider {
       ...(this.opts.requireAgentOutput ? { requireAgentOutput: true } : {}),
     });
     if (!validated.definition) return { ok: false, issues: validated.issues };
-    return { ok: true, skill, definition: validated.definition };
+
+    // 控制流分析在**校验通过之后**跑：它只看得懂一张合法的图
+    // （边都指向存在的节点），不合法时先让上面的报错说清楚问题。
+    const issues = [...validated.issues, ...analyzeFlow(validated.definition)];
+    if (hasBlockingIssue(issues)) return { ok: false, issues };
+    return {
+      ok: true,
+      skill,
+      definition: validated.definition,
+      warnings: issues.filter((i) => i.severity === 'warning'),
+    };
   }
 
   reload(input: { skill: string; flow: string; sourceHash: string }): FlowLoadResult {
