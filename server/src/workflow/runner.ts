@@ -8,6 +8,7 @@ import type { HumanTask } from '../human-tasks/types.js';
 import { parseSkillFlow } from '../skills/flow-parser.js';
 import { validateSkillFlow } from '../skills/flow-validator.js';
 import { findSkill, loadSkill, skillSearchDirs, type LoadedSkill } from '../skills/index.js';
+import { businessRoleLookup } from '../identity/index.js';
 import type { ApprovalPolicy } from '../approval/types.js';
 import {
   findFlowAction,
@@ -425,6 +426,9 @@ export class WorkflowRunner {
    * @action：**不直接调 executor**，而是走 proposeAction 的完整链路
    * （策略 → 自动放行/审批 → hash + resourceVersion 复核 → executor）。
    * 执行完不收尾（`completeOnSuccess: false`），因为后面还有节点。
+   *
+   * `@action role:` 只**收窄**该动作类型的审批资格（收窄到声明的那一个业务角色），
+   * 不会放宽；交集为空时 ActionService 直接拒绝，流程走 `- fail -> ...`。
    */
   private async runAction(
     rec: ExecutionRecord,
@@ -437,7 +441,10 @@ export class WorkflowRunner {
     }
     const intent = await action.buildIntent(this.flowContext(rec, state, node));
     const verdict = await this.deps.executions.proposeAction(rec.executionId, intent, {
-      workflow: { nodeId: node.id },
+      workflow: {
+        nodeId: node.id,
+        ...(node.attrs.role ? { restrictRoles: [node.attrs.role] } : {}),
+      },
     });
 
     if (verdict.decision === 'denied') {
@@ -484,13 +491,29 @@ export class WorkflowRunner {
       await this.failWorkflow(rec.executionId, state, `review "${node.id}" 未注册`);
       return;
     }
+    // 角色：SKILL.md 的 `role:` 优先，注册表兜底（校验器已保证至少有一个，
+    // 这里再 fail-closed 一次 —— 一个没人有资格批的任务不该被建出来）
+    const roles = node.attrs.role ? [node.attrs.role] : (review.eligibleRoles ?? []);
+    if (!roles.length) {
+      await this.failWorkflow(
+        rec.executionId,
+        state,
+        `review "${node.id}" 没有审核角色（SKILL.md 写 role: 或在 registry 登记 eligibleRoles）`,
+      );
+      return;
+    }
     const policy: ApprovalPolicy = {
       policyId: `workflow-review:${node.id}`,
       actionType: `workflow.review.${node.id}`,
-      strategy: review.strategy,
-      ...(review.requiredCount !== undefined ? { requiredCount: review.requiredCount } : {}),
-      eligibleRoles: review.eligibleRoles,
-      allowInitiator: false,
+      strategy: node.attrs.strategy ?? review.strategy ?? 'ANY',
+      ...(node.attrs.required !== undefined
+        ? { requiredCount: node.attrs.required }
+        : review.requiredCount !== undefined
+          ? { requiredCount: review.requiredCount }
+          : {}),
+      eligibleRoles: roles,
+      // SoD：缺省禁止自批；只有显式 `exclude: none` 才放开（且仍受全局开关限制）
+      allowInitiator: node.attrs.exclude === 'none',
       ...(review.timeoutSeconds !== undefined ? { timeoutSeconds: review.timeoutSeconds } : {}),
     };
     const task = await this.deps.humanTasks.createApprovalTask({
@@ -841,6 +864,8 @@ export class WorkflowRunner {
       flow: flowName,
       registry: flowRegistryLookup,
       hasSkill: (name) => Boolean(findSkill(name, dirs)),
+      // `role:` 必须指向已登记的业务角色（RoleRegistry），不是随便一个字符串
+      hasRole: businessRoleLookup.hasRole,
     });
     if (!validated.definition) return { ok: false, issues: validated.issues };
     return { ok: true, skill, definition: validated.definition };

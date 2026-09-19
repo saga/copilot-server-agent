@@ -673,8 +673,8 @@ WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
 | `@flow <id>` | 流程入口，正文第一行是 `start -> <节点 id>` | — | — |
 | `@agent <技能名>` | 跑一次 agent turn：节点正文就是给 LLM 的 prompt。**旧名 `@subagent`，语义相同**（parser 归一化，下游只认 `agent`） | `runExecutionTurn`（同一个 session / model / tool policy / 工具证据） | `success` / `fail` |
 | `@gate <注册名>` | 确定性判断，结果只来自服务端注册的实现 | registry 里的 gate 函数 | gate 自己返回的 outcome |
-| `@review <注册名>` | 人工审核 | HumanTask + ApprovalPolicy | `approve` / `reject` |
-| `@action <注册名>` | 业务动作 | `proposeAction`（策略 → 审批 → hash/版本复核 → executor） | `success` / `fail` |
+| `@review <注册名>` | 人工审核（可声明 `role` / `strategy` / `required` / `exclude`） | HumanTask + ApprovalPolicy | `approve` / `reject` |
+| `@action <注册名>` | 业务动作（可声明 `role`，只收窄不放宽） | `proposeAction`（策略 → 审批 → hash/版本复核 → executor） | `success` / `fail` |
 | `@stop <id>` | 失败/拒绝终态 → execution 落 `failed` | — | 无 |
 | `@end <id>` | 成功终态 → execution 落 `completed` | — | 无 |
 
@@ -684,7 +684,83 @@ WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
 - `@action` **不直接调 executor**，走完整的 `proposeAction` 链路，所以"上一步人工审核过了，这一步为什么还要批"是特性不是冗余 —— 审核的是"研究结论能不能发布"，批的是"这个 mutation 能不能发出去"，两者不可互相替代。唯一区别是 `completeOnSuccess: false`：动作执行完**不**收尾 execution，因为后面还有节点。
 - `@gate` 的判定权在服务端注册的实现里，agent 的自我评价不算数 —— 合规边界不由 LLM 定义。
 
-**权限、角色、审批策略不写在 SKILL.md 里。** 节点只声明"这里需要 compliance-review"，谁有资格批、要几个人批、多久超时，由服务端 registry 决定（`workflow/registry.ts`）。SKILL.md 是会被 LLM 读到、也会被人随手改的文件，不能成为 security boundary。
+**授权边界不写在 SKILL.md 里。** SKILL.md 可以声明"这一步需要什么业务角色"（见下节），
+但**角色对应哪些 AD Group、哪些人真的具备它**完全在服务端：SKILL.md 是会被 LLM 读到、
+也会被人随手改的文件，不能成为 security boundary。`title` / `description` / `timeoutSeconds`
+这类展示与超时配置同样留在服务端 registry（`workflow/registry.ts`）。
+
+### 11.1.1 保留属性与角色模型
+
+`@review` / `@action` 的正文最前面可以写**保留属性**（`name: value` 行，必须紧跟标题、在正文之前）：
+
+```md
+## @review investment-review
+
+role: investment.committee.member   # 业务角色
+strategy: ALL                       # ANY | ALL
+required: 3                         # 要几票
+exclude: initiator                  # SoD：发起人不能批（none = 显式放开）
+
+投资委员会审核。
+- approve -> publish
+- reject -> rejected
+```
+
+```md
+## @action create-supplier
+
+role: vendor.masterdata.operator    # 谁有资格批准这笔 mutation
+- success -> completed
+- fail -> creation-failed
+```
+
+属性区会被**从正文里剥掉**，所以它不会混进描述或 prompt。`@agent` / `@gate` 不支持任何属性：
+`@agent` 的正文就是 prompt，往里塞角色声明只会让"谁有权跑这个 skill"变成一句写给 LLM 的话
+（写了会报 `block-attr-unsupported`，不是静默忽略）。
+
+**三层必须分开，任何一层都不要越界：**
+
+```text
+SKILL.md / ApprovalPolicy        声明业务角色     compliance.reviewer
+        ↓  RoleRegistry（服务端配置，identity/business-roles.ts）
+Microsoft Entra / AD Group       组 object ID     3a7f1c2e-…（用 ID 不用显示名：显示名会改）
+        ↓  group membership
+Actual User
+```
+
+- SKILL.md 只写**业务角色**（`compliance.reviewer`），永远不写 AD Group 名或 object ID。
+  组改名、换组、加一个替代组，都不该要求改 SKILL.md。校验器直接拦这一类写法：
+  角色 id 必须全小写点分，而 `APP-FIL-Compliance-Reviewer` 这种组名一律 `attr-invalid`。
+- 角色到组的映射是**企业访问控制配置**（`COPILOT_BUSINESS_ROLES`），配错 JSON 启动即失败 ——
+  静默忽略等于"角色永远解析不出来"，而那时的表现是"审批人看不到任务"，比启动失败难查得多。
+- 没配 `groups` 的角色**谁都拿不到**（fail-closed）：漏配一个组不该变成"人人可批"。
+- 解析入口只有 `AuthorizationService.resolveRoles(principal)`，它把 `principal.groups`
+  （Entra group object ID）经 RoleRegistry 映射成业务角色，与 `principal.roles`
+  （网关已解析 / 本地开发）取并集。`ApprovalService.assertEligible` 与
+  `HumanTaskService.isAssignee`（"我的任务"可见性）都走它 —— 否则走 AD group 授权的人
+  会"看得到任务却点不动"，或者干脆看不到自己的待办。
+- **它是同步的、没有 Microsoft Graph 调用**：group membership 的取全（Entra group overage
+  时一个 token 装不下全部 group，需要走 Graph 补齐）发生在**网关**，服务端只收一份完整
+  membership 做纯映射。这不只是省事 —— `resolveRoles` 被 `HumanTaskService.withTaskLock()`
+  的临界区包着，一次 Graph 抖动就能让同一个 task 的并发审批卡住。
+
+**角色要求的来源与优先级：**
+
+| 节点 | 角色来源 | 冲突时 |
+|------|----------|--------|
+| `@review` | SKILL.md `role:`，或注册表 `FlowReview.eligibleRoles` | SKILL.md 优先（属性是流程自己的声明） |
+| `@action` | SKILL.md `role:` | 与该动作类型的 `ApprovalPolicy.eligibleRoles` **取交集** |
+
+两边都拿不到角色的 `@review` 会在建 execution 时直接报 `review-missing-role` ——
+一个没人有资格批的任务等于流程定义不完整，不该等到有人点开才发现。
+
+`@action role:` **只能收窄，不能放宽**：交集为空时 `ActionService.classify` 直接 deny
+（"流程可以收窄授权，不能放宽"），节点走 `- fail -> ...`。声明了 `role:` 的动作也不走
+`COPILOT_AUTO_APPROVE_ACTIONS` —— 那等于用一个环境变量绕过流程里写明的审批要求。
+
+SoD 刻意只支持 `exclude: initiator` 这一个值。更复杂的冲突规则（不能与发起人同部门、
+不能是上一步的研究人……）不要往 SKILL.md 里加，否则它会重新长成一套权限 DSL；
+那些规则属于 ApprovalPolicy / 企业策略服务。
 
 ### 11.2 校验先于执行
 

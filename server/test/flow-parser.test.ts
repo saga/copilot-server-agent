@@ -156,3 +156,87 @@ test('解析：`@subagent` 是 `@agent` 的旧名，解析成同一个节点类�
   assert.deepEqual(parsed.issues, [], '旧名不该让已经写好的 SKILL.md 校验失败');
   assert.equal(parsed.blocks[1]!.type, 'agent', '别名归一化成 agent，下游只认一种');
 });
+
+test('解析：保留属性从正文里剥掉（否则 `role: x` 会变成描述甚至 prompt）', () => {
+  const md = [
+    '## @flow demo',
+    '',
+    'start -> rev',
+    '',
+    '## @review rev',
+    '',
+    'role: compliance.reviewer',
+    'strategy: ALL',
+    'required: 2',
+    'exclude: initiator',
+    '',
+    '合规审核，重点看证据是否充分。',
+    '',
+    '- approve -> done',
+    '- reject -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  ].join('\n');
+  const parsed = parseSkillFlow(md);
+  assert.deepEqual(parsed.issues, []);
+  const rev = parsed.blocks.find((b) => b.id === 'rev')!;
+  assert.deepEqual(
+    rev.attrs.map((a) => `${a.name}=${a.value}`),
+    ['role=compliance.reviewer', 'strategy=ALL', 'required=2', 'exclude=initiator'],
+  );
+  assert.equal(rev.attrs[0]!.line, 7, '属性行要带上自己的行号（报错才能指到那一行）');
+  assert.ok(!rev.markdown.includes('role:'), '属性不该留在正文里');
+  assert.match(rev.markdown, /合规审核，重点看证据是否充分。/);
+  assert.deepEqual(rev.routes, [
+    { on: 'approve', to: 'done' },
+    { on: 'reject', to: 'done' },
+  ], '剥属性不影响路由');
+});
+
+test('解析：`@action` 只支持 role（写别的属性会被指出来）', () => {
+  const md = ['## @flow demo', '', 'start -> pub', '', '## @action pub', '', 'role: operations', '', '发布。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n');
+  const parsed = parseSkillFlow(md);
+  assert.deepEqual(parsed.issues, []);
+  const pub = parsed.blocks.find((b) => b.id === 'pub')!;
+  assert.deepEqual(pub.attrs.map((a) => `${a.name}=${a.value}`), ['role=operations']);
+
+  const withStrategy = parseSkillFlow(
+    ['## @flow demo', '', 'start -> pub', '', '## @action pub', '', 'role: operations', 'strategy: ANY', '', '发布。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n'),
+  );
+  const hit = withStrategy.issues.find((i) => i.code === 'block-attr-unsupported');
+  assert.ok(hit, '@action 上写 strategy 必须报错，不能静默忽略');
+  assert.match(hit!.message, /strategy/);
+});
+
+test('解析：`@agent` 上写 role 报错（正文是 prompt，不是权限声明的地方）', () => {
+  const md = ['## @flow demo', '', 'start -> work', '', '## @agent work', '', 'role: investment.analyst', '', '做研究。', '', '- success -> done', '- fail -> done', '', '## @end done', '', 'ok'].join('\n');
+  const parsed = parseSkillFlow(md);
+  const hit = parsed.issues.find((i) => i.code === 'block-attr-unsupported');
+  assert.ok(hit, '@agent 不支持 role —— 静默当 prompt 才是最坏的结果');
+  assert.match(hit!.message, /@agent work/);
+});
+
+test('解析：属性必须写在正文最前面（`Note: ...` 开头的正文不会被误判成属性）', () => {
+  const md = ['## @flow demo', '', 'start -> rev', '', '## @review rev', '', 'Note: 这条很重要。', '', 'role: compliance.reviewer', '', '- approve -> done', '- reject -> done', '', '## @end done', '', 'ok'].join('\n');
+  const parsed = parseSkillFlow(md);
+  assert.deepEqual(parsed.issues, [], '正文以 `Note:` 开头不该被判成属性');
+  const rev = parsed.blocks.find((b) => b.id === 'rev')!;
+  assert.deepEqual(rev.attrs, [], '属性区被普通段落打断 → 后面的 role 不算属性');
+  assert.match(rev.markdown, /^Note: 这条很重要。/);
+});
+
+test('解析：重复属性 / 认不出的属性名都报错（同段里已认领到属性时才判）', () => {
+  const dup = parseSkillFlow(
+    ['## @flow demo', '', 'start -> rev', '', '## @review rev', '', 'role: a', 'role: b', '', '- approve -> done', '- reject -> done', '', '## @end done', '', 'ok'].join('\n'),
+  );
+  const dupHit = dup.issues.find((i) => i.code === 'block-attr-duplicate');
+  assert.ok(dupHit);
+  assert.equal(dupHit!.line, 8, '指到第二行 role');
+
+  const typo = parseSkillFlow(
+    ['## @flow demo', '', 'start -> rev', '', '## @review rev', '', 'role: compliance.reviewer', 'roles: extra', '', '- approve -> done', '- reject -> done', '', '## @end done', '', 'ok'].join('\n'),
+  );
+  assert.ok(typo.issues.some((i) => i.code === 'block-attr-unknown'), '`roles:` 是拼错，必须报出来');
+});

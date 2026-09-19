@@ -2,8 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
 import type { ApprovalService } from '../approval/approval-service.js';
 import type { ApprovalPolicy } from '../approval/types.js';
+import { authorizationService, type AuthorizationService } from '../identity/authorization-service.js';
 import type { Principal } from '../services/principal.js';
-import { isAssignee } from './assignment.js';
+import { isAssignee, type ActorRoles } from './assignment.js';
 import type { HumanTaskRepository } from './repository.js';
 import type { HumanTask, HumanTaskFilter, InputTaskSchema } from './types.js';
 
@@ -17,6 +18,8 @@ export type HumanTaskResolution =
 export interface HumanTaskServiceDeps {
   repository: HumanTaskRepository;
   approval: ApprovalService;
+  /** 缺省用进程内默认实例（含 RoleRegistry 映射）。任务可见性与资格判定都走它 */
+  authorization?: AuthorizationService;
   /** 任务收敛后的回调（由 ExecutionService 实现：复核 hash/版本 → 执行 → 落终态） */
   onResolved?: (
     task: HumanTask,
@@ -47,10 +50,25 @@ export class HumanTaskService {
   /** task → 队尾（链式 promise，保证不丢唤醒） */
   private readonly taskLocks = new Map<string, Promise<unknown>>();
 
-  constructor(private readonly deps: HumanTaskServiceDeps) {}
+  private readonly authorization: AuthorizationService;
+
+  constructor(private readonly deps: HumanTaskServiceDeps) {
+    this.authorization = deps.authorization ?? authorizationService;
+  }
 
   get repository(): HumanTaskRepository {
     return this.deps.repository;
+  }
+
+  /**
+   * 判定身份视图：`Principal` → `{ userId, 已解析业务角色 }`。
+   *
+   * 必须走这一层而不是直接 `principal.roles`：`x-user-groups` 里的 Entra group
+   * 要先经 RoleRegistry 映射成业务角色，否则走 AD group 授权的人看不到自己的待办、
+   * 也点不动审批按钮。纯计算、无 I/O，可以放心放在任务锁内部调用。
+   */
+  private actorRoles(principal: Principal): ActorRoles {
+    return { userId: principal.userId, roles: this.authorization.resolveRoles(principal) };
   }
 
   /**
@@ -97,7 +115,7 @@ export class HumanTaskService {
     return this.deps.repository.list({
       ...rest,
       tenantId: principal.tenantId,
-      assignee: { userId: principal.userId, roles: principal.roles },
+      assignee: this.actorRoles(principal),
     });
   }
 
@@ -113,7 +131,7 @@ export class HumanTaskService {
     if (task.tenantId !== principal.tenantId) {
       throw new Error(`无权访问 human task："${taskId}"`);
     }
-    if (!isAssignee(task, principal)) {
+    if (!isAssignee(task, this.actorRoles(principal))) {
       throw new Error(`无权操作 human task："${taskId}"（不在 eligible 范围内）`);
     }
     return task;

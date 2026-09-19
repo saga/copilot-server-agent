@@ -58,6 +58,11 @@ agent 不得自行定义合规边界，也不得因为"结论看起来没问题"
 
 ## @review compliance-review
 
+role: compliance.reviewer
+strategy: ANY
+required: 1
+exclude: initiator
+
 由合规审核人复核研究结果。
 
 重点判断：
@@ -72,6 +77,11 @@ agent 不得自行定义合规边界，也不得因为"结论看起来没问题"
 
 ## @review investment-review
 
+role: investment.reviewer
+strategy: ANY
+required: 1
+exclude: initiator
+
 由投资审核人复核研究结论。
 
 - approve -> publish
@@ -81,10 +91,15 @@ agent 不得自行定义合规边界，也不得因为"结论看起来没问题"
 
 ## @action publish
 
+role: investment.reviewer
+
 发布研究结论。
 
 这是业务动作：即使上一步已经有人工审核通过，这一笔 mutation 仍会按
 `publish_research` 的审批策略独立走一遍（动作绑定内容 hash 与数据版本）。
+
+`role:` 只是把审批资格**收窄**到 `investment.reviewer`，不会放宽服务端策略 ——
+交集为空时动作直接被拒，流程走 `- fail -> publish-failed`。
 
 - success -> completed
 - fail -> publish-failed

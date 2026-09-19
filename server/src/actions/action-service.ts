@@ -13,6 +13,7 @@ import { getExecutor, type ActionExecutionContext, type ActionExecutionResult } 
  * 裁决顺序：
  *   agent propose → resolvePolicy(actionType)
  *     ├ 未登记策略        → deny（默认拒绝，不允许 LLM 自己发明高风险动作）
+ *     ├ 流程声明了角色     → eligibleRoles 与流程角色取交集；空交集 → deny；否则 → needs_approval
  *     ├ 有 executor 且策略登记为自动 → auto_approve，server 直接执行
  *     └ 否则               → needs_approval，建 HumanTask，execution 进入 WAITING_FOR_APPROVAL
  */
@@ -25,20 +26,47 @@ export type ActionClassification =
 export class ActionService {
   constructor(private readonly deps: { approval: ApprovalService }) {}
 
-  /** 策略裁决（纯 server 侧，不看 LLM 的建议） */
-  classify(intent: ActionIntent): ActionClassification {
-    const policy = this.deps.approval.policyFor(intent.actionType);
-    if (!policy) {
+  /**
+   * 策略裁决（纯 server 侧，不看 LLM 的建议）。
+   *
+   * `restrictRoles` 来自 Skill Flow 的 `@action role:`。它**只能收窄**，不能放宽：
+   * 流程里写明的业务角色必须已经在该动作类型的 ApprovalPolicy 里，交集为空就直接拒绝。
+   * 否则 SKILL.md 就成了一个能扩大授权面的文件 —— 而它是会被 LLM 读到、也会被人随手改的。
+   */
+  classify(intent: ActionIntent, opts: { restrictRoles?: string[] } = {}): ActionClassification {
+    const base = this.deps.approval.policyFor(intent.actionType);
+    if (!base) {
       return {
         decision: 'denied',
         reason: `动作类型 "${intent.actionType}" 未登记审批策略（默认拒绝；高风险动作必须先登记）`,
       };
     }
-    const auto = (process.env.COPILOT_AUTO_APPROVE_ACTIONS ?? '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (auto.includes(intent.actionType)) return { decision: 'auto_approve', policy };
+
+    const restrict = (opts.restrictRoles ?? []).map((r) => r.trim().toLowerCase()).filter(Boolean);
+    if (!restrict.length) {
+      const auto = (process.env.COPILOT_AUTO_APPROVE_ACTIONS ?? '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (auto.includes(intent.actionType)) return { decision: 'auto_approve', policy: base };
+      return { decision: 'needs_approval', policy: base };
+    }
+
+    const narrowed = base.eligibleRoles.filter((r) => restrict.includes(r.trim().toLowerCase()));
+    if (!narrowed.length) {
+      return {
+        decision: 'denied',
+        reason:
+          `流程要求业务角色 ${restrict.join(' / ')}，但动作 "${intent.actionType}" 的策略只允许 ` +
+          `${base.eligibleRoles.join(' / ')} —— 流程可以收窄授权，不能放宽`,
+      };
+    }
+    const policy: ApprovalPolicy = {
+      ...base,
+      policyId: `${base.policyId}+flow`,
+      eligibleRoles: narrowed,
+    };
+    // 声明了角色的动作**不走 auto_approve**：那等于用一个环境变量绕过流程里写明的审批要求
     return { decision: 'needs_approval', policy };
   }
 

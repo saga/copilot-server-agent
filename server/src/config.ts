@@ -118,6 +118,11 @@ export const config = {
   humanTaskSweepSeconds: Number(env('COPILOT_HUMAN_TASK_SWEEP', '60')) || 60,
   /** 是否允许发起人审批自己发起的 action（Separation of Duties；默认否） */
   allowInitiatorApproval: env('COPILOT_ALLOW_INITIATOR_APPROVAL', 'false') === 'true',
+  /**
+   * 业务角色 → Entra/AD group object ID 的映射（JSON 数组，见 identity/business-roles.ts）。
+   * 这是**企业访问控制配置**，与 SKILL.md（业务流程定义）分开：换组、改组名不该改 Skill。
+   */
+  businessRolesJson: env('COPILOT_BUSINESS_ROLES', ''),
   // --- MCP：filesystem 预设开关与授权目录（生产默认关；开则必须配 COPILOT_MCP_FS_DIR） ---
   mcpFilesystem: env('COPILOT_MCP_FILESYSTEM', 'false') === 'true',
   mcpFsDir: env('COPILOT_MCP_FS_DIR', '') || undefined,

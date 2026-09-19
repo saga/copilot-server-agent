@@ -121,10 +121,16 @@ start -> investment-research
 - fail -> compliance-rejected
 
 ## @review investment-review
+role: investment.reviewer      # 业务角色，不是 AD Group
+strategy: ANY                  # ANY=任一通过即可；ALL=全部都要
+required: 1
+exclude: initiator             # SoD：发起人不能批自己的流程（none=显式放开）
+
 - approve -> publish
 - reject -> investment-research      # 打回重做 = 把 route 指回上一步
 
 ## @action publish
+role: investment.reviewer      # 只**收窄**该动作的审批资格，不会放宽
 - success -> completed
 - fail -> publish-failed
 ```
@@ -132,15 +138,33 @@ start -> investment-research
 （`@stop research-failed` / `@stop compliance-rejected` / `@stop publish-failed` /
 `@end completed` 四个终止节点略。）
 
-`@flow @agent @gate @review @action @stop @end` 七种块（`@subagent` 是 `@agent` 的旧名，仍然认），必须 `##` 标题、`@` 开头，路由是
-`- <出口> -> <目标节点>`。编排器本身不新造 runtime，三层全部复用：
+`@flow @agent @gate @review @action @stop @end` 七种块，必须 `##` 标题、`@` 开头，路由是
+`- <出口> -> <目标节点>`。**保留属性只有 `@review` / `@action` 有**，且必须写在正文最前面
+（`role` / `strategy` / `required` / `exclude`）。编排器本身不新造 runtime，三层全部复用：
 
 - `@agent` → `runExecutionTurn`（同一个 Copilot session / model / tool policy / 工具证据；它**不是**真正的 subagent 委派，就是当前 session 的又一次 agent turn）
 - `@review` → HumanTask（My Tasks、委派、SoD、租户隔离、审计全都不改一行）
 - `@action` → `proposeAction`（策略 → 审批 → hash/版本复核 → executor），只是不自动收尾 execution
 
-**权限、角色、审批策略不写在 SKILL.md 里** —— 节点只声明「这里需要 compliance-review」，谁有资格
-批由服务端 `workflow/registry.ts` 决定。SKILL.md 会被 LLM 读到、也会被人改，不能是 security boundary。
+**AD Group 不写在 SKILL.md 里。** SKILL.md 只能写**业务角色**（`role: compliance.reviewer`），
+角色到 Entra group 的映射是服务端的企业访问控制配置（`identity/business-roles.ts` +
+`COPILOT_BUSINESS_ROLES`）—— 换组、改组名都不需要改流程定义。完整三层：
+
+```text
+SKILL.md / ApprovalPolicy   声明业务角色   compliance.reviewer
+      ↓  RoleRegistry（服务端配置）
+Microsoft Entra / AD Group  组 object ID   3a7f1c2e-…（用 ID 不用显示名：显示名会改）
+      ↓  group membership（网关注入 x-user-groups，overage 时由网关走 Graph 取全）
+Actual User
+```
+
+`@review` 的 `role:` 与注册表 `eligibleRoles` 二选一即可（**SKILL.md 优先**）；两边都没有 →
+校验直接报 `review-missing-role`（一个没人有资格批的任务等于流程定义不完整）。
+`@action role:` 与该动作类型的 `ApprovalPolicy.eligibleRoles` **取交集**：空交集 → 动作被拒，
+所以 Skill 只能收窄授权、不能放宽；声明了角色的动作也不会被 `COPILOT_AUTO_APPROVE_ACTIONS` 绕过。
+
+**权限、审批策略不写在 SKILL.md 里**（要几票、超时多久在服务端 registry）。SKILL.md 会被 LLM
+读到、也会被人改，不能是 security boundary。
 
 ```bash
 curl -X POST localhost:3001/api/executions -H 'content-type: application/json' \
@@ -153,7 +177,8 @@ curl -X POST localhost:3001/api/executions/<id>/run        # workflow 不需要 
 要点：
 
 - **校验先于执行**：建 execution 之前就把 `flow-missing` / `route-target-missing` /
-  `node-missing-outcome` / `node-unreachable` / `skill-missing` 等连同**行号**报出来（400）。
+  `node-missing-outcome` / `route-outcome-duplicate` / `node-unreachable` / `skill-missing` /
+  `role-missing` / `review-missing-role` 等连同**行号**报出来（400）。
   跑到一半才发现路由指向不存在的节点时，execution 可能已经停在等待态了。
 - **状态是 durable 的**：`agent_execution.workflow_state` 存 `current` / `stepStatus` / `steps` /
   `waitingTaskId`。每一步**先把 `stepStatus = running` 落库、再执行节点**，执行完才把 `current`
@@ -412,7 +437,8 @@ agent 侧入口（可选）：`scripts/governance-mcp.mjs` 是 stdio MCP server�
 | `COPILOT_HUMAN_TASK_SWEEP` | `60` | 过期扫描间隔（秒） |
 | `COPILOT_ALLOW_INITIATOR_APPROVAL` | `false` | 是否允许发起人审批自己发起的 action（SoD） |
 | `COPILOT_DEFAULT_ROLES` | `approver` | 未开启身份头可信时的默认角色（审批资格判定用） |
-| `COPILOT_AUTO_APPROVE_ACTIONS` | 空 | 逗号分隔的动作类型：这些动作跳过人工审批、server 直接执行（慎用） |
+| `COPILOT_BUSINESS_ROLES` | 空 | **业务角色 → Entra/AD group object ID** 的映射（JSON 数组）。这是企业访问控制配置，与 SKILL.md 分开；非法 JSON 启动即失败 |
+| `COPILOT_AUTO_APPROVE_ACTIONS` | 空 | 逗号分隔的动作类型：这些动作跳过人工审批、server 直接执行（慎用；Skill Flow 里 `@action` 声明了 `role:` 的动作不适用） |
 
 ## 版本锁定与自检
 
@@ -421,7 +447,8 @@ npm run check:versions     # SDK / runtime / K8s 镜像 tag 四处版本必须�
 npm run verify:agent-tools # custom agent 工具是否真能调用（只认 tool.execution_start）
 npm run test               # execution 审计（脱敏/usage/tool 证据）+ 配置 smoke（非法值必须启动失败）
                            # + 两份 DDL 逐列比对 + SQLite 端到端（含老库补列）+ 协作模型（访问矩阵/幂等/队列串行/事件游标）
-                           # + Skill Flow（AST 解析/行号校验/编排推进/重启恢复/sourceHash 防中途改版）
+                           # + Skill Flow（AST 解析/行号校验/保留属性/编排推进/重启恢复/sourceHash 防中途改版）
+                           # + 业务角色（RoleRegistry 的 ANY/ALL 匹配、group overage 前的纯映射、收窄不放宽）
 ```
 
 SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移会触发协议不兼容，且本服务依赖若干 SDK workaround。`verify:agent-tools` 对应 SDK issue #2356 —— 只看 `subagent.selected` 不够，必须看到 `tool.execution_start`。

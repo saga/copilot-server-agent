@@ -3,7 +3,14 @@ import { toString } from 'mdast-util-to-string';
 import remarkParse from 'remark-parse';
 import { unified } from 'unified';
 import { visit } from 'unist-util-visit';
-import type { FlowBlockType, FlowIssue, FlowRoute } from '../workflow/types.js';
+import {
+  ALL_ATTR_NAMES,
+  NODE_ATTRS,
+  type FlowBlockType,
+  type FlowIssue,
+  type FlowNodeType,
+  type FlowRoute,
+} from '../workflow/types.js';
 
 /**
  * Skill Flow 的解析器：`SKILL.md` → Flow blocks。
@@ -16,6 +23,10 @@ import type { FlowBlockType, FlowIssue, FlowRoute } from '../workflow/types.js';
  *
  * 用 remark 解析而不是正则扫全文，是为了避开代码块/引用块里的伪路由：
  * 路由只从段落与列表项里取，` ``` ` 里的 `- pass -> x` 不算。
+ *
+ * 另外解析正文最前面的**保留属性**（`role: compliance.reviewer`）：只有 `@review` /
+ * `@action` 支持，且必须写在正文最前面。属性区会被从正文里剥掉，所以它不会混进
+ * 描述或 prompt；值的合法性由 flow-validator 判定。
  */
 
 /** `## @agent research` / `## @flow investment-review` */
@@ -36,6 +47,14 @@ const BLOCK_ALIASES: Record<string, FlowBlockType> = { subagent: 'agent' };
  */
 const ROUTE = /^\s*[-*]?\s*([A-Za-z0-9._-]+)\s*->\s*([A-Za-z0-9._-]+)\s*$/;
 
+/**
+ * 保留属性行：`role: compliance.reviewer`
+ *
+ * 只认**正文最前面连续的一段**这样的行。属性区一旦被后面的普通段落打断就结束 ——
+ * 这样正文里出现的 `Note: ...` 不会被当成属性（见 `splitAttrs`）。
+ */
+const ATTR_LINE = /^\s*([A-Za-z][A-Za-z0-9._-]*)\s*:\s*(\S.*?)\s*$/;
+
 /** 去掉 YAML frontmatter，但保留行号（用等量空行占位） */
 function stripFrontmatter(markdown: string): string {
   const match = markdown.match(/^---[ \t]*\n[\s\S]*?\n---[ \t]*\n/);
@@ -43,10 +62,19 @@ function stripFrontmatter(markdown: string): string {
   return '\n'.repeat(match[0].split('\n').length - 1) + markdown.slice(match[0].length);
 }
 
+export interface ParsedFlowAttr {
+  /** 小写属性名 */
+  name: string;
+  /** 原样值（值的合法性由校验器判定） */
+  value: string;
+  /** 该属性行在 SKILL.md 里的行号（1-based）—— 报错直接指到这一行 */
+  line: number;
+}
+
 export interface ParsedFlowBlock {
   type: FlowBlockType;
   id: string;
-  /** 节点正文（原样 Markdown） */
+  /** 节点正文（原样 Markdown，**已剥掉开头的保留属性行**） */
   markdown: string;
   /** `## @xxx` 所在行（1-based）—— 报错时指向这一行，作者一眼能定位 */
   headingLine: number;
@@ -54,6 +82,8 @@ export interface ParsedFlowBlock {
   startLine: number;
   endLine: number;
   routes: FlowRoute[];
+  /** 保留属性（只有 @review / @action 会有非空值） */
+  attrs: ParsedFlowAttr[];
   /** 仅 `@flow`：`start -> research` 的目标 */
   start?: string;
 }
@@ -72,6 +102,75 @@ interface TextCandidate {
 
 /** 节点 id 与出口名统一小写：避免 `pass -> Compliance-Review` 这种大小写不一致的静默失配 */
 const norm = (s: string): string => s.toLowerCase();
+
+/**
+ * 切出正文开头的**保留属性区**。
+ *
+ * 三条规则，全是为了"不误伤正文"：
+ *
+ *   1. 只认最前面**连续**的 `name: value` 行 —— 遇到别的行（包括空行）就结束。
+ *      所以正文里的 `Note: ...` 不会被当成属性。
+ *   2. 名字是该节点类型支持的属性 → 认领。
+ *   3. 名字是**别的**节点类型的属性（`@agent` 上写 `role:`）→ 一定报错：这类写法
+ *      作者的本意很明确，静默当正文/prompt 才是最坏的结果。
+ *      名字完全没见过（`Note:`）→ 只有在这段确实已认领到属性时才报错，
+ *      否则整段当普通正文。
+ *
+ * 值的合法性（`strategy` 只能是 ANY/ALL 等）不在这里 —— 词法归 parser，语义归校验器。
+ */
+function splitAttrs(input: {
+  bodyLines: string[];
+  startLine: number;
+  type: FlowBlockType;
+  nodeId: string;
+  issues: FlowIssue[];
+}): { attrs: ParsedFlowAttr[]; bodyLines: string[] } {
+  const { bodyLines, startLine, type, nodeId, issues } = input;
+  const known = NODE_ATTRS[type as FlowNodeType] ?? [];
+  const label = `@${type}${nodeId ? ` ${nodeId}` : ''}`;
+
+  const zone: Array<{ name: string; value: string; line: number }> = [];
+  for (const [i, text] of bodyLines.entries()) {
+    const m = text.match(ATTR_LINE);
+    if (!m) break;
+    zone.push({ name: m[1]!.toLowerCase(), value: m[2]!, line: startLine + i });
+  }
+
+  const intendsAttrs =
+    zone.some((a) => known.includes(a.name)) ||
+    zone.some((a) => ALL_ATTR_NAMES.includes(a.name));
+  if (!intendsAttrs) return { attrs: [], bodyLines };
+
+  const attrs: ParsedFlowAttr[] = [];
+  const seen = new Set<string>();
+  for (const a of zone) {
+    const nodeIdField = nodeId ? { nodeId } : {};
+    if (!known.includes(a.name)) {
+      const recognized = ALL_ATTR_NAMES.includes(a.name);
+      issues.push({
+        code: recognized ? 'block-attr-unsupported' : 'block-attr-unknown',
+        line: a.line,
+        ...nodeIdField,
+        message: recognized
+          ? `${label} 不支持属性 "${a.name}"（${type} 支持：${known.join(' / ') || '(无)'}；属性必须写在正文最前面）`
+          : `${label} 里不认识的属性 "${a.name}"（可用：${known.join(' / ') || '(无)'}）`,
+      });
+      continue;
+    }
+    if (seen.has(a.name)) {
+      issues.push({
+        code: 'block-attr-duplicate',
+        line: a.line,
+        ...nodeIdField,
+        message: `${label} 的属性 "${a.name}" 重复声明（保留属性只能出现一次）`,
+      });
+      continue;
+    }
+    seen.add(a.name);
+    attrs.push(a);
+  }
+  return { attrs, bodyLines: bodyLines.slice(zone.length) };
+}
 
 /**
  * 解析 SKILL.md 里的全部 flow blocks。
@@ -141,7 +240,15 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
     const endLine = body.length
       ? (body[body.length - 1]!.position?.end.line ?? headingLine)
       : headingLine;
-    const bodyMarkdown = body.length ? lines.slice(startLine - 1, endLine).join('\n') : '';
+    // 保留属性区在正文最前面，先切掉再谈"正文"：否则 `role: x` 会被当成描述/prompt
+    const { attrs, bodyLines } = splitAttrs({
+      bodyLines: body.length ? lines.slice(startLine - 1, endLine) : [],
+      startLine,
+      type,
+      nodeId: norm(id),
+      issues,
+    });
+    const bodyMarkdown = bodyLines.join('\n');
 
     const bodyStartOffset = node.position?.end.offset ?? 0;
     const bodyEndOffset = body.length
@@ -181,6 +288,7 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
       startLine,
       endLine,
       routes,
+      attrs,
     };
     if (type === 'flow') {
       const start = routes.find((r) => r.on === 'start')?.to;

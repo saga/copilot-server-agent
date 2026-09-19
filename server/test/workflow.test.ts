@@ -19,6 +19,7 @@ import {
   registerFlowGate,
   registerFlowReview,
 } from '../src/workflow/registry.js';
+import { registerBusinessRole } from '../src/identity/business-roles.js';
 import { FlowValidationError, WorkflowRunner } from '../src/workflow/runner.js';
 import type { WorkflowState } from '../src/workflow/types.js';
 
@@ -120,6 +121,91 @@ ok
 /** 旧名 `@subagent`：已经写好的 SKILL.md 不该因为一次改名就整片校验失败 */
 const LEGACY_MD = SKILL_MD.replace('## @agent flow-demo', '## @subagent flow-demo');
 
+/**
+ * 保留属性：`@review` 声明**业务角色**（不是 AD Group），`@action` 把审批资格收窄。
+ * 校验器要求 role 必须已登记，所以在用例里注册一个（组 ID 用可读串，等价于 Entra object ID）。
+ */
+const ROLE_MD = `---
+name: flow-role
+description: 保留属性用
+---
+
+## @flow demo
+
+start -> flow-role
+
+## @agent flow-role
+
+做研究。
+
+- success -> demo-review
+- fail -> failed
+
+## @review demo-review
+
+role: demo.reviewer
+strategy: ANY
+required: 1
+exclude: initiator
+
+人工审核。
+
+- approve -> demo-action
+- reject -> failed
+
+## @action demo-action
+
+role: operations
+
+发布。
+
+- success -> done
+- fail -> failed
+
+## @stop failed
+
+失败终止。
+
+## @end done
+
+完成。
+`;
+
+/** `@action role:` 写了一个策略里没有的角色 → 收窄成空集 → 动作被拒（不能放宽） */
+const BAD_ROLE_MD = `---
+name: flow-bad-role
+description: 角色越界
+---
+
+## @flow demo
+
+start -> flow-bad-role
+
+## @agent flow-bad-role
+
+做研究。
+
+- success -> demo-action
+- fail -> failed
+
+## @action demo-action
+
+role: demo.reviewer
+
+发布。
+
+- success -> done
+- fail -> failed
+
+## @stop failed
+
+失败终止。
+
+## @end done
+
+完成。
+`;
+
 function writeSkills(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'copilot-flow-'));
   for (const [rel, content] of Object.entries(files)) {
@@ -176,9 +262,25 @@ registerFlowAction({
   }),
 });
 
+/**
+ * 业务角色 → AD group object ID。
+ * 用例用可读串代替 GUID：映射逻辑与真实 object ID 完全一致（都是不透明字符串）。
+ */
+registerBusinessRole({
+  id: 'demo.reviewer',
+  name: '示例审核人',
+  groups: ['grp-demo-reviewers'],
+  match: 'ANY',
+});
+
 const ALICE = { tenantId: 't1', userId: 'alice' };
 /** 审核人：不是会话 owner，也不是发起人（SoD） */
 const REVIEWER = { tenantId: 't1', userId: 'bob', roles: ['reviewer'] };
+/**
+ * 走 AD group 授权的审核人：**没有** `roles`，只有 group object ID。
+ * 他能不能批完全取决于 RoleRegistry 把 demo.reviewer 映射到哪个组。
+ */
+const REVIEWER_BY_GROUP = { tenantId: 't1', userId: 'dave', roles: [], groups: ['grp-demo-reviewers'] };
 const OPS = { tenantId: 't1', userId: 'carol', roles: ['operations'] };
 
 interface Wired {
@@ -528,6 +630,90 @@ test('编排：未预期异常也必须落 failed，不能留下永远 running �
   const settled = await waitFor(async () => (await w.executions.get(id))?.status === 'failed');
   assert.ok(settled, 'runDetached 必须自己收尾，否则 execution 永远卡在 running');
   assert.match(String((await w.executions.get(id))!.error), /DB 挂了/);
+});
+
+test('编排：@review 的 role 覆盖注册表，且走 AD group 的人能批、只有旧角色的人不能', async () => {
+  const dir = writeSkills({ 'flow-role/SKILL.md': ROLE_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w, { skill: 'flow-role' });
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'waiting_for_approval');
+  const task = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
+  assert.deepEqual(
+    task.eligibleRoles,
+    ['demo.reviewer'],
+    'SKILL.md 的 role: 覆盖注册表的 eligibleRoles —— 属性是流程自己的声明',
+  );
+  assert.equal(task.strategy, 'ANY');
+  assert.equal(task.requiredCount, 1);
+
+  // 注册表里的旧角色不再有资格：属性一旦写进 SKILL.md，就是唯一的角色来源。
+  // 挡住他的是**可见性**判定（isAssignee）—— 他连这个任务都看不到，比"看得到但点不动"更严
+  await assert.rejects(
+    () => w.humanTasks.approve(task.taskId, { principal: REVIEWER }),
+    /不在 eligible 范围内/,
+  );
+  assert.deepEqual(
+    await w.humanTasks.list({ tenantId: 't1', userId: 'bob', roles: ['reviewer'] }),
+    [],
+    '没有对应业务角色的人，"我的任务"里不该出现这条',
+  );
+
+  // 只有 group、没有 roles 的人：RoleRegistry 把他解析成 demo.reviewer 之后就能批
+  await w.humanTasks.approve(task.taskId, { principal: REVIEWER_BY_GROUP });
+  const after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'waiting_for_approval', '@action 的 role: 把它收窄到 operations → 再暂停');
+  assert.equal(after.workflow?.lastOutcome, 'approve');
+
+  const actionTask = (await w.humanTasks.get(after.workflow!.waitingTaskId!))!;
+  assert.deepEqual(
+    actionTask.eligibleRoles,
+    ['operations'],
+    '@action role: 只收窄（策略里本来就有 operations）',
+  );
+
+  await w.humanTasks.approve(actionTask.taskId, { principal: OPS });
+  assert.equal((await w.executions.get(id))!.status, 'completed');
+});
+
+test('编排：@action 声明了角色就不能被 auto_approve 绕过（流程写明的审批要求优先）', async () => {
+  process.env.COPILOT_AUTO_APPROVE_ACTIONS = 'send_external_message';
+  try {
+    const dir = writeSkills({ 'flow-role/SKILL.md': ROLE_MD });
+    const w = wire(dir);
+    const id = await startWorkflow(w, { skill: 'flow-role' });
+
+    await w.runner.run(id);
+    const paused = (await w.executions.get(id))!;
+    await w.humanTasks.approve(paused.workflow!.waitingTaskId!, { principal: REVIEWER_BY_GROUP });
+
+    const rec = (await w.executions.get(id))!;
+    assert.equal(
+      rec.status,
+      'waiting_for_approval',
+      '环境变量不该绕过 SKILL.md 里写明的角色要求',
+    );
+    assert.equal(rec.workflow?.current, 'demo-action');
+  } finally {
+    delete process.env.COPILOT_AUTO_APPROVE_ACTIONS;
+  }
+});
+
+test('编排：@action role: 越界（策略里没有这个角色）→ 动作被拒，不能靠 Skill 放宽授权', async () => {
+  const dir = writeSkills({ 'flow-bad-role/SKILL.md': BAD_ROLE_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w, { skill: 'flow-bad-role' });
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'failed', '走 - fail -> failed');
+  const denied = (await w.executions.events(id, 200)).find(
+    (e) => e.type === EVT.workflowStepCompleted && e.payload?.['nodeId'] === 'demo-action',
+  );
+  assert.equal(denied?.payload?.['decision'], 'denied');
+  assert.match(String(denied?.payload?.['reason']), /不能放宽/, '拒绝理由要说清是"收窄 vs 放宽"');
 });
 
 test('校验：出口写漏 / 技能不存在都在 prepare 阶段就抛出来（含行号）', () => {

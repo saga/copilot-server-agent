@@ -10,7 +10,9 @@ import type { FlowContext } from './types.js';
  *   Skill（声明意图） → Registry（决定实现） → 现有 Action/Approval/HumanTask 体系
  *
  * 与「LLM 不能定义 enterprise security boundary」是同一条原则：Markdown 里出现
- * `role: compliance-reviewer` 就等于把安全边界交给了可编辑的文本文件。
+ * `ad-group: CN=FIL-Compliance` 就等于把安全边界交给了可编辑的文本文件。
+ * SKILL.md 只能写**业务角色**（`role: compliance.reviewer`），角色到 Entra group 的映射
+ * 由 `identity/business-roles.ts` 决定 —— 换组、改组名都不需要动流程定义。
  *
  * 刻意用三个 Map 而不是插件框架：现在是轻量 TS dependency wiring，没有第二个消费者。
  */
@@ -29,9 +31,18 @@ export interface FlowReview {
   name: string;
   title: string;
   description?: string;
-  /** 有资格审核的角色（来自 Identity，不来自请求体） */
-  eligibleRoles: string[];
-  strategy: 'ANY' | 'ALL';
+  /**
+   * 有资格审核的**业务角色**（`compliance.reviewer`）。
+   *
+   * SKILL.md 的 `@review` 写了 `role:` 时以 SKILL.md 为准；这里是不写属性时的兜底，
+   * 也是老流程的兼容路径。两边都没有 → 校验器报 `review-missing-role`
+   * （一个没人能批的任务等于流程定义不完整）。
+   *
+   * 注意这是业务角色，不是 AD Group：角色到 Entra group 的映射在
+   * `identity/business-roles.ts`，换组不该改流程。
+   */
+  eligibleRoles?: string[];
+  strategy?: 'ANY' | 'ALL';
   requiredCount?: number;
   timeoutSeconds?: number;
 }
@@ -74,6 +85,8 @@ export const flowRegistryLookup = {
   hasGate: (name: string) => flowGates.has(norm(name)),
   hasReview: (name: string) => flowReviews.has(norm(name)),
   hasAction: (name: string) => flowActions.has(norm(name)),
+  /** 注册表里该 review 的资格角色（SKILL.md 没写 `role:` 时的兜底来源） */
+  reviewRoles: (name: string) => flowReviews.get(norm(name))?.eligibleRoles,
 };
 
 // ---------- 内置登记 ----------
@@ -104,7 +117,7 @@ registerFlowReview({
   name: 'compliance-review',
   title: '合规审核',
   description: '核对研究结论是否存在合规问题、是否需要补充证据',
-  eligibleRoles: ['compliance-reviewer'],
+  eligibleRoles: ['compliance.reviewer'],
   strategy: 'ANY',
   requiredCount: 1,
   timeoutSeconds: 86400,
@@ -114,7 +127,7 @@ registerFlowReview({
   name: 'investment-review',
   title: '投资审核',
   description: '审核投资结论与风险披露是否充分',
-  eligibleRoles: ['investment-reviewer'],
+  eligibleRoles: ['investment.reviewer'],
   strategy: 'ANY',
   requiredCount: 1,
   timeoutSeconds: 86400,

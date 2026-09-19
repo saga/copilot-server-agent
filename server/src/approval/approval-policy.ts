@@ -49,7 +49,8 @@ export const BUILTIN_POLICIES: ApprovalPolicy[] = [
     policyId: 'research-publish',
     actionType: 'publish_research',
     strategy: 'ANY',
-    eligibleRoles: ['investment-reviewer'],
+    // 业务角色 id（不是 AD Group）。角色 → Entra group 的映射在 identity/business-roles.ts
+    eligibleRoles: ['investment.reviewer'],
     allowInitiator: false,
     timeoutSeconds: 43200,
   },

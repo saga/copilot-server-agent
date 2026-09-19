@@ -28,6 +28,7 @@ import { HumanTaskService } from './human-tasks/human-task-service.js';
 import { MemoryHumanTaskRepository } from './human-tasks/memory-repository.js';
 import { SqlHumanTaskRepository } from './human-tasks/sql-repository.js';
 import type { HumanTaskRepository } from './human-tasks/repository.js';
+import { authorizationService } from './identity/index.js';
 import { SessionAccessService } from './services/session-access.js';
 import { sessionRegistry } from './services/session-registry.js';
 import { sessionService } from './services/session-service.js';
@@ -59,6 +60,8 @@ export const humanTaskRepository: HumanTaskRepository = useMemory
 
 export const approvalService = new ApprovalService({
   allowInitiatorApproval: config.allowInitiatorApproval,
+  // 角色解析：Principal.groups（Entra group object ID）→ RoleRegistry → 业务角色
+  authorization: authorizationService,
 });
 
 export const actionService = new ActionService({ approval: approvalService });
@@ -76,6 +79,7 @@ bindExecutionSink(executionService);
 export const humanTaskService = new HumanTaskService({
   repository: humanTaskRepository,
   approval: approvalService,
+  authorization: authorizationService,
   /**
    * 人工任务收敛后的分派。
    *

@@ -401,8 +401,10 @@ export class ExecutionService {
       /**
        * Skill Flow 的 `@action` 节点：审批任务上打 workflow 标记。
        * 收敛时的 dispatcher（wiring）据此把任务交回 WorkflowRunner 而不是当成终态动作。
+       *
+       * `restrictRoles` = SKILL.md 里写的 `@action role:`，只收窄不放宽（见 ActionService.classify）。
        */
-      workflow?: { nodeId: string };
+      workflow?: { nodeId: string; restrictRoles?: string[] };
     } = {},
   ): Promise<{ decision: 'auto_approve' | 'needs_approval' | 'denied'; taskId?: string; reason?: string; result?: unknown }> {
     const rec = await this.deps.repository.get(executionId);
@@ -422,7 +424,10 @@ export class ExecutionService {
 
     const actions = this.deps.actions;
     if (!actions) throw new Error('ActionService 未注入（wiring 缺失）');
-    const verdict = actions.classify(intent);
+    const verdict = actions.classify(
+      intent,
+      opts.workflow?.restrictRoles ? { restrictRoles: opts.workflow.restrictRoles } : {},
+    );
 
     if (verdict.decision === 'denied') {
       await this.eventLog.append({

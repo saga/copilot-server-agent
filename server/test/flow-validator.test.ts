@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import { parseSkillFlow } from '../src/skills/flow-parser.js';
 import { validateSkillFlow } from '../src/skills/flow-validator.js';
 import { loadSkill, skillSearchDirs } from '../src/skills/index.js';
+import { businessRoleLookup } from '../src/identity/business-roles.js';
 import { flowRegistryLookup } from '../src/workflow/registry.js';
 
 /**
@@ -330,6 +331,108 @@ test('校验：同一个出口指向同一个目标重复写，不算歧义（pa
   assert.deepEqual(r.issues, [], '重复但完全一致的路由只是啰嗦，不是错误');
 });
 
+test('校验：保留属性值不合法 → attr-invalid（带属性行行号）', () => {
+  const cases: Array<[string, RegExp]> = [
+    ['strategy: SOMETIMES', /ANY \| ALL/],
+    ['required: 0', /正整数/],
+    ['required: 两个', /正整数/],
+    ['exclude: same-department', /initiator \| none/],
+    ['role: APP-FIL-Compliance-Reviewer', /不是业务角色 id/],
+  ];
+  for (const [line, pattern] of cases) {
+    const r = ok(
+      flow(
+        '## @flow demo',
+        '',
+        'start -> rev',
+        '',
+        '## @review rev',
+        '',
+        line,
+        '',
+        '审核。',
+        '',
+        '- approve -> done',
+        '- reject -> done',
+        '',
+        '## @end done',
+        '',
+        'ok',
+      ),
+      { registry: ALL_REGISTERED, hasRole: () => true },
+    );
+    const hit = r.issues.find((i) => i.code === 'attr-invalid');
+    assert.ok(hit, `"${line}" 必须报 attr-invalid`);
+    assert.match(hit!.message, pattern);
+    assert.equal(hit!.line, 7, '要指到属性自己那一行');
+  }
+});
+
+test('校验：role 必须是已登记的业务角色（不能凭空写一个）', () => {
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> rev',
+    '',
+    '## @review rev',
+    '',
+    'role: nobody.knows',
+    '',
+    '审核。',
+    '',
+    '- approve -> done',
+    '- reject -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+  const hit = ok(md, { registry: ALL_REGISTERED, hasRole: () => false }).issues.find(
+    (i) => i.code === 'role-missing',
+  );
+  assert.ok(hit, '未登记的业务角色必须报错，而不是等到审批时才发现没人能批');
+  assert.match(hit!.message, /nobody\.knows/);
+  // 登记过就通过（真实 RoleRegistry）
+  assert.deepEqual(
+    ok(md.replace('nobody.knows', 'compliance.reviewer'), {
+      registry: ALL_REGISTERED,
+      hasRole: businessRoleLookup.hasRole,
+    }).issues,
+    [],
+  );
+});
+
+test('校验：@review 拿不到任何角色 → review-missing-role', () => {
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> rev',
+    '',
+    '## @review rev',
+    '',
+    '审核。',
+    '',
+    '- approve -> done',
+    '- reject -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+  // 注册表也查不到角色 → 建出来就是一个"没人有资格批"的任务
+  const noRoles = { ...ALL_REGISTERED, reviewRoles: () => undefined };
+  const hit = ok(md, { registry: noRoles }).issues.find((i) => i.code === 'review-missing-role');
+  assert.ok(hit, '两边都没有角色必须报错');
+  assert.match(hit!.message, /role:/, '报错要告诉作者怎么修');
+
+  // 注册表里有 eligibleRoles 就够了（SKILL.md 不必写）
+  const withRoles = { ...ALL_REGISTERED, reviewRoles: () => ['compliance.reviewer'] };
+  assert.deepEqual(ok(md, { registry: withRoles }).issues, []);
+
+  // 不提供 reviewRoles 回调时跳过这项检查（只做结构校验的场景）
+  assert.deepEqual(ok(md, { registry: ALL_REGISTERED }).issues, []);
+});
+
 test('校验：flow 名不匹配 / start 指向不存在的节点', () => {
   assert.ok(ok(FLOW_OK, { flow: 'another' }).issues.some((i) => i.code === 'flow-name-mismatch'));
   const badStart = ok(flow('## @flow demo', '', 'start -> ghost', '', '## @end done', '', 'ok'));
@@ -345,6 +448,7 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
     flow: 'investment-review',
     registry: flowRegistryLookup,
     hasSkill: (n) => Boolean(loadSkill(n, dirs)),
+    hasRole: businessRoleLookup.hasRole,
   });
   assert.deepEqual(
     r.issues,
@@ -358,4 +462,19 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
   ]);
   assert.equal(r.definition!.nodes['compliance']!.type, 'gate');
   assert.equal(r.definition!.nodes['publish']!.type, 'action');
+  // 保留属性：示例技能用 `role:` 声明业务角色（不是 AD Group），审批策略在服务端
+  assert.deepEqual(r.definition!.nodes['compliance-review']!.attrs, {
+    role: 'compliance.reviewer',
+    strategy: 'ANY',
+    required: 1,
+    exclude: 'initiator',
+  });
+  assert.deepEqual(r.definition!.nodes['investment-review']!.attrs, {
+    role: 'investment.reviewer',
+    strategy: 'ANY',
+    required: 1,
+    exclude: 'initiator',
+  });
+  assert.deepEqual(r.definition!.nodes['publish']!.attrs, { role: 'investment.reviewer' });
+  assert.deepEqual(r.definition!.nodes['investment-research']!.attrs, {}, '@agent 没有属性');
 });

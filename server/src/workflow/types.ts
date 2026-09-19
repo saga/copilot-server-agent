@@ -37,8 +37,10 @@ export interface FlowRoute {
 export interface FlowNode {
   id: string;
   type: FlowNodeType;
-  /** 节点正文（原样保留 Markdown，不做 LLM 解析） */
+  /** 节点正文（原样保留 Markdown，不做 LLM 解析）。**已剥掉开头的保留属性行** */
   body: string;
+  /** 保留属性（只有 @review / @action 有；由校验器校验并归一化） */
+  attrs: FlowNodeAttrs;
   routes: FlowRoute[];
   /** `## @xxx` 所在行（1-based）；报错指给用户看的那一行 */
   headingLine: number;
@@ -150,3 +152,45 @@ export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
   stop: [],
   end: [],
 };
+
+/**
+ * 节点正文最前面允许出现的**保留属性**（`name: value` 行）。
+ *
+ * 只有 `@review` / `@action` 有：属性表达的是"这一步需要什么业务角色、要几票、发起人能否自批"，
+ * 属于流程语义，写进 SKILL.md 是合理的；**AD Group 不在这里**，那是企业访问控制配置
+ * （见 `identity/business-roles.ts`）。
+ *
+ * `@agent` / `@gate` 刻意不支持任何属性：agent 的正文就是 prompt，往里面塞角色声明
+ * 只会让"谁有权跑这个 skill"变成一句写给 LLM 的话。
+ */
+export const NODE_ATTRS: Record<FlowNodeType, readonly string[]> = {
+  agent: [],
+  gate: [],
+  review: ['role', 'strategy', 'required', 'exclude'],
+  action: ['role'],
+  stop: [],
+  end: [],
+};
+
+/** 全部保留属性名（用于"属性名认得、但用错了节点类型"的判定） */
+export const ALL_ATTR_NAMES: readonly string[] = [...new Set(Object.values(NODE_ATTRS).flat())];
+
+/**
+ * 解析后的节点保留属性。**只有校验器会产出它** —— parser 只做词法切分，
+ * 值的合法性（strategy 只能是 ANY/ALL 等）与角色是否已登记都归校验器。
+ */
+export interface FlowNodeAttrs {
+  /** 业务角色 id（`compliance.reviewer`），不是 AD Group */
+  role?: string;
+  /** 多人审核规则 */
+  strategy?: 'ANY' | 'ALL';
+  /** 需要的批准票数 */
+  required?: number;
+  /**
+   * 排除的审批主体。
+   *
+   * `initiator` = 发起人不能批自己发起的事（SoD）；`none` = 显式允许（仍受全局
+   * `COPILOT_ALLOW_INITIATOR_APPROVAL` 限制，两个开关都开才真的放行）。
+   */
+  exclude?: 'initiator' | 'none';
+}

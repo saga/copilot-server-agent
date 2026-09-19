@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { executionService, humanTaskService } from '../wiring.js';
 import { isAssignee } from '../human-tasks/assignment.js';
+import { authorizationService } from '../identity/index.js';
 import {
   assertSessionVisible,
   principalOf,
@@ -39,7 +40,12 @@ humanTaskRouter.get('/', async (req, res, next) => {
       ...(type ? { type: type as never } : {}),
       limit: Math.max(1, Math.min(200, Number(req.query.limit ?? 50) || 50)),
     });
-    res.json({ tasks, principal: { userId: principal.userId, roles: principal.roles } });
+    res.json({
+      tasks,
+      // roles 报**解析后**的业务角色（x-user-groups → RoleRegistry），不是原始的 principal.roles：
+      // 前端拿它渲染"我能做什么"，报原始值会和实际可见的待办对不上
+      principal: { userId: principal.userId, roles: authorizationService.resolveRoles(principal) },
+    });
   } catch (err) {
     next(err);
   }
