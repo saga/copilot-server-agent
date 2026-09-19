@@ -111,7 +111,7 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 ## @flow investment-review
 start -> investment-research
 
-## @subagent investment-research
+## @agent investment-research
 （节点正文就是给 LLM 的 prompt：收集证据并输出带证据的研究结论）
 - success -> compliance
 - fail -> research-failed
@@ -132,10 +132,10 @@ start -> investment-research
 （`@stop research-failed` / `@stop compliance-rejected` / `@stop publish-failed` /
 `@end completed` 四个终止节点略。）
 
-`@flow @subagent @gate @review @action @stop @end` 七种块，必须 `##` 标题、`@` 开头，路由是
+`@flow @agent @gate @review @action @stop @end` 七种块（`@subagent` 是 `@agent` 的旧名，仍然认），必须 `##` 标题、`@` 开头，路由是
 `- <出口> -> <目标节点>`。编排器本身不新造 runtime，三层全部复用：
 
-- `@subagent` → `runExecutionTurn`（同一个 Copilot session / model / tool policy / 工具证据）
+- `@agent` → `runExecutionTurn`（同一个 Copilot session / model / tool policy / 工具证据；它**不是**真正的 subagent 委派，就是当前 session 的又一次 agent turn）
 - `@review` → HumanTask（My Tasks、委派、SoD、租户隔离、审计全都不改一行）
 - `@action` → `proposeAction`（策略 → 审批 → hash/版本复核 → executor），只是不自动收尾 execution
 
@@ -155,9 +155,13 @@ curl -X POST localhost:3001/api/executions/<id>/run        # workflow 不需要 
 - **校验先于执行**：建 execution 之前就把 `flow-missing` / `route-target-missing` /
   `node-missing-outcome` / `node-unreachable` / `skill-missing` 等连同**行号**报出来（400）。
   跑到一半才发现路由指向不存在的节点时，execution 可能已经停在等待态了。
-- **状态是 durable 的**：`agent_execution.workflow_state` 存 `current` / `steps` /
-  `waitingTaskId`，并且**先写 current 再执行节点** —— 反过来写，进程在「跑完但没落库」之间退出，
-  重启会把同一步再跑一遍，而那一步可能是已经把 mutation 发出去的 `@action`。
+- **状态是 durable 的**：`agent_execution.workflow_state` 存 `current` / `stepStatus` / `steps` /
+  `waitingTaskId`。每一步**先把 `stepStatus = running` 落库、再执行节点**，执行完才把 `current`
+  推到下一个节点并落回 `pending` —— 只有 `current` 一个字段时，"这步跑没跑完"是不可知的：
+  提前写 next 会跳过没执行完的步骤，不提前写又会重放已经产生副作用的步骤。中断恢复时
+  `@agent` / `@gate`（纯计算）允许重放，`@action`（有副作用）落 failed 交人工核对。
+- **编排器异常自己收尾**：`runDetached()` 把未预期异常落成 `failed`，不留下永远 `running` 的
+  execution（占着队列、挡住取消、也没人知道该不该重跑）。节点内的失败是可路由的出口，走 `- fail -> ...`。
 - **`sourceHash` 挡住中途换版本**：SKILL.md 的 SHA-256 每次推进前重算比对，不一致就 failed
   等人工确认 —— 不让已经开始的执行悄悄切到另一版流程上继续跑。
 - **允许环，所以有硬闸门** `MAX_FLOW_STEPS = 100`（review 一直打回不会跑成死循环）。

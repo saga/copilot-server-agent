@@ -26,7 +26,7 @@ start -> investment-research
 
 ---
 
-## @subagent investment-research
+## @agent investment-research
 
 使用本次会话已加载的 investment-research 能力完成研究。
 

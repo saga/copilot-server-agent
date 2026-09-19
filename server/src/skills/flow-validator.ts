@@ -1,20 +1,27 @@
 import type { ParsedSkillFlow } from './flow-parser.js';
-import { NODE_OUTCOMES, type FlowDefinition, type FlowIssue, type FlowNode } from '../workflow/types.js';
+import {
+  NODE_OUTCOMES,
+  type FlowDefinition,
+  type FlowIssue,
+  type FlowNode,
+  type FlowRoute,
+} from '../workflow/types.js';
 
 /**
  * Flow 静态校验。**在执行之前**把问题全部报出来，不要跑到一半才发现路由指向不存在的节点。
  *
- * 只做 8 件事（刻意不做 DAG 校验）：
+ * 只做 9 件事（刻意不做 DAG 校验）：
  *   1. 恰好一个 @flow（v1 一个技能一条流程）
- *   2. @flow 声明了 start
+ *   2. @flow 声明了 start，且 start 不重复
  *   3. 节点 id 唯一
  *   4. 所有 route target 都存在
  *   5. @end / @stop 不允许再 route
  *   6. 非终态节点必须至少有一条 route
  *   7. 所有节点从 start 可达
- *   8. **允许环** —— research → review → research 是研究流程的常态，用可达性而不是 DAG 判定
+ *   8. **同一个出口不能有两条 route** —— 否则 runner 取第一条，后面那条静默失效
+ *   9. **允许环** —— research → review → research 是研究流程的常态，用可达性而不是 DAG 判定
  *
- * `@subagent <skill>` 指向的技能是否存在由调用方补校验（校验器不认识技能目录）。
+ * `@agent <skill>` 指向的技能是否存在由调用方补校验（校验器不认识技能目录）。
  */
 
 export interface FlowRegistryLookup {
@@ -28,7 +35,7 @@ export interface ValidateSkillFlowOptions {
   flow?: string;
   /** 服务端注册表：@gate/@review/@action 必须已登记（否则会在执行到那一步时才知道） */
   registry?: FlowRegistryLookup;
-  /** `@subagent <id>` 指向的技能是否存在 */
+  /** `@agent <id>` 指向的技能是否存在 */
   hasSkill?: (name: string) => boolean;
 }
 
@@ -39,6 +46,37 @@ export interface FlowValidationResult {
 }
 
 const TERMINAL_TYPES = new Set(['stop', 'end']);
+
+/**
+ * 同一个出口名不能有两条 route。
+ *
+ * `findRoute()` 是 `routes.find((r) => r.on === outcome)` —— 第一条命中就返回，
+ * 后面的**静默被忽略**。作者以为"pass 会去 a 也可能去 b"，实际永远只去 a。
+ * 这种"看不出错、但走向不由自己决定"的写法必须在执行前拦住。
+ */
+function checkDuplicateOutcomes(
+  routes: FlowRoute[],
+  line: number,
+  issues: FlowIssue[],
+  where: { nodeId?: string; label: string },
+): void {
+  const seen = new Map<string, string>();
+  for (const route of routes) {
+    const previous = seen.get(route.on);
+    if (previous) {
+      issues.push({
+        code: 'route-outcome-duplicate',
+        line,
+        ...(where.nodeId ? { nodeId: where.nodeId } : {}),
+        message:
+          `${where.label} 的出口 "${route.on}" 重复：` +
+          `${previous} 与 ${route.to} 不能同时存在（只会走第一条）`,
+      });
+      continue;
+    }
+    seen.set(route.on, route.to);
+  }
+}
 
 export function validateSkillFlow(
   parsed: ParsedSkillFlow,
@@ -86,6 +124,13 @@ export function validateSkillFlow(
 
   const nodeBlocks = parsed.blocks.filter((b) => b.type !== 'flow');
 
+  // 2b. `start` 也只能有一条：`start -> a` 与 `start -> b` 同时存在时 runner 取第一条，
+  // 第二条静默失效 —— 金融流程不该有这种"看书写顺序决定走向"的不确定性。
+  checkDuplicateOutcomes(flowBlock.routes, flowBlock.headingLine, issues, {
+    nodeId: flowBlock.id,
+    label: `@flow ${flowBlock.id}`,
+  });
+
   // 3. 节点 id 唯一
   const nodes: Record<string, FlowNode> = {};
   for (const block of nodeBlocks) {
@@ -110,7 +155,7 @@ export function validateSkillFlow(
     };
   }
 
-  // 4/5/6. 路由合法性
+  // 4/5/6/8. 路由合法性
   for (const node of Object.values(nodes)) {
     const terminal = TERMINAL_TYPES.has(node.type);
     if (terminal && node.routes.length) {
@@ -129,6 +174,10 @@ export function validateSkillFlow(
         message: `@${node.type} ${node.id} 没有出口（非终态节点必须至少有一条 route，如 "- success -> next"）`,
       });
     }
+    checkDuplicateOutcomes(node.routes, node.headingLine, issues, {
+      nodeId: node.id,
+      label: `@${node.type} ${node.id}`,
+    });
     for (const route of node.routes) {
       if (!nodes[route.to]) {
         issues.push({
@@ -141,7 +190,7 @@ export function validateSkillFlow(
     }
   }
 
-  // 6b. 出口必须写全：@subagent/@action 只会有 success|fail，@review 只会有 approve|reject。
+  // 6b. 出口必须写全：@agent/@action 只会有 success|fail，@review 只会有 approve|reject。
   // 少写一个出口，运行时那条分支就无处可去 —— 这类问题在执行前就该报出来。
   for (const node of Object.values(nodes)) {
     const required = NODE_OUTCOMES[node.type];
@@ -202,12 +251,12 @@ export function validateSkillFlow(
         message: `${node.type} "${node.id}" 没有在服务端注册（SKILL.md 不能自己定义 ${node.type} 的语义）`,
       });
     }
-    if (node.type === 'subagent' && opts.hasSkill && !opts.hasSkill(node.id)) {
+    if (node.type === 'agent' && opts.hasSkill && !opts.hasSkill(node.id)) {
       issues.push({
         code: 'skill-missing',
         line: node.headingLine,
         nodeId: node.id,
-        message: `@subagent ${node.id} 没有对应的技能（技能目录里没有名为 "${node.id}" 的 SKILL.md）`,
+        message: `@agent ${node.id} 没有对应的技能（技能目录里没有名为 "${node.id}" 的 SKILL.md）`,
       });
     }
   }

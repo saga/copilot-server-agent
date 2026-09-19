@@ -28,7 +28,7 @@ const FLOW_OK = flow(
   '',
   'start -> work',
   '',
-  '## @subagent work',
+  '## @agent work',
   '',
   '干活。',
   '',
@@ -65,8 +65,8 @@ test('校验：结构完整时通过，并给出 FlowDefinition', () => {
   assert.equal(r.definition!.id, 'demo');
   assert.equal(r.definition!.start, 'work');
   assert.deepEqual(Object.keys(r.definition!.nodes).sort(), ['check', 'done', 'failed', 'work']);
-  assert.equal(r.definition!.nodes['work']!.type, 'subagent');
-  // body 是原样 Markdown（含 route 行）：subagent 直接拿它当 prompt，非 subagent 取首行当描述
+  assert.equal(r.definition!.nodes['work']!.type, 'agent');
+  // body 是原样 Markdown（含 route 行）：agent 直接拿它当 prompt，非 agent 取首行当描述
   assert.equal(r.definition!.nodes['check']!.body, '判断。\n\n- pass -> done\n- fail -> failed');
 });
 
@@ -126,7 +126,7 @@ test('校验：终态不允许再 route，非终态必须有 route', () => {
       '',
       'start -> work',
       '',
-      '## @subagent work',
+      '## @agent work',
       '',
       '- success -> failed',
       '- fail -> failed',
@@ -169,7 +169,7 @@ test('校验：不可达节点报错', () => {
       '',
       'start -> work',
       '',
-      '## @subagent work',
+      '## @agent work',
       '',
       '- success -> done',
       '- fail -> done',
@@ -195,7 +195,7 @@ test('校验：**允许环**（research ⇄ review 是研究流程常态，不�
       '',
       'start -> research',
       '',
-      '## @subagent research',
+      '## @agent research',
       '',
       '- success -> review',
       '- fail -> research',
@@ -250,11 +250,84 @@ test('校验：服务端没注册的 gate / review / action 在执行前就报�
   assert.deepEqual(ok(md, { registry: ALL_REGISTERED }).issues, []);
 });
 
-test('校验：@subagent 指向不存在的技能要报错（不能让 LLM 自己猜一个技能）', () => {
+test('校验：@agent 指向不存在的技能要报错（不能让 LLM 自己猜一个技能）', () => {
   const r = ok(FLOW_OK, { hasSkill: (n) => n === 'other-skill' });
   const hit = r.issues.find((i) => i.code === 'skill-missing');
   assert.ok(hit);
   assert.equal(hit!.nodeId, 'work');
+});
+
+test('校验：同一个出口写了两条 route 必须报错（否则后一条静默失效）', () => {
+  const dupGate = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> check',
+      '',
+      '## @gate check',
+      '',
+      '- pass -> done',
+      '- pass -> failed',
+      '- fail -> failed',
+      '',
+      '## @stop failed',
+      '',
+      '失败。',
+      '',
+      '## @end done',
+      '',
+      '完成。',
+    ),
+  );
+  const hit = dupGate.issues.find((i) => i.code === 'route-outcome-duplicate');
+  assert.ok(hit, '"pass" 出现两次必须报错，而不是取第一条');
+  assert.equal(hit!.nodeId, 'check');
+  assert.match(hit!.message, /pass/);
+  assert.match(hit!.message, /done 与 failed/, '要把两条目标都写出来，作者才知道删哪条');
+  assert.equal(dupGate.definition, undefined, '有 issue 就不给定义');
+});
+
+test('校验：@flow 的 start 也只能有一条（`start -> a` + `start -> b` 是歧义入口）', () => {
+  const r = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> a',
+      'start -> b',
+      '',
+      '## @end a',
+      '',
+      'ok',
+      '',
+      '## @end b',
+      '',
+      'ok',
+    ),
+  );
+  const hit = r.issues.find((i) => i.code === 'route-outcome-duplicate');
+  assert.ok(hit, '两个 start 必须报错');
+  assert.match(hit!.message, /start/);
+});
+
+test('校验：同一个出口指向同一个目标重复写，不算歧义（parser 已去重）', () => {
+  const r = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> check',
+      '',
+      '## @gate check',
+      '',
+      '- pass -> done',
+      '- pass -> done',
+      '- fail -> done',
+      '',
+      '## @end done',
+      '',
+      'ok',
+    ),
+  );
+  assert.deepEqual(r.issues, [], '重复但完全一致的路由只是啰嗦，不是错误');
 });
 
 test('校验：flow 名不匹配 / start 指向不存在的节点', () => {

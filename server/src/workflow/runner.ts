@@ -2,7 +2,7 @@ import { runExecutionTurn } from '../agent/agent-execution.js';
 import { preview } from '../execution/redact.js';
 import type { ExecutionService } from '../execution/execution-service.js';
 import type { ExecutionRecord } from '../execution/types.js';
-import { EXECUTION_EVENT_TYPES as EVT } from '../execution/types.js';
+import { EXECUTION_EVENT_TYPES as EVT, isTerminal } from '../execution/types.js';
 import type { HumanTaskService } from '../human-tasks/human-task-service.js';
 import type { HumanTask } from '../human-tasks/types.js';
 import { parseSkillFlow } from '../skills/flow-parser.js';
@@ -17,11 +17,11 @@ import {
 } from './registry.js';
 import {
   MAX_FLOW_STEPS,
-  NODE_OUTCOMES,
   type FlowContext,
   type FlowDefinition,
   type FlowIssue,
   type FlowNode,
+  type FlowNodeType,
   type WorkflowState,
 } from './types.js';
 
@@ -30,15 +30,28 @@ import {
  *
  * 没有 BPMN，没有 XState，没有第二套 runtime。底下就三层复用：
  *
- *   @subagent → runExecutionTurn（同一个 Copilot session / model / tool policy）
- *   @review   → HumanTaskService（同一套 My Tasks / 委派 / SoD / 租户隔离 / 审计）
- *   @action   → ExecutionService.proposeAction（同一套策略 → 审批 → hash/版本复核 → executor）
+ *   @agent  → runExecutionTurn（同一个 Copilot session / model / tool policy）
+ *   @review → HumanTaskService（同一套 My Tasks / 委派 / SoD / 租户隔离 / 审计）
+ *   @action → ExecutionService.proposeAction（同一套策略 → 审批 → hash/版本复核 → executor）
  *
- * 两步之间的"状态"就是 `agent_execution.workflow_state` 里的一个节点 id。
+ * 两步之间的"状态"就是 `agent_execution.workflow_state` 里的一个节点 id 加上它的执行状态。
  *
- * 推进顺序有讲究：**先把 current 写库，再执行那个节点**。反过来的话，进程在
- * "跑完但状态没落库"之间退出，重启后会把同一步再跑一遍，而 `@action` 那一步
- * 可能已经把业务动作做出去了。
+ * ## 步骤持久化（step durability）
+ *
+ * 每一步的顺序是：**先把 `stepStatus = running` 落库，再执行那个节点**；执行完把 `current`
+ * 推到下一个节点并落回 `pending`。
+ *
+ * 只有 `current` 一个字段时，"这一步跑没跑完"是不可知的：进程在"跑完但状态没落库"之间退出，
+ * 重启后只能靠猜 —— 提前写 `current = next` 会**跳过**一个其实没执行完的步骤；不提前写又会
+ * 重放一个可能已经产生副作用的步骤。所以状态里多一个 `stepStatus`，把顺序显式表达成
+ *
+ *   pending → running → pending
+ *
+ * 这样 crash 恢复才能明确回答"publish 已经开始过，但它完成了没有？"。
+ *
+ * 恢复策略见 `admitInterruptedStep()`：`@agent` / `@gate` 是纯计算，允许重放；
+ * `@action` 有真实副作用，**不自动重放**，落 failed 交人工核对（幂等键只能防重复提交，
+ * 防不了"外部系统已经生效但本地没记上"）。
  */
 
 /** 单测注入 fake，不必拉起 Copilot runtime */
@@ -78,8 +91,15 @@ export interface PreparedFlow {
   definition: FlowDefinition;
 }
 
-/** `@subagent` 输出落进 workflow_state 的截断长度（它只是下一步的判断依据，不是证据仓库） */
+/** `@agent` 输出落进 workflow_state 的截断长度（它只是下一步的判断依据，不是证据仓库） */
 const OUTPUT_MAX_CHARS = 4000;
+
+/**
+ * 允许"重放"的节点类型：纯计算，重跑只是多花一次算力，不会留下副作用。
+ *
+ * `@action` **刻意不在里面**：它可能已经把动作做出去了，重放等于重复提交。
+ */
+const REPLAY_SAFE_NODE_TYPES: ReadonlySet<FlowNodeType> = new Set<FlowNodeType>(['agent', 'gate']);
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -115,10 +135,28 @@ export class WorkflowRunner {
     return loaded.ok ? { ok: true, issues: [] } : { ok: false, issues: loaded.issues };
   }
 
-  /** 后台推进流程（202 之后调用，不阻塞 HTTP） */
+  /**
+   * 后台推进流程（202 之后调用，不阻塞 HTTP）。
+   *
+   * 编排器自己的异常**必须**在终态落地：只 log 的话，`buildIntent()` / `createApprovalTask()` /
+   * `transition()` / registry 抛出来的意外错误会留下一个永远 `running` 的 execution ——
+   * 它占着队列、挡住取消、也没人知道该不该重跑。
+   *
+   * 注意 `runSubagent()` / `runGate()` 自己 catch 了节点内的失败（那是**可路由**的出口），
+   * 所以这里兜住的是真正未预期的异常，测试里不容易碰到 —— 正因为不容易碰到才必须写。
+   */
   runDetached(record: ExecutionRecord): void {
-    void this.run(record.executionId).catch((err) => {
-      console.error(`[workflow] execution ${record.executionId} 推进异常：${errMsg(err)}`);
+    void this.run(record.executionId).catch(async (err) => {
+      console.error(`[workflow] execution ${record.executionId} 推进异常：`, err);
+      try {
+        const current = await this.deps.executions.get(record.executionId);
+        if (current && !isTerminal(current.status)) {
+          await this.deps.executions.fail(record.executionId, err);
+        }
+      } catch (failErr) {
+        // 连落 failed 都失败（库挂了）：至少日志里要有，运维才能从外部状态核对
+        console.error(`[workflow] execution ${record.executionId} 无法落 failed：`, failErr);
+      }
     });
   }
 
@@ -137,7 +175,42 @@ export class WorkflowRunner {
         start: state.current,
       });
     }
+    if (!(await this.admitInterruptedStep(executionId, state, loaded.definition))) return;
     await this.loop(rec, state, loaded.definition);
+  }
+
+  /**
+   * 上一次推进在**节点中途**退出（durable 状态里留着 `stepStatus = running`）时的准入判断。
+   *
+   * 这是 `stepStatus` 存在的全部意义：只有它能把"这一步已经开始过"和"这一步还没跑"区分开。
+   *
+   *   @agent / @gate  纯计算 → 记一条审计后直接重跑
+   *   @action         有副作用 → 不重放，落 failed 交人工核对
+   *
+   * @returns false = 已落终态 / 不该继续推进
+   */
+  private async admitInterruptedStep(
+    executionId: string,
+    state: WorkflowState,
+    definition: FlowDefinition,
+  ): Promise<boolean> {
+    if (state.stepStatus !== 'running') return true;
+    const node = definition.nodes[state.current];
+    await this.append(executionId, EVT.workflowStepInterrupted, {
+      nodeId: state.current,
+      nodeType: node?.type ?? 'unknown',
+      steps: state.steps,
+    });
+    // 节点不存在交给 loop() 报"节点不存在"，这里不重复判定
+    if (!node || REPLAY_SAFE_NODE_TYPES.has(node.type)) return true;
+    await this.failWorkflow(
+      executionId,
+      state,
+      `节点 "${state.current}" 已开始执行但未确认完成（进程在步骤中途退出）：` +
+        '有副作用的步骤不自动重放。请人工核对外部系统是否已生效（幂等键 action:<executionId>:<actionHash>），' +
+        '确认后再决定是否重新发起',
+    );
+    return false;
   }
 
   /**
@@ -209,10 +282,17 @@ export class WorkflowRunner {
         step: state.steps,
       });
 
+      // 执行**之前**先落 running：进程在节点中途退出时，durable 状态里留下"这一步开始了"。
+      // 没有它，重启后既可能重放已完成的动作，也可能跳过没跑完的动作。
+      if (state.stepStatus !== 'running') {
+        state = { ...state, stepStatus: 'running' };
+        await this.deps.executions.updateWorkflowState(executionId, state);
+      }
+
       let result: StepResult;
       switch (node.type) {
-        case 'subagent':
-          result = await this.runSubagent(rec, state, node);
+        case 'agent':
+          result = await this.runAgent(rec, state, node);
           break;
         case 'gate':
           result = await this.runGate(rec, state, node);
@@ -264,11 +344,13 @@ export class WorkflowRunner {
       state = {
         ...state,
         current: next,
+        stepStatus: 'pending',
         steps: state.steps + 1,
         lastOutcome: result.outcome,
         waitingTaskId: undefined,
       };
-      // 先落库再执行下一步：中途退出时停在"还没跑"的那一步，而不是"跑完不知道"
+      // 执行完才把 current 推到下一个节点：中途退出时停在"跑了一半"的那一步，
+      // 由 admitInterruptedStep() 决定能不能重放，而不是把没执行完的步骤直接跳过
       await this.deps.executions.updateWorkflowState(executionId, state);
     }
   }
@@ -276,13 +358,17 @@ export class WorkflowRunner {
   // ---------- 节点实现 ----------
 
   /**
-   * @subagent：复用 runExecutionTurn —— Copilot session、model、tool policy、tool 证据、
+   * @agent：复用 runExecutionTurn —— Copilot session、model、tool policy、tool 证据、
    * usage 全部走现在的路径。节点**不拥有任何新的工具权限**，也不自己拼 prompt 模板。
    *
-   * 节点 id 就是技能名（`## @subagent investment-research`）：技能必须先存在，
+   * 注意它**不是真正的 subagent 委派**：跑的是当前 session 的又一次 agent turn，
+   * 而不是另起一个独立 agent / 独立技能进程。所以关键字叫 `@agent`（旧名 `@subagent`
+   * 仍然认，但含义一样）。真要做 skill → skill 的委派，得先实现 subagent invocation。
+   *
+   * 节点 id 就是技能名（`## @agent investment-research`）：技能必须先存在，
    * 找不到就失败，而不是让 LLM 自己猜一个。
    */
-  private async runSubagent(
+  private async runAgent(
     rec: ExecutionRecord,
     state: WorkflowState,
     node: FlowNode,
@@ -364,6 +450,7 @@ export class WorkflowRunner {
       await this.deps.executions.updateWorkflowState(rec.executionId, {
         ...state,
         current: node.id,
+        stepStatus: 'waiting',
         waitingTaskId: verdict.taskId,
       });
       await this.append(rec.executionId, EVT.workflowWaiting, {
@@ -433,6 +520,7 @@ export class WorkflowRunner {
     await this.deps.executions.updateWorkflowState(rec.executionId, {
       ...state,
       current: node.id,
+      stepStatus: 'waiting',
       waitingTaskId: task.taskId,
     });
   }
@@ -449,6 +537,7 @@ export class WorkflowRunner {
     const settled: WorkflowState = {
       ...state,
       current: node.id,
+      stepStatus: 'completed',
       steps: state.steps + 1,
       waitingTaskId: undefined,
     };
@@ -472,6 +561,7 @@ export class WorkflowRunner {
     const settled: WorkflowState = {
       ...state,
       current: node.id,
+      stepStatus: 'completed',
       steps,
       lastOutcome: 'completed',
       waitingTaskId: undefined,
@@ -603,6 +693,7 @@ export class WorkflowRunner {
     const advanced: WorkflowState = {
       ...state,
       current: next,
+      stepStatus: 'pending',
       steps: state.steps + 1,
       lastOutcome: outcome,
       waitingTaskId: undefined,

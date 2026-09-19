@@ -28,7 +28,7 @@ start -> work
 
 ---
 
-## @subagent work
+## @agent work
 
 干活的说明。
 
@@ -56,7 +56,7 @@ test('解析：frontmatter / 普通 section 不干扰，节点与路由都取到
   assert.deepEqual(parsed.issues, []);
   assert.deepEqual(
     parsed.blocks.map((b) => `${b.type}:${b.id}`),
-    ['flow:demo', 'subagent:work', 'gate:check', 'stop:failed', 'end:done'],
+    ['flow:demo', 'agent:work', 'gate:check', 'stop:failed', 'end:done'],
   );
   const flow = parsed.blocks[0]!;
   assert.equal(flow.start, 'work', 'start 从 `start -> work` 里取');
@@ -88,7 +88,7 @@ test('解析：代码块里的 `->` 不算路由（否则示例代码会把流�
     '',
     'start -> work',
     '',
-    '## @subagent work',
+    '## @agent work',
     '',
     '示例（不是路由）：',
     '',
@@ -145,7 +145,14 @@ test('解析：SKILL.md 里没有 @block 时返回空结果（普通技能仍然
 });
 
 test('解析：带 `- ` 前缀的 start 也认（列表写法与裸行写法等价）', () => {
-  const md = ['## @flow demo', '', '- start -> work', '', '## @subagent work', '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
+  const md = ['## @flow demo', '', '- start -> work', '', '## @agent work', '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
   const parsed = parseSkillFlow(md);
   assert.equal(parsed.blocks[0]!.start, 'work');
+});
+
+test('解析：`@subagent` 是 `@agent` 的旧名，解析成同一个节点类型（不报错、不重复）', () => {
+  const md = ['## @flow demo', '', 'start -> work', '', '## @subagent work', '', '- success -> done', '', '## @end done', '', 'ok'].join('\n');
+  const parsed = parseSkillFlow(md);
+  assert.deepEqual(parsed.issues, [], '旧名不该让已经写好的 SKILL.md 校验失败');
+  assert.equal(parsed.blocks[1]!.type, 'agent', '别名归一化成 agent，下游只认一种');
 });

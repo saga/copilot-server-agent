@@ -671,7 +671,7 @@ WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
 | 块 | 作用 | 复用 | 出口 |
 |----|------|------|------|
 | `@flow <id>` | 流程入口，正文第一行是 `start -> <节点 id>` | — | — |
-| `@subagent <技能名>` | 跑一次技能：节点正文就是给 LLM 的 prompt | `runExecutionTurn`（同一个 session / model / tool policy / 工具证据） | `success` / `fail` |
+| `@agent <技能名>` | 跑一次 agent turn：节点正文就是给 LLM 的 prompt。**旧名 `@subagent`，语义相同**（parser 归一化，下游只认 `agent`） | `runExecutionTurn`（同一个 session / model / tool policy / 工具证据） | `success` / `fail` |
 | `@gate <注册名>` | 确定性判断，结果只来自服务端注册的实现 | registry 里的 gate 函数 | gate 自己返回的 outcome |
 | `@review <注册名>` | 人工审核 | HumanTask + ApprovalPolicy | `approve` / `reject` |
 | `@action <注册名>` | 业务动作 | `proposeAction`（策略 → 审批 → hash/版本复核 → executor） | `success` / `fail` |
@@ -690,15 +690,36 @@ WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
 
 `POST /api/executions` 在**建 execution 之前**就把整份流程校验完，不过就 400 并带上行号：
 
-`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`node-unreachable`、`skill-missing`（`@subagent` 指向的技能不存在）。
+`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`route-outcome-duplicate`（同一个出口写了两条 route）、`node-unreachable`、`skill-missing`（`@agent` 指向的技能不存在）。
+
+`route-outcome-duplicate` 是后补的一条：`findRoute()` 是 `routes.find(...)`，第一条命中就返回，后面的**静默失效**。`- pass -> review-a` 加 `- pass -> review-b` 读起来像"两种可能"，实际永远只去 `review-a`。`@flow` 的 `start` 同一条规则 —— 金融流程不该有"看书写顺序决定走向"的不确定性。
 
 顺序有讲究：跑到一半才发现某个 `- approve -> xxx` 指向不存在的节点，那时 execution 可能已经停在等待态，或者已经把业务动作提出去了。`@gate` 的出口名无法静态校验（由服务端实现决定），所以这类节点不参与 `node-missing-outcome` 检查，但运行时找不到匹配出口会立刻失败，不做"只有一个出口就兜底"的猜测。
 
 环是**允许**的（`- reject -> investment-research` 是研究流程的常态），所以有硬闸门 `MAX_FLOW_STEPS = 100`：超了就 failed。它刻意不在 DSL 里 —— 这是运行时保护，不是流程语义。
 
-### 11.3 durable state 与 sourceHash
+### 11.3 durable state：stepStatus + sourceHash
 
-每次推进都先把 `current` 写进 `agent_execution.workflow_state`，**再**执行那个节点。反过来写的话，进程在"跑完但状态没落库"之间退出，重启会把同一步再跑一遍，而 `@action` 那一步可能已经把钱打出去了。状态里含 `current` / `steps` / `waitingTaskId` / `lastOutcome` / `lastOutput`（`@subagent` 输出截断 4000 字符，只作下一步判断依据，不是证据仓库 —— 证据在 tool_calls 里）。
+**只有 `current` 一个字段是表达不了"这一步跑没跑完"的**，所以状态里多一个 `stepStatus`：
+
+```
+pending → running → pending
+```
+
+每一步先把 `stepStatus = running` 写进 `agent_execution.workflow_state`，**再**执行那个节点；执行完才把 `current` 推到下一个节点并落回 `pending`。等人工任务时落 `waiting`，`@stop` / `@end` 落 `completed`。
+
+为什么不能只提前写 `current = next`：那样会**跳过**一个其实没执行完的步骤；而不提前写，进程在"跑完但状态没落库"之间退出，重启会**重放**一个可能已经产生副作用的步骤。两种写法都只是把不确定性挪了个位置 —— 只有显式记下 `running` 才能回答"publish 已经开始过，它完成了没有？"
+
+恢复策略在 `admitInterruptedStep()`：
+
+| 中断在哪一步 | 处理 |
+|--------------|------|
+| `@agent` / `@gate` | 纯计算，记一条 `workflow.step.interrupted` 审计后**允许重放** |
+| `@action` | 有真实副作用，**不重放**，落 `failed` 交人工核对（幂等键只能防重复提交，防不了"外部系统已生效但本地没记上"） |
+
+状态里含 `current` / `stepStatus` / `steps` / `waitingTaskId` / `lastOutcome` / `lastOutput`（`@agent` 输出截断 4000 字符，只作下一步判断依据，不是证据仓库 —— 证据在 tool_calls 里）。
+
+编排器自身的未预期异常（`buildIntent()` / `createApprovalTask()` / `transition()` / registry / DB）由 `runDetached()` 兜底落 `failed`：只 `console.error` 会留下一个永远 `running` 的 execution —— 它占着队列、挡住取消，也没人知道该不该重跑。节点内的失败（`@agent` 跑不动、`@gate` 抛错）不走这条路，它们是**可路由**的出口（`- fail -> ...`）。
 
 `sourceHash` 是 SKILL.md 的 SHA-256，每次推进前重算比对。它只是一个字段，挡的是金融流程最不该发生的事：已经开始的执行悄悄切到另一个版本的流程定义上继续跑。不一致 → failed + 人工确认，不静默迁移。
 

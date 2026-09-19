@@ -11,7 +11,7 @@
  *
  * 节点只有 6 种，没有 parallel / timer / subprocess / expression：
  *
- *   @subagent  Agent/Skill 干活（走 Copilot session）
+ *   @agent     跑一次 agent turn（走 Copilot session）—— 旧名 @subagent，语义相同
  *   @gate      确定性判断（走服务端注册的 gate，LLM 不决定合规边界）
  *   @review    人工审核（复用 HumanTask + ApprovalPolicy）
  *   @action    业务动作（复用 ActionService：策略 → 审批 → hash/版本复核 → executor）
@@ -22,13 +22,13 @@
  * 由服务端 registry 决定谁有资格（与"LLM 不能定义 enterprise security boundary"一致）。
  */
 
-export type FlowNodeType = 'subagent' | 'gate' | 'review' | 'action' | 'stop' | 'end';
+export type FlowNodeType = 'agent' | 'gate' | 'review' | 'action' | 'stop' | 'end';
 
 /** 解析期出现的块类型，比节点多一个 `@flow`（流程入口） */
 export type FlowBlockType = FlowNodeType | 'flow';
 
 export interface FlowRoute {
-  /** 出口名：subagent/action 用 success|fail；gate 用 gate 自己返回的 outcome；review 用 approve|reject */
+  /** 出口名：agent/action 用 success|fail；gate 用 gate 自己返回的 outcome；review 用 approve|reject */
   on: string;
   /** 目标节点 id */
   to: string;
@@ -56,13 +56,25 @@ export interface FlowDefinition {
 }
 
 /**
+ * 当前节点的执行状态。**只有 `current` 一个字段是表达不了"这步跑没跑完"的**：
+ *
+ *   pending   还没开始 —— 可以安全执行
+ *   running   已经开始 —— 进程在这里退出的话，无法确认它是否已经完成
+ *   waiting   停在等人工任务（review / action 审批）
+ *   completed 终态节点（@stop / @end）已收尾
+ *
+ * 缺省（老数据）按 `pending` 处理。
+ */
+export type WorkflowStepStatus = 'pending' | 'running' | 'waiting' | 'completed';
+
+/**
  * 运行中的 workflow 状态，落在 `agent_execution.workflow_state`。
  *
  * 必须 durable：`@review` 可能等几个小时，Pod 重启后要靠它回答"我停在哪个节点、
  * 等的是哪个任务"。否则 execution = waiting_for_approval 但没人知道等的是哪一步。
  */
 export interface WorkflowState {
-  /** 技能名（= 节点 `@subagent <skill>` 的名字） */
+  /** 技能名（= 节点 `@agent <skill>` 的名字） */
   skill: string;
   flow: string;
   /**
@@ -73,13 +85,15 @@ export interface WorkflowState {
   sourceHash: string;
   /** 当前节点 id */
   current: string;
+  /** 当前节点的执行状态（见 WorkflowStepStatus） */
+  stepStatus?: WorkflowStepStatus;
   /** 已执行步数（上限见 MAX_FLOW_STEPS） */
   steps: number;
   /** 正等着的人工任务（review / action 审批） */
   waitingTaskId?: string;
   /** 最近一个节点的出口名，便于审计与排障 */
   lastOutcome?: string;
-  /** 最近一个 @subagent 的输出（截断），供后续 gate/action 判断依据 */
+  /** 最近一个 @agent 的输出（截断），供后续 gate/action 判断依据 */
   lastOutput?: string;
 }
 
@@ -98,7 +112,7 @@ export interface FlowContext {
   nodeId: string;
   /** execution 建立时带的 input（如 { securityId } ） */
   input?: unknown;
-  /** 上一个 @subagent 的输出（截断后） */
+  /** 上一个 @agent 的输出（截断后） */
   lastOutput?: string;
 }
 
@@ -123,13 +137,13 @@ export interface FlowIssue {
 /**
  * 运行时出口词汇表 —— 校验器与 runner 共用这一份，避免两边各写一份字面量后漂移。
  *
- *   @subagent / @action  只会给出 success | fail（跑成功或跑失败）
+ *   @agent / @action     只会给出 success | fail（跑成功或跑失败）
  *   @review              只会给出 approve | reject（打回重做=把 reject 的 route 指回上一步）
  *   @gate                出口由服务端注册的实现决定，SKILL.md 必须与它一致（无法静态校验）
  *   @stop / @end         终态，没有出口
  */
 export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
-  subagent: ['success', 'fail'],
+  agent: ['success', 'fail'],
   gate: [],
   review: ['approve', 'reject'],
   action: ['success', 'fail'],

@@ -235,6 +235,8 @@ export const EXECUTION_EVENT_TYPES = {
   workflowStarted: 'workflow.started',
   workflowStepStarted: 'workflow.step.started',
   workflowStepCompleted: 'workflow.step.completed',
+  /** 上一次推进在节点中途退出（durable 状态里留着 stepStatus = running） */
+  workflowStepInterrupted: 'workflow.step.interrupted',
   workflowWaiting: 'workflow.waiting',
   workflowResumed: 'workflow.resumed',
   workflowCompleted: 'workflow.completed',

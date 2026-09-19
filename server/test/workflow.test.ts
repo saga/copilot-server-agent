@@ -26,7 +26,7 @@ import type { WorkflowState } from '../src/workflow/types.js';
  * WorkflowRunner 端到端（内存仓储 + 假 turn，不拉 Copilot runtime）。
  *
  * 要证明的是编排本身：
- *   - @subagent → @gate → @review（暂停等人工）→ 审批后续跑 → @action（再暂停）→ @end
+ *   - @agent → @gate → @review（暂停等人工）→ 审批后续跑 → @action（再暂停）→ @end
  *   - 两条恢复路径（评审 / 动作审批）都能从 durable 状态接上
  *   - 失败与拒绝走到 @stop，execution 落 failed 而不是卡在中间
  *   - 环有步数上限兜底（否则 review 一直打回会把 execution 跑成死循环）
@@ -44,7 +44,7 @@ description: 编排测试用技能
 
 start -> flow-demo
 
-## @subagent flow-demo
+## @agent flow-demo
 
 做研究，输出带证据的结论。
 
@@ -116,6 +116,9 @@ start -> demo-action
 
 ok
 `;
+
+/** 旧名 `@subagent`：已经写好的 SKILL.md 不该因为一次改名就整片校验失败 */
+const LEGACY_MD = SKILL_MD.replace('## @agent flow-demo', '## @subagent flow-demo');
 
 function writeSkills(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'copilot-flow-'));
@@ -243,6 +246,16 @@ async function startWorkflow(
 const eventTypes = async (w: Wired, id: string): Promise<string[]> =>
   (await w.executions.events(id, 200)).map((e) => e.type);
 
+/** runDetached 是 fire-and-forget：轮询等它自己收尾（不用 sleep 硬等） */
+async function waitFor(check: () => Promise<boolean>, ms = 1000): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    if (await check()) return true;
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
 test.beforeEach(() => {
   gateOutcome = 'pass';
   turnError = undefined;
@@ -250,7 +263,7 @@ test.beforeEach(() => {
   turnBehavior = (_p, i) => ({ content: `研究结论 ${i}`, chars: 20 });
 });
 
-test('编排：subagent → gate → review 暂停 → 审批续跑 → action 再暂停 → 审批 → 完成', async () => {
+test('编排：agent → gate → review 暂停 → 审批续跑 → action 再暂停 → 审批 → 完成', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w, { input: { securityId: 'AAPL' } });
@@ -262,8 +275,8 @@ test('编排：subagent → gate → review 暂停 → 审批续跑 → action �
   assert.equal(rec.workflow?.current, 'demo-review');
   assert.ok(rec.workflow?.waitingTaskId, '要记下在等哪个任务（重启后才能接上）');
   assert.equal(rec.workflow?.steps, 2, 'work + check 已推进两步');
-  assert.deepEqual(seenPrompts.length, 1, '@subagent 只跑一次 agent turn');
-  assert.match(seenPrompts[0]!, /做研究，输出带证据的结论/, '@subagent 的 prompt 就是节点正文');
+  assert.deepEqual(seenPrompts.length, 1, '@agent 只跑一次 agent turn');
+  assert.match(seenPrompts[0]!, /做研究，输出带证据的结论/, '@agent 的 prompt 就是节点正文');
 
   const reviewTask = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
   assert.equal(reviewTask.type, 'approval');
@@ -358,7 +371,7 @@ test('编排：gate 判 fail → 走 @stop（确定性判断真的会改变走�
   assert.match(String(gateEvent?.payload?.['reason']), /gate 判定 fail/, 'gate 的理由要进审计');
 });
 
-test('编排：@subagent 抛错是**可路由**的失败，不是编排器崩溃', async () => {
+test('编排：@agent 抛错是**可路由**的失败，不是编排器崩溃', async () => {
   turnError = 'runtime 挂了';
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
@@ -420,6 +433,101 @@ test('编排：自动放行的动作不再暂停，直接走到 @end', async () 
   } finally {
     delete process.env.COPILOT_AUTO_APPROVE_ACTIONS;
   }
+});
+
+test('编排：旧名 @subagent 与 @agent 等价（改名不让已写好的 SKILL.md 失效）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': LEGACY_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'waiting_for_approval', '旧名照样能跑起来');
+  assert.equal(rec.workflow?.current, 'demo-review');
+});
+
+test('编排：每一步**先把 stepStatus=running 落库、再执行**，执行完才落 pending', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const writes: Array<{ current: string; stepStatus?: string }> = [];
+  const orig = w.executions.updateWorkflowState.bind(w.executions);
+  w.executions.updateWorkflowState = async (id, state) => {
+    writes.push({
+      current: state.current,
+      ...(state.stepStatus ? { stepStatus: state.stepStatus } : {}),
+    });
+    return orig(id, state);
+  };
+
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  assert.deepEqual(writes, [
+    { current: 'flow-demo', stepStatus: 'running' },
+    { current: 'demo-gate', stepStatus: 'pending' },
+    { current: 'demo-gate', stepStatus: 'running' },
+    { current: 'demo-review', stepStatus: 'pending' },
+    { current: 'demo-review', stepStatus: 'running' },
+    { current: 'demo-review', stepStatus: 'waiting' },
+  ]);
+  assert.equal((await w.executions.get(id))!.workflow?.stepStatus, 'waiting');
+});
+
+test('编排：crash 在 @agent 中途 → 允许重放（纯计算），但要留审计', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 模拟"进程在 @agent 节点执行到一半被杀"：durable 状态停在 running
+  const rec0 = (await w.executions.get(id))!;
+  await w.executions.updateWorkflowState(id, { ...rec0.workflow!, stepStatus: 'running' });
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'waiting_for_approval', '@agent 重放后照常推进');
+  assert.ok(
+    (await eventTypes(w, id)).includes(EVT.workflowStepInterrupted),
+    '重放必须在时间线上留痕',
+  );
+  assert.equal(seenPrompts.length, 1);
+});
+
+test('编排：crash 在 @action 中途 → **不重放**，落 failed 交人工核对（不能重复提交）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  const rec0 = (await w.executions.get(id))!;
+  await w.executions.updateWorkflowState(id, {
+    ...rec0.workflow!,
+    current: 'demo-action',
+    stepStatus: 'running',
+    steps: 3,
+  });
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'failed', '有副作用的步骤不能自动重放');
+  assert.match(String(rec.error), /未确认完成/);
+  assert.match(String(rec.error), /幂等键/, '要告诉运维去哪里核对');
+  assert.ok((await eventTypes(w, id)).includes(EVT.workflowStepInterrupted));
+});
+
+test('编排：未预期异常也必须落 failed，不能留下永远 running 的 execution', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 模拟推进途中的未预期异常（registry / DB / transition 都可能这样炸）
+  w.executions.updateWorkflowState = async () => {
+    throw new Error('DB 挂了');
+  };
+
+  w.runner.runDetached((await w.executions.get(id))!);
+
+  const settled = await waitFor(async () => (await w.executions.get(id))?.status === 'failed');
+  assert.ok(settled, 'runDetached 必须自己收尾，否则 execution 永远卡在 running');
+  assert.match(String((await w.executions.get(id))!.error), /DB 挂了/);
 });
 
 test('校验：出口写漏 / 技能不存在都在 prepare 阶段就抛出来（含行号）', () => {

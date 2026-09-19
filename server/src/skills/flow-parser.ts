@@ -18,8 +18,17 @@ import type { FlowBlockType, FlowIssue, FlowRoute } from '../workflow/types.js';
  * 路由只从段落与列表项里取，` ``` ` 里的 `- pass -> x` 不算。
  */
 
-/** `## @gate compliance` / `## @flow investment-review` */
-const FLOW_HEADING = /^@(flow|subagent|gate|review|action|stop|end)(?:\s+(.+))?$/i;
+/** `## @agent research` / `## @flow investment-review` */
+const FLOW_HEADING = /^@(flow|agent|subagent|gate|review|action|stop|end)(?:\s+(.+))?$/i;
+
+/**
+ * `@subagent` 是 v1 的旧名，等价于 `@agent`。
+ *
+ * 它启动的是**当前 session 的一次 agent turn**（`runExecutionTurn`），不是另起一个
+ * 独立 agent / 独立 skill —— 名字必须说清这一点，否则会被读成真正的 subagent 委派。
+ * 旧名保留为别名：已经写好的 SKILL.md 不该因为一次改名就整片校验失败。
+ */
+const BLOCK_ALIASES: Record<string, FlowBlockType> = { subagent: 'agent' };
 
 /**
  * 路由：`- pass -> review`，也接受不带列表符号的 `start -> research`。
@@ -100,7 +109,7 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
         issues.push({
           code: 'block-unknown-type',
           line,
-          message: `未知的 flow block 类型：「${headingText}」（可用：@flow / @subagent / @gate / @review / @action / @stop / @end）`,
+          message: `未知的 flow block 类型：「${headingText}」（可用：@flow / @agent / @gate / @review / @action / @stop / @end；@subagent 是 @agent 的旧名）`,
         });
       }
       continue;
@@ -116,7 +125,8 @@ export function parseSkillFlow(markdown: string): ParsedSkillFlow {
       continue;
     }
 
-    const type = match[1]!.toLowerCase() as FlowBlockType;
+    const type = (BLOCK_ALIASES[match[1]!.toLowerCase()] ??
+      match[1]!.toLowerCase()) as FlowBlockType;
     const id = (match[2] ?? '').trim();
 
     // 正文 = 本标题之后、下一个同级（或更高级）标题之前的全部节点
