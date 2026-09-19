@@ -33,6 +33,7 @@ import {
 import type { CollaborationMode } from '../collaboration/types.js';
 import { createPermissionHandler } from './tool-policy.js';
 import { createToolEvidenceHooks } from './tool-evidence.js';
+import { agentCapabilityFor } from '../workflow/capability.js';
 import { sqliteFilePath, type StateBackend } from '../db/connection.js';
 import type { ExecutionStats } from '../execution/repository.js';
 
@@ -473,6 +474,8 @@ class SessionService {
       sessionId,
       workspacePath: workspaceDir,
       mcpServers: mcpServers ? Object.keys(mcpServers) : [],
+      // Skill Flow 的 @agent 能力边界：跑到流程节点时才有值，所以按请求现取（见 capability.ts）
+      capability: () => agentCapabilityFor(sessionId),
     };
     // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设；
     // 工具证据 + workspace 守卫（onPreToolUse/onPostToolUse/onPostToolUseFailure）为强制项，

@@ -59,6 +59,23 @@ const ALL_REGISTERED = {
   hasAction: () => true,
 };
 
+/** 注册表里的 `@review` 基策略（服务端权威值；SKILL.md 的属性只能在其上收窄） */
+function basePolicy(
+  eligibleRoles: string[],
+  over: Partial<{
+    strategy: 'ANY' | 'ALL';
+    requiredCount: number;
+    allowInitiator: boolean;
+  }> = {},
+) {
+  return {
+    eligibleRoles,
+    strategy: over.strategy ?? ('ANY' as const),
+    requiredCount: over.requiredCount ?? 1,
+    allowInitiator: over.allowInitiator ?? false,
+  };
+}
+
 test('校验：结构完整时通过，并给出 FlowDefinition', () => {
   const r = ok(FLOW_OK);
   assert.deepEqual(r.issues, []);
@@ -419,17 +436,20 @@ test('校验：@review 拿不到任何角色 → review-missing-role', () => {
     '',
     'ok',
   );
-  // 注册表也查不到角色 → 建出来就是一个"没人有资格批"的任务
-  const noRoles = { ...ALL_REGISTERED, reviewRoles: () => undefined };
+  // 注册表里该 review 登记了，但 eligibleRoles 是空的 → 建出来就是一个"没人有资格批"的任务
+  const noRoles = { ...ALL_REGISTERED, reviewPolicy: () => basePolicy([]) };
   const hit = ok(md, { registry: noRoles }).issues.find((i) => i.code === 'review-missing-role');
-  assert.ok(hit, '两边都没有角色必须报错');
-  assert.match(hit!.message, /role:/, '报错要告诉作者怎么修');
+  assert.ok(hit, '注册表的 eligibleRoles 为空必须报错');
+  assert.match(hit!.message, /eligibleRoles/, '报错要告诉作者怎么修');
 
   // 注册表里有 eligibleRoles 就够了（SKILL.md 不必写）
-  const withRoles = { ...ALL_REGISTERED, reviewRoles: () => ['compliance.reviewer'] };
+  const withRoles = {
+    ...ALL_REGISTERED,
+    reviewPolicy: () => basePolicy(['compliance.reviewer']),
+  };
   assert.deepEqual(ok(md, { registry: withRoles }).issues, []);
 
-  // 不提供 reviewRoles 回调时跳过这项检查（只做结构校验的场景）
+  // 不提供 reviewPolicy 回调时跳过这项检查（只做结构校验的场景）
   assert.deepEqual(ok(md, { registry: ALL_REGISTERED }).issues, []);
 });
 
@@ -476,5 +496,311 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
     exclude: 'initiator',
   });
   assert.deepEqual(r.definition!.nodes['publish']!.attrs, { role: 'investment.reviewer' });
-  assert.deepEqual(r.definition!.nodes['investment-research']!.attrs, {}, '@agent 没有属性');
+  assert.deepEqual(
+    r.definition!.nodes['investment-research']!.attrs,
+    { output: 'non-empty' },
+    '@agent 只有完成契约属性（谁有权跑这个 skill 不由 SKILL.md 决定）',
+  );
+});
+
+// ---------- 属性只能比服务端更严（本轮新增的核心安全规则） ----------
+
+/** 一个 `@review` 流程骨架，属性写在正文最前面 */
+const reviewFlow = (...attrs: string[]): string =>
+  flow(
+    '## @flow demo',
+    '',
+    'start -> rev',
+    '',
+    '## @review rev',
+    '',
+    ...attrs,
+    ...(attrs.length ? [''] : []),
+    '审核。',
+    '',
+    '- approve -> done',
+    '- reject -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+
+const withPolicy = (policy: ReturnType<typeof basePolicy>) => ({
+  ...ALL_REGISTERED,
+  reviewPolicy: () => policy,
+});
+
+test('校验：@review 的 role 只能是注册表基策略的子集（不能引入新角色）', () => {
+  const md = reviewFlow('role: compliance.reviewer');
+  // 基策略里有它 → 合法的收窄
+  assert.deepEqual(ok(md, { registry: withPolicy(basePolicy(['compliance.reviewer', 'risk'])) }).issues, []);
+
+  // 基策略里没有它 → 引入了一个新角色，等于放宽
+  const hit = ok(md, { registry: withPolicy(basePolicy(['risk'])) }).issues.find(
+    (i) => i.code === 'role-not-allowed',
+  );
+  assert.ok(hit, 'role 不在基策略里必须报错');
+  assert.match(hit!.message, /只能从基策略里收窄/);
+});
+
+test('校验：@review 的 strategy / required / exclude 都只能更严', () => {
+  // strategy：基策略 ALL → SKILL.md 写 ANY = 放宽（3 人通过降成任一通过）
+  const anyWidens = ok(reviewFlow('strategy: ANY'), {
+    registry: withPolicy(basePolicy(['risk'], { strategy: 'ALL', requiredCount: 3 })),
+  }).issues.find((i) => i.code === 'attr-widens');
+  assert.ok(anyWidens, 'ALL → ANY 必须报错');
+  assert.match(anyWidens!.message, /strategy: ANY 放宽/);
+
+  // 基策略 ANY → 写 ALL = 更严，允许
+  assert.deepEqual(
+    ok(reviewFlow('strategy: ALL'), { registry: withPolicy(basePolicy(['risk'])) }).issues,
+    [],
+  );
+
+  // required：基策略 3 票 → 写 1 票 = 放宽
+  const fewerVotes = ok(reviewFlow('required: 1'), {
+    registry: withPolicy(basePolicy(['risk'], { requiredCount: 3 })),
+  }).issues.find((i) => i.code === 'attr-widens');
+  assert.ok(fewerVotes, '降票数必须报错');
+  assert.match(fewerVotes!.message, /低于注册表要求的 3 票/);
+
+  // 基策略 1 票 → 写 3 票 = 更严，允许
+  assert.deepEqual(
+    ok(reviewFlow('required: 3'), { registry: withPolicy(basePolicy(['risk'])) }).issues,
+    [],
+  );
+
+  // exclude：基策略不允许自批 → 写 none = 放宽
+  const selfApprove = ok(reviewFlow('exclude: none'), {
+    registry: withPolicy(basePolicy(['risk'], { allowInitiator: false })),
+  }).issues.find((i) => i.code === 'attr-widens');
+  assert.ok(selfApprove, '把禁止自批改成允许必须报错');
+  assert.match(selfApprove!.message, /SoD/);
+
+  // 基策略允许自批 → 写 initiator = 更严，允许
+  assert.deepEqual(
+    ok(reviewFlow('exclude: initiator'), {
+      registry: withPolicy(basePolicy(['risk'], { allowInitiator: true })),
+    }).issues,
+    [],
+  );
+});
+
+test('校验：@review 属性全部合法时不报错（属性只是收窄，不改变基策略本身）', () => {
+  const r = ok(reviewFlow('role: risk', 'strategy: ALL', 'required: 3', 'exclude: initiator'), {
+    registry: withPolicy(
+      basePolicy(['risk', 'compliance'], { strategy: 'ANY', requiredCount: 1, allowInitiator: true }),
+    ),
+  });
+  assert.deepEqual(r.issues, []);
+  assert.deepEqual(r.definition!.nodes['rev']!.attrs, {
+    role: 'risk',
+    strategy: 'ALL',
+    required: 3,
+    exclude: 'initiator',
+  });
+});
+
+// ---------- @gate 的出口必须与注册表声明一致 ----------
+
+test('校验：@gate 声明的出口必须有 route，route 的出口必须被声明', () => {
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> check',
+    '',
+    '## @gate check',
+    '',
+    '判断。',
+    '',
+    '- pass -> done',
+    '- fail -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+  const gate = (outcomes: string[]) => ({ ...ALL_REGISTERED, gateOutcomes: () => outcomes });
+
+  // 声明了 review 但没有它的 route → 运行时那条分支无处可去
+  const unrouted = ok(md, { registry: gate(['pass', 'fail', 'review']) }).issues.find(
+    (i) => i.code === 'gate-outcome-unrouted',
+  );
+  assert.ok(unrouted, '声明的出口没有 route 必须报错');
+  assert.match(unrouted!.message, /review/);
+
+  // route 写了一个永远不会被返回的出口 → 死分支
+  const unknown = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> check',
+      '',
+      '## @gate check',
+      '',
+      '- pass -> done',
+      '- fail -> done',
+      '- escalate -> done',
+      '',
+      '## @end done',
+      '',
+      'ok',
+    ),
+    { registry: gate(['pass', 'fail']) },
+  ).issues.find((i) => i.code === 'gate-outcome-unknown');
+  assert.ok(unknown, 'route 的出口不在声明里必须报错');
+  assert.match(unknown!.message, /escalate/);
+
+  // 完全一致 → 通过
+  assert.deepEqual(ok(md, { registry: gate(['pass', 'fail']) }).issues, []);
+
+  // 不提供 gateOutcomes 回调时跳过（只做结构校验的场景）
+  assert.deepEqual(ok(md, { registry: ALL_REGISTERED }).issues, []);
+});
+
+// ---------- @agent 的完成契约与能力边界 ----------
+
+test('校验：@agent 的 tools 只能比服务端上限更严', () => {
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> work',
+    '',
+    '## @agent work',
+    '',
+    'tools: read',
+    '',
+    '干活。',
+    '',
+    '- success -> done',
+    '- fail -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+  const ceiling = ['read', 'write', 'url'] as const;
+
+  const r = ok(md, { agentTools: ceiling });
+  assert.deepEqual(r.issues, []);
+  assert.deepEqual(r.definition!.nodes['work']!.attrs.tools, ['read']);
+
+  // 声明 mcp = 超出上限（默认上限刻意不含 mcp/shell）
+  const widened = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> work',
+      '',
+      '## @agent work',
+      '',
+      'tools: read,mcp',
+      '',
+      '干活。',
+      '',
+      '- success -> done',
+      '- fail -> done',
+      '',
+      '## @end done',
+      '',
+      'ok',
+    ),
+    { agentTools: ceiling },
+  ).issues.find((i) => i.code === 'agent-tools-widens');
+  assert.ok(widened, 'tools 超出上限必须报错');
+  assert.match(widened!.message, /mcp/);
+  assert.match(widened!.message, /COPILOT_WORKFLOW_AGENT_TOOLS/, '要告诉运维改哪里');
+
+  // 未知权限类别 → attr-invalid
+  assert.ok(
+    ok(md.replace('tools: read', 'tools: teleport'), { agentTools: ceiling }).issues.some(
+      (i) => i.code === 'attr-invalid',
+    ),
+  );
+});
+
+test('校验：@agent 的 output 必须是已注册的完成契约，且可被要求必填', () => {
+  const md = flow(
+    '## @flow demo',
+    '',
+    'start -> work',
+    '',
+    '## @agent work',
+    '',
+    'output: research.brief',
+    '',
+    '干活。',
+    '',
+    '- success -> done',
+    '- fail -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+
+  const withOutput = { ...ALL_REGISTERED, hasOutput: (n: string) => n === 'research.brief' };
+  const r = ok(md, { registry: withOutput });
+  assert.deepEqual(r.issues, []);
+  assert.equal(r.definition!.nodes['work']!.attrs.output, 'research.brief');
+
+  // 未注册的契约 → SKILL.md 不能自己定义"什么叫做完了"
+  const missing = ok(md, { registry: { ...ALL_REGISTERED, hasOutput: () => false } }).issues.find(
+    (i) => i.code === 'registry-missing-output',
+  );
+  assert.ok(missing);
+  assert.match(missing!.message, /不能自己定义/);
+
+  // requireAgentOutput：没写 output 的 @agent 直接报错（生产环境的推荐配置）
+  const noOutput = flow(
+    '## @flow demo',
+    '',
+    'start -> work',
+    '',
+    '## @agent work',
+    '',
+    '干活。',
+    '',
+    '- success -> done',
+    '- fail -> done',
+    '',
+    '## @end done',
+    '',
+    'ok',
+  );
+  const required = ok(noOutput, { registry: withOutput, requireAgentOutput: true }).issues.find(
+    (i) => i.code === 'agent-output-missing',
+  );
+  assert.ok(required, '开启 requireAgentOutput 后没写契约必须报错');
+  assert.match(required!.message, /output:/);
+  // 默认不要求（否则存量 SKILL.md 全部校验不过）
+  assert.deepEqual(ok(noOutput, { registry: withOutput }).issues, []);
+});
+
+test('校验：@gate 不接受任何属性（语义完全由服务端决定）', () => {
+  const r = ok(
+    flow(
+      '## @flow demo',
+      '',
+      'start -> check',
+      '',
+      '## @gate check',
+      '',
+      'role: risk',
+      '',
+      '判断。',
+      '',
+      '- pass -> done',
+      '',
+      '## @end done',
+      '',
+      'ok',
+    ),
+    { registry: { ...ALL_REGISTERED, gateOutcomes: () => ['pass'] } },
+  );
+  assert.ok(
+    r.issues.some((i) => i.code === 'block-attr-unsupported'),
+    '往 gate 上写属性必须报错（写了也不会有任何效果）',
+  );
 });

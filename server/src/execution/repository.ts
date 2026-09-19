@@ -1,4 +1,5 @@
 import type { DbBackend } from '../db/dialect.js';
+import type { WorkflowState } from '../workflow/types.js';
 import type {
   ExecutionEvent,
   ExecutionFilter,
@@ -32,6 +33,26 @@ export interface ExecutionRepository {
   update(
     executionId: string,
     patch: Partial<ExecutionRecord>,
+  ): Promise<ExecutionRecord | undefined>;
+  /**
+   * **带版本的** workflow 状态写入（单写者 / CAS）。
+   *
+   * `update()` 是"读 → 合并 → 整行 upsert"，两个推进者并发时后写的会把先写的整段覆盖掉。
+   * 这个方法把写入变成条件更新：
+   *
+   *   update agent_execution
+   *      set workflow_state = ?, workflow_version = workflow_version + 1
+   *    where execution_id = ? and workflow_version = ?
+   *
+   * 只有一个写者能命中，其余返回 undefined（= 冲突，调用方必须停止推进）。
+   *
+   * 注意 `workflow_version` **只由本方法写入**，不参与 `update()` 的整行 upsert ——
+   * 否则一次 `addUsage` 就能把刚被 CAS 抬高的版本号写回旧值，CAS 形同虚设。
+   */
+  compareAndSwapWorkflowState(
+    executionId: string,
+    expectedVersion: number,
+    workflow: WorkflowState,
   ): Promise<ExecutionRecord | undefined>;
   list(filter?: ExecutionFilter): Promise<ExecutionRecord[]>;
   /**

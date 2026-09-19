@@ -123,6 +123,22 @@ export const config = {
    * 这是**企业访问控制配置**，与 SKILL.md（业务流程定义）分开：换组、改组名不该改 Skill。
    */
   businessRolesJson: env('COPILOT_BUSINESS_ROLES', ''),
+  /**
+   * Skill Flow 的 `@agent` 节点允许使用的工具权限类别（逗号分隔，见 workflow/capability.ts）。
+   *
+   * 默认 `read,write,url` —— **刻意不含 mcp 与 shell**：那两样正是 agent 绕开
+   * `@action` 审批、直接对外产生业务副作用的路径（调 MCP 发报告、用 shell 打内部接口）。
+   * 这是企业配置，不是 SKILL.md 能改的东西；SKILL.md 的 `@agent tools:` 只能在它之内收窄。
+   */
+  workflowAgentTools: env('COPILOT_WORKFLOW_AGENT_TOOLS', 'read,write,url'),
+  /**
+   * 是否强制每个 `@agent` 节点声明完成契约（`output:`）。
+   *
+   * 默认关：打开会让所有没写契约的存量 SKILL.md 校验不过。生产环境建议打开 ——
+   * 没有契约时 `@agent success` 只等于"这次 turn 没抛异常"，
+   * 模型回一句"抱歉我无法完成"同样是 success。
+   */
+  workflowRequireAgentOutput: env('COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT', 'false') === 'true',
   // --- MCP：filesystem 预设开关与授权目录（生产默认关；开则必须配 COPILOT_MCP_FS_DIR） ---
   mcpFilesystem: env('COPILOT_MCP_FILESYSTEM', 'false') === 'true',
   mcpFsDir: env('COPILOT_MCP_FS_DIR', '') || undefined,

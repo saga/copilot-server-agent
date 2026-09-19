@@ -23,6 +23,7 @@ const PG_MIGRATION_FILES = [
   'src/db/migrations/001_agent_execution.sql',
   'src/db/migrations/002_collaboration.sql',
   'src/db/migrations/003_workflow.sql',
+  'src/db/migrations/004_workflow_single_writer.sql',
 ];
 /** 001 是建表那一版，它自己的补列已写进 SQLite 的 CREATE TABLE；增量补列从 002 起比对 */
 const PG_INCREMENTAL_FILES = PG_MIGRATION_FILES.slice(1);

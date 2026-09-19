@@ -23,6 +23,16 @@ import {
 import { LlmUsageAccumulator, type LlmUsageSample } from './usage.js';
 import type { WorkflowState } from '../workflow/types.js';
 
+/**
+ * 一次 workflow 状态写入的结果。
+ *
+ * `conflict` = 版本号对不上（另一个推进者已经改过）—— 调用方必须停止推进，
+ * 但**不能**把它当失败：有别人正在推进这个 execution，落终态等于把对方跑着的流程打死。
+ */
+export type WorkflowStateWrite =
+  | { ok: true; version: number }
+  | { ok: false; conflict: true; current?: ExecutionRecord };
+
 export interface ExecutionServiceDeps {
   repository: ExecutionRepository;
   events: EventRepository;
@@ -212,9 +222,34 @@ export class ExecutionService {
    * 顺序要求：先把 `current` 推进到下一个节点写库，再去执行它。
    * 反过来的话，进程在"执行完了但状态还没落库"之间退出，重启后会把同一步再跑一遍
    * （子流程可能已经把动作做出去了）。
+   *
+   * `expectedVersion` 给了就做 **CAS**（单写者）：版本对不上返回 `{ ok: false }`，
+   * 调用方必须停止推进 —— 说明另一个推进者（重启恢复 / 另一副本 / 人工任务回调）
+   * 已经改过这一段状态。不给则无条件写（建流程、测试注入用）。
+   *
+   * 为什么不能让"读 → 合并 → 整行写回"承担这件事：两个推进者交错时，
+   * 后写的会把先写的**整段覆盖掉**（某一步被跳过、步数回退），而审计链上看不出异常。
    */
-  async updateWorkflowState(executionId: string, workflow: WorkflowState): Promise<void> {
-    await this.deps.repository.update(executionId, { workflow });
+  async updateWorkflowState(
+    executionId: string,
+    workflow: WorkflowState,
+    expectedVersion?: number,
+  ): Promise<WorkflowStateWrite> {
+    if (expectedVersion === undefined) {
+      const rec = await this.deps.repository.update(executionId, { workflow });
+      if (!rec) return { ok: false, conflict: true };
+      return { ok: true, version: rec.workflowVersion ?? 0 };
+    }
+    const rec = await this.deps.repository.compareAndSwapWorkflowState(
+      executionId,
+      expectedVersion,
+      workflow,
+    );
+    if (!rec) {
+      const current = await this.deps.repository.get(executionId);
+      return { ok: false, conflict: true, ...(current ? { current } : {}) };
+    }
+    return { ok: true, version: rec.workflowVersion ?? expectedVersion + 1 };
   }
 
   async start(executionId: string): Promise<ExecutionRecord> {

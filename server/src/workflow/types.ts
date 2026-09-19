@@ -141,11 +141,14 @@ export interface FlowIssue {
  *
  *   @agent / @action     只会给出 success | fail（跑成功或跑失败）
  *   @review              只会给出 approve | reject（打回重做=把 reject 的 route 指回上一步）
- *   @gate                出口由服务端注册的实现决定，SKILL.md 必须与它一致（无法静态校验）
+ *   @gate                出口由服务端注册的实现决定 —— 见 FlowGate.outcomes（静态可校验）
  *   @stop / @end         终态，没有出口
  */
 export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
   agent: ['success', 'fail'],
+  // gate 没有固定词汇表：出口名由注册的实现声明（registry.gateOutcomes），
+  // 所以这里给空数组，校验器改走注册表那条路径 —— 硬编码 pass/fail 会把
+  // "again / review / escalate" 这类合法出口误判成缺 route。
   gate: [],
   review: ['approve', 'reject'],
   action: ['success', 'fail'],
@@ -156,21 +159,64 @@ export const NODE_OUTCOMES: Record<FlowNodeType, readonly string[]> = {
 /**
  * 节点正文最前面允许出现的**保留属性**（`name: value` 行）。
  *
- * 只有 `@review` / `@action` 有：属性表达的是"这一步需要什么业务角色、要几票、发起人能否自批"，
- * 属于流程语义，写进 SKILL.md 是合理的；**AD Group 不在这里**，那是企业访问控制配置
- * （见 `identity/business-roles.ts`）。
+ *   @review   role / strategy / required / exclude   —— 谁能批、要几票、发起人能否自批
+ *   @action   role                                   —— 把动作审批资格收窄到某个业务角色
+ *   @agent    output / tools                         —— 完成契约 / 能力边界
  *
- * `@agent` / `@gate` 刻意不支持任何属性：agent 的正文就是 prompt，往里面塞角色声明
- * 只会让"谁有权跑这个 skill"变成一句写给 LLM 的话。
+ * 一条贯穿全部属性的规则：**属性只能比服务端更严**（见 flow-validator 的 `attr-widens`）。
+ * SKILL.md 是会被 LLM 读到、也会被人随手改的文件，不能靠它扩大授权面或放宽能力边界。
+ *
+ * `@gate` 刻意不支持任何属性：gate 的语义完全由服务端注册的实现决定，SKILL.md 里
+ * 写什么都改变不了它 —— 能写的东西只有"看起来有影响"的假象。
  */
 export const NODE_ATTRS: Record<FlowNodeType, readonly string[]> = {
-  agent: [],
+  agent: ['output', 'tools'],
   gate: [],
   review: ['role', 'strategy', 'required', 'exclude'],
   action: ['role'],
   stop: [],
   end: [],
 };
+
+/**
+ * 权限类别 —— 与 SDK `PermissionRequest.kind` 对齐的**白名单**子集。
+ *
+ * 只列 @agent 节点可能被允许的类别：SDK 里还有 memory / custom-tool / extension 等，
+ * 它们**不在白名单里**，因此永远无法通过能力边界（默认拒绝，与 tool-policy 一致）。
+ */
+export type FlowPermissionKind = 'read' | 'write' | 'shell' | 'mcp' | 'url';
+
+export const FLOW_PERMISSION_KINDS: readonly FlowPermissionKind[] = [
+  'read',
+  'write',
+  'shell',
+  'mcp',
+  'url',
+];
+
+export function isFlowPermissionKind(value: string): value is FlowPermissionKind {
+  return (FLOW_PERMISSION_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * `@review` 的**生效基策略** —— 服务端注册表的权威值（可选字段已补成确定值）。
+ *
+ * 放在这里而不是 registry.ts，是为了让校验器只依赖类型定义，不依赖注册表实现：
+ * 校验器只回答"SKILL.md 有没有越过这条基策略"，不关心它从哪来。
+ */
+export interface ReviewBasePolicy {
+  /** 有资格审核的业务角色（权威来源；SKILL.md 的 `role:` 只能从中挑） */
+  eligibleRoles: string[];
+  strategy: 'ANY' | 'ALL';
+  requiredCount: number;
+  /** 是否允许发起人自批（SoD）；false 时 SKILL.md 不能写 `exclude: none` */
+  allowInitiator: boolean;
+  timeoutSeconds?: number;
+}
+
+/** 完成契约 / gate 名等流程内引用的 id 形态（与业务角色 id 同一套规则） */
+export const FLOW_CONTRACT_ID = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/;
+
 
 /** 全部保留属性名（用于"属性名认得、但用错了节点类型"的判定） */
 export const ALL_ATTR_NAMES: readonly string[] = [...new Set(Object.values(NODE_ATTRS).flat())];
@@ -182,15 +228,32 @@ export const ALL_ATTR_NAMES: readonly string[] = [...new Set(Object.values(NODE_
 export interface FlowNodeAttrs {
   /** 业务角色 id（`compliance.reviewer`），不是 AD Group */
   role?: string;
-  /** 多人审核规则 */
+  /** 多人审核规则。相对注册表的基策略**只能更严**：基策略是 ANY 时才允许改成 ALL */
   strategy?: 'ANY' | 'ALL';
-  /** 需要的批准票数 */
+  /** 需要的批准票数。**只能 ≥** 注册表的 requiredCount（降票数 = 放宽） */
   required?: number;
   /**
    * 排除的审批主体。
    *
    * `initiator` = 发起人不能批自己发起的事（SoD）；`none` = 显式允许（仍受全局
    * `COPILOT_ALLOW_INITIATOR_APPROVAL` 限制，两个开关都开才真的放行）。
+   *
+   * 注册表没开 `allowInitiator` 时，写 `exclude: none` 属于放宽 → 校验失败。
    */
   exclude?: 'initiator' | 'none';
+  /**
+   * `@agent` 的完成契约 id（服务端注册，见 registry 的 FlowOutput）。
+   *
+   * 它解决的问题：`@agent success` 只代表"这次 turn 没抛异常"，不代表业务上做完了。
+   * 有了契约，节点返回 success 之前必须先过服务端注册的确定性校验 —— 不让 LLM 自评。
+   */
+  output?: string;
+  /**
+   * `@agent` 允许的权限类别（`read,write`）。
+   *
+   * 与 `role:` 同理，**只能比服务端上限更严**（上限见 config.workflowAgentTools）：
+   * 默认上限是 read/write/url —— 也就是"能读能写工作区文件，但**碰不到 MCP 与 shell**"，
+   * 因为那两样正是绕开 `@action` 审批直接产生业务副作用的路径。
+   */
+  tools?: FlowPermissionKind[];
 }

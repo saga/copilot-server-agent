@@ -354,6 +354,66 @@ fail
 
 ---
 
+## 保留属性：`output` 与 `tools`
+
+`@agent` 的正文最前面可以写两行保留属性（必须**紧跟标题**，否则会被当成 prompt 正文）：
+
+```md
+## @agent investment-research
+
+output: non-empty
+tools: read,url
+
+使用本次会话已加载的 investment-research 能力完成研究。
+
+- success -> compliance
+- fail -> research-failed
+```
+
+### `output: <契约 id>` —— 完成契约
+
+`turn 没有抛异常` **不等于** `业务上做完了`。模型因为权限、工具失败或 prompt 歧义回一句
+“抱歉，我无法完成该任务”时，turn 同样是成功的 —— 于是一份空结论会一路走到发布审批。
+
+所以完成条件由**服务端注册的确定性校验**判定，不由模型自评：
+
+```ts
+registerFlowOutput({
+  name: 'non-empty',
+  description: 'turn 必须产出非空内容',
+  validate: ({ content }) => (content.trim() ? { ok: true } : { ok: false, reason: '空输出' }),
+});
+```
+
+契约没过 → 走 `fail` 出口（**可路由**，不是编排器崩溃）。契约 id 必须在服务端注册，
+SKILL.md 不能自己定义“什么叫做完了”（`registry-missing-output`）。
+
+生产环境建议开启 `COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT=true`：每个 `@agent` 都必须声明契约
+（`agent-output-missing`）。默认关闭只是为了让存量 SKILL.md 不突然全部校验不过。
+
+### `tools: <权限类别>` —— 能力边界
+
+流程把业务动作收敛到 `@action`（策略 → 审批 → hash/版本复核 → executor），
+但 agent 手上还有工具：它完全可以不走 `@action`，直接调一个 MCP server 把研究报告发出去。
+那样整条流程的审批就成了摆设。
+
+所以 `@agent` 节点执行期间会套上一个能力边界：
+
+```text
+read    允许（只读无副作用）
+write   允许（只能落在 session workspace 内，路径守卫仍然生效）
+url     允许（出站请求另有 SSRF 检查 + 域名 allowlist）
+shell   默认拒绝 —— 命令可以绕过路径守卫触达任意外部系统
+mcp     默认拒绝 —— MCP server 就是外部业务系统，正是"绕开 @action"的路径
+```
+
+上限由**企业配置**决定（`COPILOT_WORKFLOW_AGENT_TOOLS`，默认 `read,write,url`）；
+`tools:` 只能在它之内**收窄**（超出上限 → `agent-tools-widens`）。
+这条与 `role:` 是同一条规则：SKILL.md 是会被 LLM 读到、也会被人随手改的文件，
+不能靠它扩大授权面或能力边界。
+
+---
+
 # 5. `@gate`
 
 ## 语法
@@ -394,6 +454,9 @@ Use the registered compliance policy.
 interface FlowGate {
   name: string;
 
+  /** 该 gate 可能返回的**全部**出口名（静态声明） */
+  outcomes: readonly string[];
+
   evaluate(ctx): Promise<{
     outcome: string;
     reason?: string;
@@ -411,6 +474,15 @@ ComplianceGate
 Compliance Policy
         ↓
 pass / review / fail
+```
+
+`outcomes` 不是装饰：`@gate` 的出口不在固定词汇表里（pass / fail / review / again / escalate…），
+没有这份声明，校验器只能等运行时才发现“gate 返回了 review，但 SKILL.md 里没有 review 的 route”
+—— 而那时流程已经跑了一半。有了它，两个方向都能在**执行之前**查出来：
+
+```text
+声明的出口没有 route   → gate-outcome-unrouted（这条分支只能在运行时落 failed）
+route 的出口没被声明   → gate-outcome-unknown（一条永远不会走到的死分支）
 ```
 
 ---
@@ -534,6 +606,57 @@ requiredCount:
 
 ---
 
+## 保留属性：四个都**只能更严**
+
+`@review` 的正文最前面可以写四行保留属性：
+
+```md
+## @review compliance-review
+
+role: compliance.reviewer
+strategy: ALL
+required: 2
+exclude: initiator
+
+核对研究结论是否存在合规问题。
+
+- approve -> publish
+- reject -> compliance-rejected
+```
+
+| 属性 | 含义 | 相对服务端基策略 |
+| --- | --- | --- |
+| `role` | 审核业务角色（**不是 AD Group**） | 必须是基策略 `eligibleRoles` 的**子集**（交集） |
+| `strategy` | `ANY` / `ALL` | 只能 `ANY → ALL` |
+| `required` | 需要几票 | 只能 **≥** 基策略的 `requiredCount` |
+| `exclude` | `initiator`（禁止自批）/ `none` | 不能把基策略的禁止自批改成允许 |
+
+服务端注册的基策略才是**权威**：
+
+```ts
+registerFlowReview({
+  name: 'compliance-review',
+  title: '合规审核',
+  eligibleRoles: ['compliance.reviewer', 'risk'],   // 权威来源
+  strategy: 'ANY',
+  requiredCount: 1,
+  allowInitiator: false,                             // SoD
+});
+```
+
+SKILL.md 是在它之上做收窄，**不能放宽**。四条违规各自有独立的 issue code
+（`role-not-allowed` / `attr-widens`）。
+
+这条规则的由来：SKILL.md 会被 LLM 读到、也会被人随手改。如果它能**覆盖**基策略，
+那么一个 Markdown 文件就能把“要 3 个人批”降成“1 个人批”，
+把“投资委员会”换成任意一个角色 —— 企业审批要求不该由一个文本文件决定。
+
+注意 `role:` 只能写**业务角色 id**（`compliance.reviewer`）。写 AD Group 名或 object ID
+会直接被形态校验拒掉：角色到 Entra group 的映射在服务端 `COPILOT_BUSINESS_ROLES`，
+换组、改组名都不该要求改 SKILL.md。
+
+---
+
 # 7. `@action`
 
 ## 语法
@@ -621,6 +744,35 @@ Mutation
 ```
 
 这也是整个设计里最重要的安全边界之一。
+
+---
+
+## 保留属性：`role`
+
+```md
+## @action publish
+
+role: investment.reviewer
+
+Publish the approved research result.
+
+- success -> completed
+- fail -> publish-failed
+```
+
+含义与 `@review role:` **不同**：这里是把该动作类型的审批资格**收窄**到声明的业务角色。
+
+```text
+ApprovalPolicy(actionType).eligibleRoles  ∩  { role: }   =  生效的审批角色
+```
+
+交集为空 → `ActionService` 直接拒绝（`decision: 'denied'`），流程走 `fail` 出口。
+所以 `@action role:` 写一个策略里没有的角色，效果是**动作被拒**，而不是“换一个角色来批”。
+
+同样只能收窄：SKILL.md 不能让一个本来只需要 `operations` 批的动作变成需要 `investment.reviewer`。
+
+另外，声明了 `role:` 的动作**不走 auto_approve**：否则一个环境变量就能绕过
+流程里写明的审批要求（`COPILOT_AUTO_APPROVE_ACTIONS` 只对没写 `role:` 的动作生效）。
 
 ---
 
@@ -906,6 +1058,8 @@ When performing research:
 start -> investment-research
 
 ## @agent investment-research
+
+output: non-empty
 
 Analyze the investment opportunity.
 
@@ -1329,3 +1483,115 @@ Successful Terminal State
 ```
 
 因为 Skill Flow 描述的是“这一步由 Agent 执行”，而不是要求 Skill DSL 自己定义什么叫 sub-agent；真正的 agent / sub-agent 层次应该交给 Copilot SDK 本身处理。
+
+---
+
+# 17. 运行时加固：不确定性的三个来源
+
+前面 16 节描述的是**语义**。这一节描述的是**运行期**：一个已经跑起来的流程，
+在进程崩溃、并发推进、人工任务乱序到达时，怎么保证它不会悄悄走错一步。
+
+三条规则，分别对应三种不确定性。
+
+## 17.1 步骤持久化：`current` 一个字段是不够的
+
+每一步的顺序是：
+
+```text
+先把 stepStatus = running 落库  →  再执行那个节点  →  执行完把 current 推到下一个节点并落回 pending
+```
+
+```ts
+type WorkflowStepStatus = 'pending' | 'running' | 'waiting' | 'completed';
+```
+
+只有 `current` 时，“这一步跑没跑完”是不可知的。进程在“跑完但状态没落库”之间退出，
+重启后只能靠猜：
+
+```text
+提前写 current = next   →  会跳过 一个其实没执行完的步骤
+不提前写                →  会重放 一个可能已经产生副作用的步骤
+```
+
+两种做法都只是把不确定性挪了个位置。所以状态里多一个 `stepStatus`，把顺序显式表达成
+`pending → running → pending`，crash 恢复才能明确回答：
+
+> publish 已经开始过，但它完成了没有？
+
+恢复策略按节点类型分（`admitInterruptedStep()`）：
+
+| 节点 | 有副作用？ | 中断后 |
+| --- | --- | --- |
+| `@agent` / `@gate` | 否（纯计算） | 记一条审计后**允许重放** |
+| `@action` | 是 | **不自动重放**，落 failed 交人工核对 |
+
+幂等键 `action:<executionId>:<actionHash>` 只能防**重复提交**，防不了
+“外部系统已经生效、但本地没记上” —— 所以有副作用的步骤必须交给人。
+
+## 17.2 单写者：两个推进者不能同时改状态
+
+`workflow_state` 的写入是“读 → 合并 → 整行 upsert”。两个推进者并发时
+（重启恢复 + 人工任务回调，或两个 Pod），后写的会把先写的**整段覆盖掉**：
+
+```text
+某一步被跳过 / 步数回退 —— 而审计链上看不出任何异常
+```
+
+所以加一个乐观锁版本号 `agent_execution.workflow_version`，写入变成条件更新：
+
+```sql
+update agent_execution
+   set workflow_state = $1, workflow_version = workflow_version + 1
+ where execution_id = $2 and workflow_version = $3
+```
+
+只有一个写者能命中。拿不到版本的那个**停止推进并留痕**（`workflow.write.conflict`），
+但**绝不落 failed** —— 冲突说明有别人正在推进这个 execution，落终态等于把对方跑着的流程打死。
+
+版本号只由 CAS 语句抬高，不参与整行 upsert：否则一次 usage 更新就能把它写回旧值。
+
+进程内另有一把按 `executionId` 的串行锁：CAS 是跨副本的正确性保证，
+这把锁让“恢复推进”与“人工任务回调”不在同一进程里交错。
+
+## 17.3 人工任务回调必须与 durable 状态绑定
+
+一条人工任务收敛后，回调必须证明自己**就是当前这一步在等的那个任务**。四件事同时成立才续跑：
+
+```text
+state.waitingTaskId === task.taskId      这条任务就是 durable 状态里记的那条
+state.current       === marker.nodeId    流程还停在任务所属的那个节点上
+state.stepStatus    === 'waiting'        这一步确实在等人工
+rec.status          === 'waiting_for_approval'  execution 确实在等审批
+```
+
+任一条不成立 → 只写一条 `workflow.resume.rejected` 审计事件，**不动状态**。
+
+没有这一步，一条过期 / 重复 / 串台的任务回调就能把流程往前推一格 —— 而推错之后的状态
+**是自洽的**，审计链上也看不出问题，没人能发现它推错了。
+
+## 17.4 接口边界：两条独立的变化轴
+
+编排器只做四件事：**推进状态、落库、路由、把人工任务接回来**。另外两件事拆出去了：
+
+```text
+definition-provider.ts   流程定义从哪来、怎么校验、怎么确认版本没变
+runtime.ts               一个 @agent / @gate / @action / @review 具体怎么执行
+runner.ts                状态怎么推进、什么时候落库、冲突怎么办
+```
+
+刻意**不**做成一个大的 `WorkflowEngine` 接口：定义来源与节点执行是两个独立的变化轴
+（多租户按 tenant 取定义 vs. 把 agent 换成真正的 subagent 委派），
+合成一个接口只会让两边互相牵扯。
+
+## 17.5 核心不变量（一直成立，这一节没有改变它）
+
+> **LLM 永远不能决定 Workflow State Transition。**
+
+走向只由两样东西决定：durable 状态里的 `state.current`，以及该节点声明的 `node.routes`。
+
+- `@gate` 的结果来自服务端注册的确定性函数
+- `@action` 的审批资格来自 ApprovalPolicy，不是 SKILL.md 的自然语言
+- `@review` 的四个属性只能比服务端基策略更严
+- `@agent` 只能走 `success` / `fail`，且 `success` 要先过服务端注册的完成契约
+- `@agent` 执行期间套着能力边界（默认碰不到 MCP 与 shell）——
+  否则它可以绕开 `@action` 直接对外产生副作用

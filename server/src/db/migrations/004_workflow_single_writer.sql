@@ -1,0 +1,21 @@
+-- Skill Flow 单写者：agent_execution 增加 workflow_version（乐观锁版本号）
+-- 应用方式：psql "$DATABASE_URL" -f server/src/db/migrations/004_workflow_single_writer.sql
+--
+-- 前置：先应用 001_agent_execution.sql / 002_collaboration.sql / 003_workflow.sql。
+-- 幂等，重复执行安全。
+--
+-- 为什么需要它：workflow_state 的写入是"读 → 合并 → 整行 upsert"。两个推进者并发时
+-- （重启恢复 + 人工任务回调，或两个 Pod）后写的会把先写的整段覆盖掉 ——
+-- 表现为某一步被跳过或步数回退，而审计链上看不出任何异常。
+--
+-- 有了版本号，写入变成条件更新：
+--   update agent_execution set workflow_state = $1, workflow_version = workflow_version + 1
+--    where execution_id = $2 and workflow_version = $3
+-- 只有一个写者能命中，其余拿到空结果并停止推进。
+--
+-- 注意这一列**只由 CAS 语句写**，不参与整行 upsert：否则一次 usage 更新就能把
+-- 刚被抬高的版本号写回旧值，CAS 形同虚设（见 execution/sql-repository.ts 的 COLUMNS 注释）。
+--
+-- 与 src/db/sqlite-schema.ts 的 agent_execution.workflow_version 一一对应。
+
+alter table agent_execution add column if not exists workflow_version integer not null default 0;

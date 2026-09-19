@@ -43,6 +43,28 @@ export class MemoryExecutionRepository implements ExecutionRepository {
     return clone(next);
   }
 
+  /**
+   * 单写者 / CAS：与 SQL 实现同语义 —— 版本对不上就返回 undefined，调用方停止推进。
+   * 内存实现没有并发写，但版本号语义必须一致，否则单测会掩盖真实后端的问题。
+   */
+  async compareAndSwapWorkflowState(
+    executionId: string,
+    expectedVersion: number,
+    workflow: ExecutionRecord['workflow'],
+  ): Promise<ExecutionRecord | undefined> {
+    const rec = this.records.get(executionId);
+    if (!rec) return undefined;
+    if ((rec.workflowVersion ?? 0) !== expectedVersion) return undefined;
+    const next: ExecutionRecord = {
+      ...rec,
+      workflow: workflow ? clone(workflow) : undefined,
+      workflowVersion: expectedVersion + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    this.records.set(executionId, next);
+    return clone(next);
+  }
+
   async list(filter: ExecutionFilter = {}): Promise<ExecutionRecord[]> {
     const matched = [...this.records.values()].filter((r) => {
       if (filter.sessionId && r.sessionId !== filter.sessionId) return false;

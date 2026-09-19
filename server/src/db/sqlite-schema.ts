@@ -74,6 +74,9 @@ create table if not exists agent_execution (
   -- Skill Flow 的编排状态（kind = 'workflow'）：当前节点 / 步数 / 等着哪个任务 / SKILL.md 哈希。
   -- 必须 durable：@review 可能等几个小时，重启后只有它能回答"停在哪个节点"。
   workflow_state text,
+  -- workflow_state 的乐观锁版本号（单写者）：写入走条件更新，冲突的那个推进者停下。
+  -- 只由 CAS 语句抬高，不参与整行 upsert（见 execution/sql-repository.ts 的 COLUMNS 注释）。
+  workflow_version integer not null default 0,
   -- execution 级事件序号分配器：execution_event.sequence 由它原子自增
   event_sequence integer not null default 0,
   model text,
@@ -231,4 +234,5 @@ export const SQLITE_COLUMN_UPGRADES: readonly string[] = [
   'alter table agent_execution add column queue_sequence integer',
   'alter table agent_execution add column event_sequence integer not null default 0',
   'alter table agent_execution add column workflow_state text',
+  'alter table agent_execution add column workflow_version integer not null default 0',
 ];

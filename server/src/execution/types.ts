@@ -144,6 +144,19 @@ export interface ExecutionRecord {
    */
   workflow?: WorkflowState;
 
+  /**
+   * `workflow` 的乐观锁版本号（单写者 / CAS）。
+   *
+   * 为什么单独一个版本号：`updateWorkflowState()` 是"读 → 合并 → 整行 upsert"，
+   * 两个推进者（重启后的恢复 + 人工任务回调、或两个 Pod）并发时后写的会把先写的
+   * **整段覆盖掉** —— 表现为"某一步被跳过"或"步数回退"，而审计链上什么都看不出来。
+   *
+   * 版本号让写入变成条件更新：`... where execution_id = ? and workflow_version = ?`，
+   * 只有拿到当前版本的那个写者能落地，其余拿到冲突并停止推进。
+   * 与 `resource_version` 无关 —— 那个是**动作数据**的版本（审批复核用），不是这行的版本。
+   */
+  workflowVersion?: number;
+
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -237,6 +250,19 @@ export const EXECUTION_EVENT_TYPES = {
   workflowStepCompleted: 'workflow.step.completed',
   /** 上一次推进在节点中途退出（durable 状态里留着 stepStatus = running） */
   workflowStepInterrupted: 'workflow.step.interrupted',
+  /**
+   * 人工任务收敛时**没有**推进流程：任务与 durable 状态对不上（stale task / 另一个
+   * 推进者已经走过这一步 / execution 已是终态）。只留痕，不动状态 ——
+   * 让一条过期任务把流程往前推，比停下来难排查得多。
+   */
+  workflowResumeRejected: 'workflow.resume.rejected',
+  /**
+   * 状态写入撞上版本号（另一个推进者已经改过这一段状态）：本次推进停止。
+   *
+   * 刻意**不是**失败事件 —— 冲突说明有别人正在推进这个 execution（重启恢复 / 另一副本 /
+   * 人工任务回调），流程归拿到版本的那个推进者继续。落 failed 等于把别人跑着的流程打死。
+   */
+  workflowWriteConflict: 'workflow.write.conflict',
   workflowWaiting: 'workflow.waiting',
   workflowResumed: 'workflow.resumed',
   workflowCompleted: 'workflow.completed',

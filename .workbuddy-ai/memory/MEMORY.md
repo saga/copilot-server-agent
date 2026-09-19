@@ -28,10 +28,25 @@ Principal { userId, roles, groups }
 - 定义写在 `SKILL.md` 里，Markdown AST 解析（remark），**没有第二套 YAML/BPMN DSL**。
 - `@subagent` 是 `@agent` 的旧名（parser 归一化）；**别动** SDK 的 `subagent.*` 事件，那是另一回事。
 - `@agent <id>` 的 **id 必须等于技能目录名**（`findSkill` 按目录找），否则 `skill-missing`。
-- 保留属性只有 `@review`（role/strategy/required/exclude）与 `@action`（role），
-  且**必须写在正文最前面**；parser 会把属性区从正文里剥掉。
+- 三个文件分工：`workflow/runner.ts`（状态机）/ `workflow/runtime.ts`（节点怎么执行）/
+  `workflow/definition-provider.ts`（定义从哪来）。**不要**合并成一个 WorkflowEngine 接口。
+- 保留属性：`@review`（role/strategy/required/exclude）、`@action`（role）、
+  `@agent`（output/tools），**必须写在正文最前面**；parser 把属性区从正文剥掉。
+- 🔒 **属性一律只能比服务端更严**（`attr-widens` / `role-not-allowed` / `agent-tools-widens`）：
+  `@review role` 与注册表 `eligibleRoles` 取**交集**；`strategy` 只能 ANY→ALL；
+  `required` 只能 ≥ 基策略；`exclude: none` 在基策略禁止自批时报错。
+  注册表 `FlowReview` 是权威（`eligibleRoles` 必填 + `allowInitiator`）。
+- `@gate` 必须静态声明 `outcomes`（`gate-outcome-unrouted` / `gate-outcome-unknown`）。
+- `@agent output:` 走服务端 `FlowOutput` 完成契约（`success` ≠ 业务成功，不让 LLM 自评）；
+  `@agent tools:` 收窄能力边界，上限 `COPILOT_WORKFLOW_AGENT_TOOLS`（默认 read,write,url，
+  **不含 mcp/shell** —— 那两条是绕开 `@action` 审批的路）。
 - 推进顺序：**先落 `stepStatus = running`，再执行节点**；执行完落 `{current: next, pending}`。
   中断恢复：`@agent`/`@gate` 可重放，`@action` 落 failed 交人工核对（`admitInterruptedStep`）。
+- 单写者：`agent_execution.workflow_version` + `compareAndSwapWorkflowState()`。
+  ⚠️ 该列**不在** `sql-repository.ts` 的 `COLUMNS` 里（否则整行 upsert 会写回旧值）。
+  冲突 → `workflow.write.conflict` + 停止推进，**绝不落 failed**。
+- 人工任务回调必须四重绑定（waitingTaskId / current / stepStatus / execution status），
+  不匹配只写 `workflow.resume.rejected`，**不动状态**。
 - 编排器未预期异常由 `runDetached()` 兜底落 failed（不能只 log，否则 execution 永远 running）。
 - 校验先于执行：`POST /api/executions` 建之前跑 `validateSkillFlow`，不过就 400 + 行号。
 

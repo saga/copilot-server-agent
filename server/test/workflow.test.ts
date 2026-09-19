@@ -21,6 +21,7 @@ import {
 } from '../src/workflow/registry.js';
 import { registerBusinessRole } from '../src/identity/business-roles.js';
 import { FlowValidationError, WorkflowRunner } from '../src/workflow/runner.js';
+import { agentCapabilityFor } from '../src/workflow/capability.js';
 import type { WorkflowState } from '../src/workflow/types.js';
 
 /**
@@ -206,6 +207,13 @@ role: demo.reviewer
 完成。
 `;
 
+/**
+ * 在 `@agent flow-demo` 正文最前面插入保留属性行。
+ * 属性区必须**紧跟标题**（parser 只认最前面连续的一段 `name: value`）。
+ */
+const agentWithAttrs = (...attrs: string[]): string =>
+  SKILL_MD.replace('## @agent flow-demo\n\n', `## @agent flow-demo\n\n${attrs.join('\n')}\n\n`);
+
 function writeSkills(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'copilot-flow-'));
   for (const [rel, content] of Object.entries(files)) {
@@ -225,9 +233,13 @@ let turnBehavior: (prompt: string, index: number) => { content: string; chars: n
 ) => ({ content: `研究结论 ${i}`, chars: 20 });
 let turnError: string | undefined;
 const seenPrompts: string[] = [];
+/** `@agent` turn 执行**期间**读到的能力边界（会话级，跑完必须被清掉） */
+const capabilitiesDuringTurn: Array<{ nodeId: string; kinds: string[] } | undefined> = [];
 
 registerFlowGate({
   name: 'demo-gate',
+  // 出口必须静态声明：校验器据此判断"gate 会返回的每个出口都有 route"
+  outcomes: ['pass', 'fail'],
   async evaluate() {
     return { outcome: gateOutcome, reason: `gate 判定 ${gateOutcome}` };
   },
@@ -235,18 +247,28 @@ registerFlowGate({
 
 registerFlowGate({
   name: 'demo-spin',
+  outcomes: ['again'],
   async evaluate() {
     return { outcome: 'again' };
   },
 });
 
+/**
+ * `@review` 的**基策略**：服务端权威值。
+ *
+ * `eligibleRoles` 里同时放 `reviewer` 与 `demo.reviewer`，是为了让 ROLE_MD 里
+ * `role: demo.reviewer` 成为一次**合法的收窄**（子集），而不是引入一个新角色。
+ * 两个角色对应不同的授权路径：`reviewer` 走 `principal.roles`，
+ * `demo.reviewer` 走 AD group → RoleRegistry。
+ */
 registerFlowReview({
   name: 'demo-review',
   title: '示例审核',
   description: '看看结论',
-  eligibleRoles: ['reviewer'],
+  eligibleRoles: ['reviewer', 'demo.reviewer'],
   strategy: 'ANY',
   requiredCount: 1,
+  allowInitiator: false,
 });
 
 registerFlowAction({
@@ -362,7 +384,12 @@ test.beforeEach(() => {
   gateOutcome = 'pass';
   turnError = undefined;
   seenPrompts.length = 0;
-  turnBehavior = (_p, i) => ({ content: `研究结论 ${i}`, chars: 20 });
+  capabilitiesDuringTurn.length = 0;
+  turnBehavior = (_p, i) => {
+    const cap = agentCapabilityFor('s1');
+    capabilitiesDuringTurn.push(cap ? { nodeId: cap.nodeId, kinds: [...cap.kinds].sort() } : undefined);
+    return { content: `研究结论 ${i}`, chars: 20 };
+  };
 });
 
 test('编排：agent → gate → review 暂停 → 审批续跑 → action 再暂停 → 审批 → 完成', async () => {
@@ -382,7 +409,11 @@ test('编排：agent → gate → review 暂停 → 审批续跑 → action 再�
 
   const reviewTask = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
   assert.equal(reviewTask.type, 'approval');
-  assert.deepEqual(reviewTask.eligibleRoles, ['reviewer'], '资格来自服务端注册，不来自 SKILL.md');
+  assert.deepEqual(
+    reviewTask.eligibleRoles,
+    ['reviewer', 'demo.reviewer'],
+    '资格来自服务端注册表（SKILL.md 没写 role: 时基策略原样生效）',
+  );
   assert.deepEqual(reviewTask.payload['workflow'], {
     executionId: id,
     nodeId: 'demo-review',
@@ -632,7 +663,7 @@ test('编排：未预期异常也必须落 failed，不能留下永远 running �
   assert.match(String((await w.executions.get(id))!.error), /DB 挂了/);
 });
 
-test('编排：@review 的 role 覆盖注册表，且走 AD group 的人能批、只有旧角色的人不能', async () => {
+test('编排：@review 的 role 只**收窄**注册表（交集），且走 AD group 的人能批、被排除的人不能', async () => {
   const dir = writeSkills({ 'flow-role/SKILL.md': ROLE_MD });
   const w = wire(dir);
   const id = await startWorkflow(w, { skill: 'flow-role' });
@@ -644,12 +675,12 @@ test('编排：@review 的 role 覆盖注册表，且走 AD group 的人能批�
   assert.deepEqual(
     task.eligibleRoles,
     ['demo.reviewer'],
-    'SKILL.md 的 role: 覆盖注册表的 eligibleRoles —— 属性是流程自己的声明',
+    '基策略是 [reviewer, demo.reviewer]，SKILL.md 写 role: demo.reviewer → 交集就是它自己（收窄）',
   );
   assert.equal(task.strategy, 'ANY');
   assert.equal(task.requiredCount, 1);
 
-  // 注册表里的旧角色不再有资格：属性一旦写进 SKILL.md，就是唯一的角色来源。
+  // 基策略里也有 `reviewer`，但 SKILL.md 把它收窄掉了 —— 这就是"只能更严"的实际含义。
   // 挡住他的是**可见性**判定（isAssignee）—— 他连这个任务都看不到，比"看得到但点不动"更严
   await assert.rejects(
     () => w.humanTasks.approve(task.taskId, { principal: REVIEWER }),
@@ -731,4 +762,158 @@ test('校验：出口写漏 / 技能不存在都在 prepare 阶段就抛出来�
   const missing = w.runner.validate({ skill: 'nope', flow: 'demo' });
   assert.equal(missing.ok, false);
   assert.equal(missing.issues[0]?.code, 'skill-missing');
+});
+
+// ---------- 人工任务回调必须与 durable 状态绑定 ----------
+
+test('编排：stale 人工任务回调只留痕、**不推进**流程（推错一步是看不出来的）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  const task = (await w.humanTasks.get(rec.workflow!.waitingTaskId!))!;
+
+  // 一条**不属于这一步**的任务（taskId 对不上）：可能是重复投递，也可能是另一条流程串台
+  await w.runner.onHumanTaskResolved({ ...task, taskId: 'task_stale' }, 'approved', []);
+  let after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'waiting_for_approval', 'stale 任务不能把流程往前推');
+  assert.equal(after.workflow?.current, 'demo-review');
+  const rejected = (await w.executions.events(id, 200)).filter(
+    (e) => e.type === EVT.workflowResumeRejected,
+  );
+  assert.equal(rejected.length, 1);
+  assert.match(String(rejected[0]!.payload?.['reason']), /stale task/);
+  assert.ok(
+    !(await eventTypes(w, id)).includes(EVT.workflowResumed),
+    '被拒绝的回调不能留下"流程已续跑"的痕迹',
+  );
+
+  // stepStatus 不是 waiting（例如已经被恢复推进带走了）：同样只留痕
+  await w.executions.updateWorkflowState(id, { ...after.workflow!, stepStatus: 'running' });
+  await w.runner.onHumanTaskResolved(task, 'approved', []);
+  after = (await w.executions.get(id))!;
+  assert.equal(after.workflow?.current, 'demo-review', '状态不匹配时一步都不该走');
+  assert.equal(
+    (await w.executions.events(id, 200)).filter((e) => e.type === EVT.workflowResumeRejected).length,
+    2,
+  );
+
+  // 把状态修回去之后，同一条任务就能正常续跑（绑定校验不是"一次拒绝永久拒绝"）
+  await w.executions.updateWorkflowState(id, { ...after.workflow!, stepStatus: 'waiting' });
+  await w.runner.onHumanTaskResolved(task, 'approved', []);
+  assert.equal((await w.executions.get(id))!.workflow?.current, 'demo-action');
+});
+
+test('编排：人工任务过期 / 取消 → execution 必须落终态，不能永远停在等待', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+
+  // workflow 任务走的是编排器的回调路径（不经过 ExecutionService.onHumanTaskResolved），
+  // 所以"落终态"这件事必须由编排器自己做
+  await w.humanTasks.cancel(rec.workflow!.waitingTaskId!, { principal: REVIEWER });
+  const after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'cancelled');
+  assert.match(String(after.error), /已被取消/);
+  assert.ok((await eventTypes(w, id)).includes(EVT.workflowFailed));
+});
+
+// ---------- 单写者 / CAS ----------
+
+test('编排：状态写入冲突时**停止推进**，但绝不把 execution 落 failed', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 另一个推进者已经在改这个 execution：带版本的写入全部拿不到
+  w.executions.updateWorkflowState = async () => ({ ok: false, conflict: true });
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'running', '冲突不是失败：流程归拿到版本的那个推进者继续');
+  assert.ok(
+    (await eventTypes(w, id)).includes(EVT.workflowWriteConflict),
+    '冲突必须在时间线上留痕',
+  );
+  assert.ok(
+    !(await eventTypes(w, id)).includes(EVT.workflowFailed),
+    '把冲突当失败会把别人正在跑的流程打死',
+  );
+  assert.equal(seenPrompts.length, 0, '拿不到版本就不该执行节点');
+});
+
+test('编排：CAS 版本号对不上 → 写不进去（repository 层的单写者契约）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  const rec = (await w.executions.get(id))!;
+  const state = rec.workflow!;
+
+  const first = await w.executions.updateWorkflowState(id, state, 0);
+  assert.equal(first.ok, true);
+  assert.equal(first.ok && first.version, 1, '每次成功写入都要抬高版本号');
+
+  // 拿着旧版本再写一次 → 冲突
+  const stale = await w.executions.updateWorkflowState(id, state, 0);
+  assert.equal(stale.ok, false);
+  assert.equal(stale.ok === false && stale.conflict, true);
+
+  // 版本号必须 durable：读回来还是 1（不会被普通 update 写回去）
+  await w.executions.appendEvent({ executionId: id, type: 'noop', actorType: 'system' });
+  assert.equal((await w.executions.get(id))!.workflowVersion, 1);
+});
+
+// ---------- @agent 的能力边界与完成契约 ----------
+
+test('编排：@agent 执行期间套上能力边界（默认不含 mcp / shell），跑完立刻清掉', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  assert.deepEqual(
+    capabilitiesDuringTurn,
+    [{ nodeId: 'flow-demo', kinds: ['read', 'url', 'write'] }],
+    '默认上限是 read/write/url —— agent 碰不到 MCP 与 shell（绕开 @action 审批的两条路）',
+  );
+  assert.equal(agentCapabilityFor('s1'), undefined, '节点跑完必须清掉，否则后续 turn 一直被限制');
+});
+
+test('编排：@agent 的 tools 只能收窄（tools: read → 只剩 read）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': agentWithAttrs('tools: read') });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  assert.deepEqual(capabilitiesDuringTurn, [{ nodeId: 'flow-demo', kinds: ['read'] }]);
+  assert.equal(agentCapabilityFor('s1'), undefined);
+});
+
+test('编排：@agent 的完成契约没过 → 走可路由的 fail 出口，不是 success', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': agentWithAttrs('output: non-empty') });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 模型"礼貌地拒绝"：turn 没抛异常，但什么都没产出 —— 这不该算成功
+  turnBehavior = () => ({ content: '   ', chars: 0 });
+  await w.runner.run(id);
+
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'failed', '走 - fail -> failed');
+  const step = (await w.executions.events(id, 200)).find(
+    (e) => e.type === EVT.workflowStepCompleted && e.payload?.['nodeId'] === 'flow-demo',
+  );
+  assert.equal(step?.payload?.['outcome'], 'fail');
+  assert.match(String(step?.payload?.['error']), /完成契约/, '审计要写清是哪个契约没过');
+});
+
+test('编排：@agent 的完成契约过了就照常推进', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': agentWithAttrs('output: non-empty') });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+  assert.equal((await w.executions.get(id))!.status, 'waiting_for_approval');
 });

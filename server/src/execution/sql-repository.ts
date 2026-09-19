@@ -70,6 +70,8 @@ function toRecord(r: ExecutionRow): ExecutionRecord {
     ...(typeof r.wait_reason === 'string' ? { waitReason: r.wait_reason as 'input' | 'approval' } : {}),
     // Skill Flow 的编排状态：读回来，重启后的续跑才知道"停在哪个节点"
     ...(r.workflow_state ? { workflow: dialect.json<ExecutionRecord['workflow']>(r.workflow_state) } : {}),
+    // 单写者版本号：**只读**，只由 compareAndSwapWorkflowState 抬高（见 repository.ts）
+    ...(typeof r.workflow_version === 'number' ? { workflowVersion: r.workflow_version } : {}),
     ...(r.result !== null && r.result !== undefined ? { result: dialect.json(r.result) } : {}),
     ...(typeof r.content_chars === 'number' ? { contentChars: r.content_chars } : {}),
     ...(typeof r.error === 'string' ? { error: r.error } : {}),
@@ -79,6 +81,15 @@ function toRecord(r: ExecutionRow): ExecutionRecord {
   };
 }
 
+/**
+ * 可整行 upsert 的列。
+ *
+ * `workflow_version` **刻意不在这里**：它是 CAS 的版本号，只能由
+ * `compareAndSwapWorkflowState()` 用 `workflow_version = workflow_version + 1` 抬高。
+ * 若把它放进整行 upsert，一次 `addUsage()`（读 → 合并 → 写回）就会把刚被 CAS 抬高的
+ * 版本号写回它读到的旧值 —— 两个并发推进者又能互相覆盖，CAS 就白做了。
+ * 建行时由 DDL 的 `default 0` 兜底。
+ */
 const COLUMNS = [
   'execution_id',
   'session_id',
@@ -190,8 +201,38 @@ export class SqlExecutionRepository implements ExecutionRepository {
     return rows[0] ? toRecord(rows[0]) : undefined;
   }
 
-  async list(filter: ExecutionFilter = {}): Promise<ExecutionRecord[]> {
+  /**
+   * 单写者 / CAS：只有拿到当前版本号的写者能落地。
+   *
+   * 条件更新在 PostgreSQL 与 SQLite 上都是原子的（行级写锁），所以两个副本同时推进时
+   * 只有一个 `returning *` 会给出结果 —— 另一个拿到空集，必须停止推进。
+   */
+  async compareAndSwapWorkflowState(
+    executionId: string,
+    expectedVersion: number,
+    workflow: ExecutionRecord['workflow'],
+  ): Promise<ExecutionRecord | undefined> {
     const dialect = d();
+    const { rows } = await getDb().query<ExecutionRow>(
+      `update agent_execution
+          set workflow_state = ${dialect.ph(1)},
+              workflow_version = workflow_version + 1,
+              updated_at = ${dialect.ph(2)}
+        where execution_id = ${dialect.ph(3)}
+          and workflow_version = ${dialect.ph(4)}
+        returning *`,
+      [
+        jsonParam(workflow),
+        dialect.tsParam(new Date().toISOString()),
+        executionId,
+        expectedVersion,
+      ],
+    );
+    const row = rows[0];
+    return row ? toRecord(row) : undefined;
+  }
+
+  async list(filter: ExecutionFilter = {}): Promise<ExecutionRecord[]> {    const dialect = d();
     const where: string[] = [];
     const params: unknown[] = [];
     const push = (col: string, value: unknown): void => {

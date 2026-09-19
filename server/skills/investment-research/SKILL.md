@@ -28,6 +28,8 @@ start -> investment-research
 
 ## @agent investment-research
 
+output: non-empty
+
 使用本次会话已加载的 investment-research 能力完成研究。
 
 需要覆盖：
