@@ -1462,7 +1462,11 @@ same Event Contract
 
 ---
 
-# 35. 当前行业实际上已经在走这个方向
+# 35. 当前行业正在形成类似的职责分离（术语尚未统一）
+
+> **本文的 Control Plane / Runtime 是推荐的 architecture pattern，不是行业统一标准。**
+> AWS / Google / Microsoft / Anthropic 有非常接近的分层思想，但术语并不完全一致；
+> 以下只能说“可以抽象成 Control Plane / Runtime 模型”，不能反过来说业界已经统一使用这个名字。
 
 Microsoft Agent Framework 当前把：
 
@@ -1491,7 +1495,8 @@ AWS 的 AgentCore 相关架构也将 runtime、identity、gateway、workflow sec
 
 所以：
 
-> **Control Plane / Runtime Plane 分离不是理论上的“架构洁癖”，已经越来越接近企业 Agent 平台的共性方向。**
+> **Control Plane / Runtime Plane 分离不是理论上的“架构洁癖”，而是本系列推荐的 architecture pattern；
+> 它与当前主要平台的职责分离方向一致，但各家术语并不统一。**
 
 ---
 
@@ -1601,7 +1606,10 @@ LLM
 
 ---
 
-# 39. Model Routing 应属于 Control Plane 的一部分
+# 39. Model Routing 的 Policy 边界属于 Control Plane，Runtime 在批准集合内选择
+
+> **准确表述：在关键控制路径上，模型路由的允许集合由 Control Plane 的 Model Policy 决定；
+> Runtime 只能在批准集合内选择（例如按任务类型、风险、成本），不能自行突破到未批准模型。**
 
 不要：
 

@@ -338,7 +338,13 @@ Trusted Command
 
 ---
 
-# 7. Workflow 必须拥有绝对的状态权威
+# 7. Workflow 拥有 Workflow Execution State 的权威，而不是全部 Business State 的权威
+
+> **三分法：Agent Memory = contextual state；Workflow / Control Plane = execution state；
+> Domain System = business state。**
+> 例如 `Order.status / Position.quantity / Client.status` 的 authority 是 Domain / Business System；
+> `workflow.status / currentNode / pendingApproval / retryCount / checkpoint` 的 authority
+> 才是 Workflow Runtime / Control Plane。两者不要压缩成“Workflow = 唯一 State Authority”。
 
 AI Agent 可以思考：
 
@@ -625,7 +631,13 @@ Agent
 
 ---
 
-# 12. Tool 权限必须比 Agent 权限更窄
+# 12. Agent 的有效能力必须通过 Tool / Gateway / Policy 边界被外部约束
+
+> **准确表述：Agent 所能获得的 effective capability，必须受到 Tool / Gateway /
+> Policy Enforcement Point 的外部约束；Agent 不能仅凭自身权限决定 Tool 是否可执行。**
+> 这不是简单的 `Tool permission < Agent permission` 包含关系，而是
+> `Agent capability → approved capability set → Tool invocation → Policy decision →
+> Domain authorization → Side effect` 的执行链约束。
 
 Agent 可以拥有：
 

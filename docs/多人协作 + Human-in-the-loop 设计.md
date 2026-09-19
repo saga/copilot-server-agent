@@ -846,7 +846,13 @@ What happens on disagreement?
 
 ---
 
-# 16. Approval 必须绑定具体内容
+# 16. Approval 的授权范围必须显式、可验证、可审计
+
+> **准确表述：Approval 的 scope（具体 Proposal、参数范围或预授权操作类别）必须显式。**
+> 默认应对具体 Proposal / Proposal Version / Command Hash 绑定，防止 approval replay / scope creep；
+> 但企业同样可以存在 Standing / Policy-based / Threshold / Delegated / Pre-approved Action Class
+> 授权（例如 `< $100K + 符合 Strategy X + Risk Tier <= 2 + Data Scope = Fund A`），
+> 前提是其 scope 必须明确、可验证、可审计。
 
 这是金融 Agent 中非常重要的一条。
 
@@ -905,7 +911,8 @@ Re-review
 
 因为：
 
-> **人批准的是一个具体版本的业务状态，而不是一个永久性的“允许未来做这件事情”。**
+> **默认情况下，人批准的是一个具体版本的业务状态，而不是一个永久性的“允许未来做这件事情”。
+> 例外（standing / threshold / pre-approved 类别）必须把授权范围显式写出来。**
 
 AWS 也特别建议把 persistent trust 限制到特定 command、parameter shape 或 resource，并避免 wildcard trust。
 
@@ -2565,7 +2572,7 @@ new workflow state
 
 ---
 
-### 51.3 Approval 必须绑定 Proposal Version
+### 51.3 Approval 绑定显式 Scope（默认绑定 Proposal Version）
 
 例如：
 

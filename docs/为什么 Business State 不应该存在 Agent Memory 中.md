@@ -1,4 +1,9 @@
-# 为什么 Business State 不应该存在 Agent Memory 中
+# 为什么 Business State 不能以 Agent Memory 作为权威来源
+
+> **系列 invariant：Agent Memory 可以保存 context，但不能成为 Business Truth 的 authority。**
+> Business State 可以被 Agent Memory 缓存、引用和摘要（`caseId / currentTask / lastKnownStatus /
+> relevantEntities / previousDecisionSummary` 都很正常），但 `Agent Memory ≠ Source of Truth`。
+> 真正危险的只是 `Memory → 自认为可继续 → 直接执行 mutation` 这条路径。
 
 ## 1. 核心结论
 

@@ -167,7 +167,12 @@ Audit    → Evidence
 
 ---
 
-# 4. Workflow 是金融业务的 Control Plane
+# 4. Workflow 是 Control Plane 中负责 Business Execution / State Transition 的核心组件
+
+> **层级澄清：`Workflow ∈ Control Plane`，而不是 `Workflow = Control Plane`。**
+> Control Plane 还包含 Policy、Authorization、Capability、Human Task、Command、Audit 等；
+> Workflow 是其中负责业务执行与状态转换的核心组件。
+> 下文第 29 节的三层展开（Control / Agent / Data-Business Plane）以此为准。
 
 金融 Workflow 不应该只是“把 Agent 调起来的代码”。
 
@@ -223,7 +228,10 @@ Completed
 
 Agent 可以参与 Research，但不能通过 Prompt 把状态改成 `Completed`。
 
-Workflow 必须是状态的唯一权威来源。
+Workflow 必须是 Workflow Execution State 的权威来源；Business State 的权威是 Domain / Business System；
+Agent Memory 的权威只是 Agent Runtime 的上下文。Workflow 负责 execution state（`currentNode /
+pendingApproval / retryCount / checkpoint`），Domain 负责 business state
+（`Order.status / Position.quantity / Client.status`）。
 
 Microsoft 当前的 Agent Framework 文档也明确区分：如果“结果应该由代码决定”，就应该采用确定性的 executor；如果“应该由人决定”，就使用 Human-in-the-loop gate；当流程需要严格顺序和业务规则时，应使用 Workflow，而不是让模型动态决定路径。
 
@@ -1725,7 +1733,14 @@ AWS 当前 Agentic AI Lens 也明确指出，Multi-Agent 会引入 handoff、协
 
 ---
 
-# 33. 风险分级决定 Agent 自主程度
+# 33. 风险分级决定 Agent 自主程度（高风险 ≠ 必然每次人工审批）
+
+> **准确模型：`Risk + Impact + Reversibility + Autonomy Level → Oversight Policy →
+> None / Monitor / Confirm / Approve / Dual Control`。**
+> 高风险作为默认进 HITL 的设计原则合理，但不是普遍规律；还需结合可逆性、交易限额、
+> 置信度、补偿控制、职责分离和自动化成熟度（例如低金额自动退款可用
+> policy + limit + 自动执行 + 事后复核，而非每次人工批准）。下表是默认分级，
+> 具体等级由机构自己的风险框架确定。
 
 不应该所有任务都采用同一种 autonomy。
 

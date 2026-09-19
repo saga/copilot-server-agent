@@ -1,4 +1,11 @@
-# 为什么金融 Agent 不能让 LLM 成为 Workflow Engine
+# 为什么金融 Agent 不能让 LLM 成为关键控制路径的唯一权威
+
+> **系列 invariant：AI 可以自主推理，但不能自主突破授权。**
+> `Agent Autonomy ≠ Authorization Authority`。
+> LLM 可以决定“怎么完成任务”、在受控范围内决定“下一步做什么”、甚至动态选择 Agent / Tool；
+> 但 LLM 不能成为 Business Authorization、Business State、Regulatory Control 的最终不可约束权威。
+> 无论是确定性 workflow 还是 agent-delegated workflow，authorization、state protection、
+> input validation、circuit breaker 等控制都必须放在 orchestration layer 上。
 
 ## 1. 先说结论
 
