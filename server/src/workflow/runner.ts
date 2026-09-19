@@ -75,6 +75,10 @@ import {
  * 按上面的顺序，崩溃留下的最长是 `stepStatus = waiting` + `execution = running`：
  * 任务确实已经建出来了，只需要把它接回来（`reconcileWaiting()`）。
  *
+ * 注意这个形状**不止**这一个来源：`resumeInto()` 的"推出等待态 → CAS 写下一个节点"
+ * 之间崩溃会留下同样的字段组合，但那条任务**已经被处理过**。所以 `reconcileWaiting()`
+ * 不能只读 durable 字段，必须回查任务本身的终态（见该方法的注释）。
+ *
  * 代价是 2 与 3 之间崩溃会留下一条**孤儿人工任务**（流程那边会重新走一遍）。这是
  * 刻意选的：任务会自然过期，过期回调也会被 `resumeFromTask()` 的绑定校验拦下；
  * 而"流程状态不可判定"是没法靠超时自愈的。
@@ -352,7 +356,7 @@ export class WorkflowRunner {
   }
 
   /**
-   * 等待态的**对账**：durable 状态说"这一步在等任务 T"，execution 该不该在 waiting。
+   * 等待态的**对账**：durable 状态说"这一步在等任务 T"，到底该等它、还是该把那一格补完。
    *
    * 为什么需要它 —— 落库顺序是
    *
@@ -367,7 +371,27 @@ export class WorkflowRunner {
    * waiting_for_approval` + `workflow.stepStatus = running` 时，"在等人工"与
    * "要重放这一步"同时成立，没有任何字段能判断该信哪个。
    *
-   * @returns true = 已经收敛（调用方必须停止推进，等任务回调）
+   * ## `waitingTaskId` 说的是"任务被创建过"，不是"任务还没结束"
+   *
+   * 只看 durable 字段是不够的。`running` + `stepStatus = waiting` + `waitingTaskId = T`
+   * 这个形状有**两个**来源，字段本身分不开：
+   *
+   *   甲、崩在"落 waiting"与"迁移 execution"之间 → T 还是 open，该等它
+   *   乙、崩在 `resumeInto()` 的"把 execution 推出等待态"与"CAS 写 current = next"之间
+   *       → T **已经被处理过**（就是那次续跑在处理它），回调不会再来了
+   *
+   * 乙如果不加区分地按甲处理，会把 execution 推回 `waiting_for_approval` 去等一个
+   * 永不再来的回调 —— 而 `waiting_for_approval` 下 `complete()` 是静默 return 的
+   * （见 ExecutionService.complete），于是这条流程**永久卡住**，连超时都救不回来
+   * （超时只对 open 的任务产生回调）。这正是"先建任务"这个顺序要换来的可判定性：
+   * 判定必须包含**回查任务本身的终态**，否则只是把不可判定换成了判错。
+   *
+   * 所以这里回查 `humanTasks.get(taskId)`：
+   *   open                          → 甲，接回等待态（若 execution 还没迁过来）
+   *   已收敛（approved/…/cancelled） → 乙，把那次续跑**原样重放**（`resumeFromTask()` 幂等）
+   *   查不到                        → 状态与任务对不上，落 failed 让人看见
+   *
+   * @returns true = 已经收敛（调用方必须停止推进）
    */
   private async reconcileWaiting(rec: ExecutionRecord, state: WorkflowState): Promise<boolean> {
     if (state.stepStatus !== 'waiting') return false;
@@ -384,20 +408,48 @@ export class WorkflowRunner {
       return true;
     }
 
+    const task = await this.deps.humanTasks.get(taskId);
+    if (!task) {
+      await this.failWorkflow(
+        executionId,
+        state,
+        `节点 "${state.current}" 记录的人工任务 "${taskId}" 不存在：durable 状态与任务对不上，无法判定该等它还是该补完这一步`,
+      );
+      return true;
+    }
+
+    if (task.status === 'open') {
+      // 甲：任务仍在等人处理。只有"任务已建、execution 还没迁过来"这一种情况需要补迁移
+      if (rec.status === 'running') {
+        await this.append(executionId, EVT.workflowWaitingReconciled, {
+          nodeId: state.current,
+          taskId,
+          note: '任务仍待处理，但 execution 还是 running（上一次推进在建任务与迁移之间退出），已接回等待态',
+        });
+        await this.deps.executions.transition(executionId, 'waiting_for_approval', {
+          currentHumanTaskId: taskId,
+          waitReason: 'approval',
+        });
+      }
+      return true;
+    }
+
+    // 乙：任务已收敛，workflow 却还停在等待态 —— 上一次续跑没走完。回调不会再来。
+    if (isTerminal(rec.status)) return true; // execution 已收敛，不必再补
     if (rec.status === 'running') {
-      // 崩溃窗口：任务已经存在，把 execution 接回等待态，然后等任务回调（不再重跑节点）
+      // resumeFromTask() 的四重绑定要求 execution 在 waiting_for_approval，先摆回去
       await this.append(executionId, EVT.workflowWaitingReconciled, {
         nodeId: state.current,
         taskId,
-        note: '任务已存在但 execution 仍是 running（上一次推进在建任务与迁移之间退出），已接回等待态',
+        taskStatus: task.status,
+        note: '任务已收敛但 workflow 仍停在等待态（上一次续跑在推出等待态与推进节点之间退出），已重放该次续跑',
       });
       await this.deps.executions.transition(executionId, 'waiting_for_approval', {
         currentHumanTaskId: taskId,
         waitReason: 'approval',
       });
-      return true;
     }
-    // waiting_for_approval = 正常在等；终态 = 已经收敛（任务回调被绑定校验拦下）
+    await this.resumeFromTask(task, task.status, task.decisions);
     return true;
   }
 
@@ -1189,7 +1241,27 @@ export class WorkflowRunner {
       steps: state.steps,
       reason,
     });
+    await this.exitWaitingIfNeeded(executionId);
     await this.deps.executions.fail(executionId, new Error(`workflow 失败：${reason}`));
+  }
+
+  /**
+   * 等待态**不能直接落 failed**：`ALLOWED_TRANSITIONS` 里 `waiting_for_approval` /
+   * `waiting_for_input` 只有 `resuming / rejected / cancelled / expired`，没有 `failed`。
+   *
+   * 少了这一步，`failWorkflow()` 会抛"非法状态迁移"，而它跑在**收尾路径**上 ——
+   * 异常往上抛的结果是 execution 反而永远停在等待态（`runDetached` 的兜底 catch
+   * 再调一次 `fail()` 还是同一个异常，只剩一行日志）。"状态与任务对不上"这类
+   * 内部不一致恰恰最常发生在等待态，所以每条收尾路径都必须能合法地退出等待。
+   *
+   * 走 `resuming` 而不是绕道 `running`：`resuming → failed` 是表里已有的边，少一次写入，
+   * 而且语义准确 —— "本来要恢复，恢复不了"。
+   */
+  private async exitWaitingIfNeeded(executionId: string): Promise<void> {
+    const rec = await this.deps.executions.get(executionId);
+    if (!rec) return;
+    if (rec.status !== 'waiting_for_approval' && rec.status !== 'waiting_for_input') return;
+    await this.deps.executions.transition(executionId, 'resuming');
   }
 
   /**

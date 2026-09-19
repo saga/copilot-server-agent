@@ -1002,6 +1002,108 @@ test('编排：crash 在建任务与迁移之间 → 重跑只接回任务，不
   assert.equal(resumed.workflow?.current, 'demo-action');
 });
 
+/**
+ * `waitingTaskId` 说的是"任务被创建过"，**不是**"任务还没结束"。
+ *
+ * 除了"建任务与迁移之间崩"之外，`running` + `stepStatus = waiting` + `waitingTaskId = T`
+ * 还有第二个来源：`resumeInto()` 先把 execution 推出等待态、再 CAS 写 `current = next`，
+ * 崩在中间就留下这个形状 —— 而 T **已经被处理过**（那次续跑正是在处理它）。
+ *
+ * 对账若只看 durable 字段，就会把它推回 waiting_for_approval 去等一个永不再来的回调；
+ * 而 waiting_for_approval 下 `complete()` 是**静默 return** 的，于是这条流程永久卡住，
+ * 连超时都救不回来（超时只对 open 的任务产生回调）。
+ */
+test('编排：任务已收敛但 workflow 仍停在等待态（续跑中途崩）→ 补完那次续跑，不回到等待', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  const paused = (await w.executions.get(id))!;
+  assert.equal(paused.workflow?.current, 'demo-review');
+  const taskId = paused.workflow!.waitingTaskId!;
+  const waitingState = paused.workflow!;
+
+  // 审批通过 → 续跑（@action 那里又开了第二条待办），流程已经前进到 demo-action
+  await w.humanTasks.approve(taskId, { principal: REVIEWER });
+  assert.equal((await w.executions.get(id))!.workflow?.current, 'demo-action');
+
+  // 构造崩溃残留：把 durable 状态倒回"续跑刚把 execution 推出等待态、还没写下一个节点"
+  // 的那一刻 —— 此时 T 已经是 approved。
+  await w.executions.updateWorkflowState(id, waitingState);
+  await w.executions.transition(id, 'resuming');
+  await w.executions.transition(id, 'running');
+  const crashed = (await w.executions.get(id))!;
+  assert.equal(crashed.status, 'running');
+  assert.equal(crashed.workflow?.current, 'demo-review', '状态确实倒回去了');
+  assert.equal(crashed.workflow?.stepStatus, 'waiting');
+  assert.equal((await w.humanTasks.get(taskId))!.status, 'approved', '而那条任务已经收敛了');
+
+  await w.runner.run(id);
+
+  const after = (await w.executions.get(id))!;
+  assert.equal(
+    after.workflow?.current,
+    'demo-action',
+    '必须把那次续跑补完（推到下一个节点），不能推回等待态等一个不会来的回调',
+  );
+  assert.equal(after.status, 'waiting_for_approval', '@action 那里照常暂停');
+  assert.notEqual(
+    after.workflow?.waitingTaskId,
+    taskId,
+    '等的必须是 @action 的新任务，不是那条已经批完的 review 任务',
+  );
+
+  const reconciled = (await w.executions.events(id, 200)).find(
+    (e) => e.type === EVT.workflowWaitingReconciled && e.payload?.taskStatus === 'approved',
+  );
+  assert.ok(reconciled, '对账必须留痕，并写明它认出来的依据是"任务已收敛"');
+});
+
+/**
+ * 进程停机期间任务自然过期（或被人取消）——`sweepExpired` / `cancel` 的回调**没有送达**。
+ *
+ * 这时 durable 状态是 `waiting_for_approval` + `stepStatus = waiting` + 一条已收敛的任务。
+ * 只做"接回等待态"的对账会把它原样留着，而回调永远不会再来 → 永久卡住。
+ * 恢复时必须自己发现任务已经收敛，并按它收敛的方式把 execution 落终态。
+ */
+test('编排：停机期间任务已过期（回调没送到）→ 恢复时按过期收敛，不是永远等', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  const taskId = (await w.executions.get(id))!.workflow!.waitingTaskId!;
+  // 直接关掉任务、**不**触发 onResolved：等价于"进程当时不在，过期回调没有送达"
+  await w.humanTasks.repository.close(taskId, {
+    status: 'expired',
+    completedAt: new Date().toISOString(),
+  });
+  assert.equal((await w.humanTasks.get(taskId))!.status, 'expired');
+
+  await w.runner.run(id);
+  const after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'expired', '过期是独立的业务事实，不该被混成 failed');
+});
+
+test('编排：等待态记的任务根本不存在 → 落 failed，而不是把它当成"还在等"', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  const paused = (await w.executions.get(id))!;
+  await w.executions.updateWorkflowState(id, {
+    ...paused.workflow!,
+    waitingTaskId: 'task-that-never-existed',
+  });
+
+  await w.runner.run(id);
+  const after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'failed', '状态与任务对不上时不能瞎猜，要让人看见');
+  assert.match(String(after.error), /不存在/);
+});
+
 test('编排：等待态但没记任务 id → 落 failed，而不是永远等一个不存在的任务', async () => {
   const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);

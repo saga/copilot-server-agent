@@ -1674,6 +1674,55 @@ execution = waiting_for_approval   +   workflow.stepStatus = running
 这是刻意选的 —— 任务会自然过期，过期回调也会被 17.3 的绑定校验拦下；
 而“流程状态不可判定”是没法靠超时自愈的。
 
+### 17.6.1 `waitingTaskId` 说的是“任务被创建过”，不是“任务还没结束”
+
+上面那个形状 `running` + `stepStatus = waiting` + `waitingTaskId = T` **不止一个来源**：
+
+| 来源 | T 的状态 | 该怎么办 |
+| --- | --- | --- |
+| 甲：崩在“落 waiting”与“迁移 execution”之间 | `open` | 接回等待态，等回调 |
+| 乙：崩在续跑的“推出等待态”与“CAS 写 `current = next`”之间 | **已收敛** | 把那次续跑补完 |
+
+乙之所以存在，是因为**退出等待态**也是分两步的（`resumeInto()`）：
+
+```text
+ensureRunning(): waiting_for_approval → resuming → running
+updateWorkflowState(current = next, stepStatus = pending)   ← CAS
+```
+
+崩在两步之间就留下甲的形状，但 T 已经批完了 —— 那次续跑正是在处理它。
+
+只看 durable 字段、一律按甲处理的话，会把 execution 推回 `waiting_for_approval`
+去等一个**永不再来的回调**；而 `waiting_for_approval` 下 `complete()` 是**静默 return** 的
+（见 `ExecutionService.complete`），于是这条流程**永久卡住**，连超时都救不回来
+（超时只对 `open` 的任务产生回调）。换句话说：可判定性不等于判定正确 ——
+判定必须包含**回查任务本身的终态**。
+
+所以 `reconcileWaiting()` 回查 `humanTasks.get(taskId)`，按三种结果分派：
+
+| 任务的当前状态 | 动作 |
+| --- | --- |
+| `open` | 甲：补一次 `waiting_for_approval` 迁移，等回调 |
+| `approved` / `rejected` / `expired` / `cancelled` | 乙：摆回 `waiting_for_approval` 以满足四重绑定，再**原样重放** `resumeFromTask()`（幂等） |
+| 查不到 | durable 状态与任务对不上 → 落 failed，不瞎猜 |
+
+第二行顺带覆盖了**停机期间任务自然过期 / 被人取消、回调没有送达**的情况：
+恢复时自己发现任务已收敛，按它收敛的方式把 execution 落终态（`expired` / `cancelled`），
+而不是留着等一个不会来的回调。
+
+### 17.6.2 收尾路径必须能合法地退出等待态
+
+`ALLOWED_TRANSITIONS` 里 `waiting_for_approval` / `waiting_for_input` 的出口是
+`resuming / rejected / cancelled / expired` —— **没有 `failed`**。
+
+于是 `failWorkflow()` 在等待态被调用时会抛“非法状态迁移”。而它跑在**收尾路径**上：
+异常往上抛的结果是 execution **反而永远停在等待态**（`runDetached` 的兜底 catch
+再调一次 `fail()` 还是同一个异常，只剩一行日志）。而“状态与任务对不上”这类内部不一致
+恰恰最常发生在等待态 —— 也就是说，最需要落 failed 的地方正好落不下去。
+
+所以 `failWorkflow()` 先调 `exitWaitingIfNeeded()`：状态在等待态时补一次
+`→ resuming`，再走 `resuming → failed`（这条边表里已有，语义也对 ——“本来要恢复，恢复不了”）。
+
 ## 17.7 能力边界属于哪条 execution
 
 `@agent` 的能力边界是**会话级存放、execution 级生效**的（`capability.ts`）：

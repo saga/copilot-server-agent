@@ -58,10 +58,21 @@ Principal { userId, roles, groups }
 - 🔑 **等待态落库顺序**（`@review`/`@action` 通用）：
   `create HumanTask → CAS 写 workflow=waiting + waitingTaskId → transition execution=waiting_for_approval`。
   **不能反过来** —— 反过来中间崩会得到 `execution=waiting_for_approval` + `workflow=running`
-  的**不可判定**态。按新顺序崩在任何一步都可判定：`stepStatus==='waiting'` 但无
-  `waitingTaskId` → failed；有 → `run()` 开头 `reconcileWaiting()` 补 transition
-  （`workflow.waiting.reconciled`）。代价是可能留**孤儿任务**（靠过期+四重绑定自愈，
-  不写清理器）；CAS 冲突时记 `workflow.orphan_task`（**别复用** `workflow.write.conflict`）。
+  的**不可判定**态。代价是可能留**孤儿任务**（靠过期+四重绑定自愈，不写清理器）；
+  CAS 冲突时记 `workflow.orphan_task`（**别复用** `workflow.write.conflict`）。
+- ⚠️ **`waitingTaskId` 记的是"任务被创建过"，不是"任务还没结束"** —— 对账必须**解引用**：
+  `reconcileWaiting()` 回查 `humanTasks.get(taskId)`。同一个字段形状有两个来源：
+  甲、崩在建任务与迁移之间（任务 open → 补迁移）；
+  乙、崩在 `resumeInto()` 的 `ensureRunning` 与 CAS 写 `current=next` 之间
+  （任务**已收敛** → 摆回 waiting_for_approval 后 `resumeFromTask()` 重放）。
+  只看字段按甲处理 → 推回等待等一个永不再来的回调，而 `complete()` 在
+  `waiting_for_approval` 下**静默 return** → **永久卡住**。乙还顺带覆盖
+  "停机期间任务过期/取消、回调没送达"。查不到任务 → 落 failed，不瞎猜。
+- ⚠️ **`failWorkflow()` 在等待态会抛"非法状态迁移"**：`ALLOWED_TRANSITIONS` 里
+  `waiting_for_approval`/`waiting_for_input` 只有 `resuming/rejected/cancelled/expired`，
+  **没有 `failed`**。它跑在收尾路径上 → 异常往上抛 → execution 反而永远停在等待态。
+  必须走 `exitWaitingIfNeeded()`：等待态先补 `→ resuming`，再 `resuming → failed`。
+  （`resumeFromTask()` 里"节点不存在"/"input_submitted"、`loadChecked()` 失败原本都会抛。）
 - 契约：`runtime.runAction()` **只建任务，绝不碰 execution 状态**（单写者）。
   `ExecutionService.proposeAction()` 的 `workflow.deferWaitingTransition` 置位时
   只建任务+发事件就 return，不 transition、不发 `waitingForApproval`。
