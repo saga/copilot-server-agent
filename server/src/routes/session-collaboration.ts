@@ -122,7 +122,6 @@ sessionCollaborationRouter.get('/:id/events', async (req, res, next) => {
     });
 
     let closed = false;
-    let lastSent = after;
     const write = (event: SessionEvent) => {
       if (closed || res.writableEnded) return;
       const frame: string[] = [];
@@ -131,21 +130,13 @@ sessionCollaborationRouter.get('/:id/events', async (req, res, next) => {
       frame.push(`event: ${event.type}`);
       frame.push(`data: ${JSON.stringify(event)}`);
       res.write(`${frame.join('\n')}\n\n`);
-      if (event.sequence > 0) lastSent = Math.max(lastSent, event.sequence);
     };
-
-    for (const event of await sessionEventService.listAfter(id, after)) write(event);
-
-    const unsubscribe = sessionEventService.subscribe(id, (event) => {
-      // 回放与订阅之间的重叠：同一条事件不重复推
-      if (event.sequence > 0 && event.sequence <= lastSent) return;
-      write(event);
-    });
 
     const heartbeat = setInterval(() => {
       if (!closed && !res.writableEnded) res.write(': heartbeat\n\n');
     }, HEARTBEAT_MS);
 
+    let unsubscribe = (): void => undefined;
     const cleanup = () => {
       if (closed) return;
       closed = true;
@@ -155,6 +146,15 @@ sessionCollaborationRouter.get('/:id/events', async (req, res, next) => {
     };
     req.on('close', cleanup);
     res.on('close', cleanup);
+
+    /**
+     * 回放与订阅的原子接管交给 event service：先订阅再回放，中间落库的事件进缓冲不会丢。
+     * 若在这里写成「先 listAfter 再 subscribe」，两步之间的事件会永久缺失 ——
+     * 按 sequence 去重只能防重复，防不了丢失。
+     */
+    unsubscribe = await sessionEventService.subscribeWithReplay(id, after, write);
+    // 回放期间连接就断了：cleanup 已经跑过，这里补一次清理
+    if (closed) unsubscribe();
     return undefined;
   } catch (err) {
     if (res.headersSent) {

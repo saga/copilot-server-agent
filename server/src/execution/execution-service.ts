@@ -49,6 +49,12 @@ export interface CreateExecutionInput {
   input?: unknown;
   /** 会话消息 id（shared：execution 挂到触发它的那条 message 上） */
   sourceMessageId?: string;
+  /**
+   * 队列定序键 = 来源消息的 sequence。
+   * 有 sourceMessageId 就必须一起给，否则队列只能退化成按时间排序，
+   * 并发提交时 agent 的处理顺序会与 transcript 顺序不一致。
+   */
+  queueSequence?: number;
 }
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -91,9 +97,40 @@ export class ExecutionService {
     return this.deps.repository.list(filter);
   }
 
-  /** 队列里的下一条：同一 session 内最早创建、仍未开始（shared 会话的 drain 靠它取活） */
+  /** 队列里的下一条：同一 session 内按来源消息 sequence 定序（shared 会话的 drain 靠它取活） */
   nextQueued(sessionId: string): Promise<ExecutionRecord | undefined> {
-    return this.deps.repository.nextCreated(sessionId);
+    return this.deps.repository.nextQueued(sessionId);
+  }
+
+  /** 仍有排队中协作 execution 的 session（启动恢复用：chains 是进程内状态，重启即丢） */
+  queuedSessionIds(): Promise<string[]> {
+    return this.deps.repository.queuedSessionIds();
+  }
+
+  /**
+   * 启动恢复：把进程退出时留在 running/resuming 的执行落成 interrupted。
+   *
+   * **刻意不自动重试**：agent 可能已经执行过业务动作（提交交易、表决），
+   * 进程死在动作之后、状态落库之前时自动重跑会重复提交 —— 金融场景不可接受。
+   * 是否重跑交给人工判断。
+   *
+   * 不在这个状态集里的：`created`（还没开跑，重新入队即可）与 `waiting_*`
+   * （等人工，状态本就该跨重启保留）。
+   */
+  async recoverInterrupted(
+    reason = '进程在 turn 中途退出（interrupted）：未自动重试，请人工确认是否需要重跑',
+  ): Promise<ExecutionRecord[]> {
+    const hit = await this.deps.repository.interruptActive(reason);
+    for (const rec of hit) {
+      this.cleanup(rec.executionId, rec.sessionId);
+      await this.eventLog.append({
+        executionId: rec.executionId,
+        type: EVT.interrupted,
+        actorType: 'system',
+        payload: { reason },
+      });
+    }
+    return hit;
   }
 
   stats(): Promise<ExecutionStats> {
@@ -126,6 +163,7 @@ export class ExecutionService {
       userId: input.owner.userId,
       initiatedByUserId: input.initiatedByUserId ?? input.owner.userId,
       ...(input.sourceMessageId ? { sourceMessageId: input.sourceMessageId } : {}),
+      ...(input.queueSequence !== undefined ? { queueSequence: input.queueSequence } : {}),
       kind: input.kind ?? 'interactive',
       status: 'created',
       createdAt: now,

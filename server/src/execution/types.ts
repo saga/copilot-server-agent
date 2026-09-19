@@ -20,7 +20,13 @@ export type ExecutionStatus =
   | 'failed'
   | 'cancelled'
   | 'rejected'
-  | 'expired';
+  | 'expired'
+  /**
+   * 进程在 turn 中途退出（Pod 重启/被 kill）。**终态，且刻意不自动重试**：
+   * agent 可能已经执行过业务动作（下单、提交表决），自动重跑会重复提交。
+   * 是否重跑由人工/运维决定。
+   */
+  | 'interrupted';
 
 export const TERMINAL_STATUSES: readonly ExecutionStatus[] = [
   'completed',
@@ -28,6 +34,7 @@ export const TERMINAL_STATUSES: readonly ExecutionStatus[] = [
   'cancelled',
   'rejected',
   'expired',
+  'interrupted',
 ];
 
 export function isTerminal(status: ExecutionStatus): boolean {
@@ -40,15 +47,25 @@ export const ALLOWED_TRANSITIONS: Record<ExecutionStatus, readonly ExecutionStat
   // 它必须在终态落地 —— 留在 created 就等于永远排在队头，调度器会反复取到同一条。
   // 与 cancelled 的区别：cancelled 是有人取消，failed 是自己跑不起来。
   created: ['running', 'cancelled', 'failed'],
-  running: ['waiting_for_input', 'waiting_for_approval', 'completed', 'failed', 'cancelled'],
+  // running → interrupted：进程在 turn 中途退出（启动恢复时落终态，不自动重试）。
+  running: [
+    'waiting_for_input',
+    'waiting_for_approval',
+    'completed',
+    'failed',
+    'cancelled',
+    'interrupted',
+  ],
   waiting_for_input: ['resuming', 'cancelled', 'expired'],
   waiting_for_approval: ['resuming', 'rejected', 'cancelled', 'expired'],
-  resuming: ['running', 'failed', 'cancelled'],
+  // resuming 同理：恢复执行的过程中进程退出 → interrupted
+  resuming: ['running', 'failed', 'cancelled', 'interrupted'],
   completed: [],
   failed: [],
   cancelled: [],
   rejected: [],
   expired: [],
+  interrupted: [],
 };
 
 /** execution 来源：interactive=HTTP chat；job=后台作业；workflow=工作流步骤 */
@@ -107,6 +124,13 @@ export interface ExecutionRecord {
   initiatedByUserId?: string;
   /** 触发本次 execution 的会话消息（agent_message.messageId），可回溯到原始输入 */
   sourceMessageId?: string;
+  /**
+   * 队列定序键：镜像来源消息的 `sequence`。
+   * created_at 是毫秒级 ISO 串，两个并发提交的 execution 建行顺序可能与消息落库顺序相反，
+   * 而 FIFO 必须与 transcript 顺序一致（用户看到的顺序 = agent 实际处理顺序）。
+   * 只有协作 execution（sourceMessageId 非空）有值。
+   */
+  queueSequence?: number;
 
   kind: ExecutionKind;
   status: ExecutionStatus;
@@ -192,4 +216,6 @@ export const EXECUTION_EVENT_TYPES = {
   cancelled: 'execution.cancelled',
   rejected: 'execution.rejected',
   expired: 'execution.expired',
+  /** 进程中途退出（启动恢复时写入），终态且不自动重试 */
+  interrupted: 'execution.interrupted',
 } as const;

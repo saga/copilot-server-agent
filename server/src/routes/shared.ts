@@ -19,6 +19,38 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction): u
   return res.status(401).json({ error: 'unauthorized（管理接口需 x-admin-token）' });
 }
 
+/**
+ * 调用方是否持有管理令牌。
+ *
+ * 用于「运营视角能看全量、参与者视角只能看自己的」这类读接口：管理令牌不是一个
+ * 独立的准入闸门，而是**可见范围的放大器**。此前这些接口挂 `requireAdmin`，
+ * 结果是配了 COPILOT_ADMIN_TOKEN 的部署里，共享会话的参与者读不到同会话的
+ * execution 时间线（会话详情却读得到），协作读路径被截断。安全属性没有放松：
+ * 未带令牌时仍会退到会话可见性判定，匿名拿不到全量。
+ */
+export function hasAdminToken(req: Request): boolean {
+  return Boolean(config.adminToken) && req.header('x-admin-token') === config.adminToken;
+}
+
+/**
+ * 读接口的准入与范围，一处判定、四处复用：
+ *   all     管理令牌；或部署本身没设闸（没配令牌也不信任身份头 = 单租户本地开发）
+ *   scoped  可信身份下的调用方：读到的范围收窄为「自己拥有的 + 自己参与的」会话
+ *   denied  配了令牌、又拿不到可信身份：不给读
+ *
+ * 为什么不是 `requireAdmin`：execution 的可见性本就跟着 session 走（见 assertSessionVisible），
+ * 管理令牌只回答「是否无视会话边界看全量」，不回答「能否读这个会话」。
+ */
+export function readAccess(req: Request): 'all' | 'scoped' | 'denied' {
+  if (hasAdminToken(req)) return 'all';
+  if (!config.adminToken) return config.trustIdentityHeaders ? 'scoped' : 'all';
+  return config.trustIdentityHeaders ? 'scoped' : 'denied';
+}
+
+export const READ_ACCESS_DENIED = {
+  error: 'unauthorized（需 x-admin-token，或开启可信身份头以按会话收窄）',
+} as const;
+
 /** 调用方身份（owner + roles；角色只在网关可信时来自请求头） */
 export function principalOf(req: Request) {
   return principalFromHeaders(req.headers);

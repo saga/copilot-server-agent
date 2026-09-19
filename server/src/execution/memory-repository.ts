@@ -1,6 +1,11 @@
 import { randomUUID } from 'node:crypto';
 import { config } from '../config.js';
-import type { EventRepository, ExecutionRepository, ExecutionStats } from './repository.js';
+import type {
+  AppendExecutionEventInput,
+  EventRepository,
+  ExecutionRepository,
+  ExecutionStats,
+} from './repository.js';
 import type { ExecutionEvent, ExecutionFilter, ExecutionRecord } from './types.js';
 
 /**
@@ -51,13 +56,53 @@ export class MemoryExecutionRepository implements ExecutionRepository {
     return matched.slice(-limit).map(clone);
   }
 
-  /** 队列里最早创建、仍未开始的那条（created 状态即排队中） */
-  async nextCreated(sessionId: string): Promise<ExecutionRecord | undefined> {
-    // 与 SQL 实现同一定序：created_at 并列时看 execution_id（见 sql-repository.nextCreated）
+  /**
+   * 队列取活：与 SQL 实现同一定序 —— queueSequence（= 来源消息 sequence）升序，
+   * 并只认协作 execution（有 sourceMessageId）。见 sql-repository.nextQueued。
+   */
+  async nextQueued(sessionId: string): Promise<ExecutionRecord | undefined> {
     const queued = [...this.records.values()]
-      .filter((r) => r.sessionId === sessionId && r.status === 'created')
-      .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.executionId.localeCompare(b.executionId));
+      .filter(
+        (r) =>
+          r.sessionId === sessionId &&
+          r.status === 'created' &&
+          r.sourceMessageId !== undefined &&
+          r.queueSequence !== undefined,
+      )
+      .sort(
+        (a, b) =>
+          (a.queueSequence ?? 0) - (b.queueSequence ?? 0) ||
+          a.executionId.localeCompare(b.executionId),
+      );
     return queued[0] ? clone(queued[0]) : undefined;
+  }
+
+  async queuedSessionIds(): Promise<string[]> {
+    return [
+      ...new Set(
+        [...this.records.values()]
+          .filter((r) => r.status === 'created' && r.sourceMessageId !== undefined)
+          .map((r) => r.sessionId),
+      ),
+    ];
+  }
+
+  async interruptActive(reason: string): Promise<ExecutionRecord[]> {
+    const now = new Date().toISOString();
+    const hit: ExecutionRecord[] = [];
+    for (const [id, rec] of this.records) {
+      if (rec.status !== 'running' && rec.status !== 'resuming') continue;
+      const next: ExecutionRecord = {
+        ...rec,
+        status: 'interrupted',
+        updatedAt: now,
+        completedAt: rec.completedAt ?? now,
+        error: rec.error ?? reason,
+      };
+      this.records.set(id, next);
+      hit.push(clone(next));
+    }
+    return hit;
   }
 
   async stats(): Promise<ExecutionStats> {
@@ -89,12 +134,16 @@ export class MemoryExecutionRepository implements ExecutionRepository {
 
 export class MemoryEventRepository implements EventRepository {
   private events = new Map<string, ExecutionEvent[]>();
+  /** 与 SQL 侧的 agent_execution.event_sequence 同义：独立计数器，不靠数组长度推算 */
+  private seq = new Map<string, number>();
 
-  async append(input: Omit<ExecutionEvent, 'eventId'>): Promise<ExecutionEvent> {
+  async append(input: AppendExecutionEventInput): Promise<ExecutionEvent> {
     const list = this.events.get(input.executionId) ?? [];
+    const sequence = (this.seq.get(input.executionId) ?? 0) + 1;
+    this.seq.set(input.executionId, sequence);
     const event: ExecutionEvent = {
       ...clone(input),
-      sequence: list.length + 1,
+      sequence,
       eventId: `ev_${randomUUID()}`,
     };
     list.push(event);
@@ -111,5 +160,6 @@ export class MemoryEventRepository implements EventRepository {
 
   clear(): void {
     this.events.clear();
+    this.seq.clear();
   }
 }

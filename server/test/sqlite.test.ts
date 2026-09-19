@@ -459,15 +459,40 @@ test('SQLite：老库文件缺协作列时自动补列（create table if not exi
   try {
     assert.ok((await columnsOf(db, 'agent_session')).includes('collaboration_mode'));
     assert.ok((await columnsOf(db, 'agent_session')).includes('message_sequence'));
+    assert.ok((await columnsOf(db, 'agent_session')).includes('event_sequence'));
     assert.ok((await columnsOf(db, 'agent_execution')).includes('initiated_by_user_id'));
     assert.ok((await columnsOf(db, 'agent_execution')).includes('source_message_id'));
+    assert.ok((await columnsOf(db, 'agent_execution')).includes('queue_sequence'));
+    assert.ok((await columnsOf(db, 'agent_execution')).includes('event_sequence'));
 
     // 老数据行必须拿到 default，而不是 null：否则读出来就是 undefined，模式判定会跑偏
-    const { rows } = await db.query<{ collaboration_mode: string; message_sequence: number }>(
-      "select collaboration_mode, message_sequence from agent_session where session_id = 'old-1'",
+    const { rows } = await db.query<{
+      collaboration_mode: string;
+      message_sequence: number;
+      event_sequence: number;
+    }>(
+      "select collaboration_mode, message_sequence, event_sequence from agent_session where session_id = 'old-1'",
     );
     assert.equal(rows[0]!.collaboration_mode, 'single');
     assert.equal(rows[0]!.message_sequence, 0);
+    assert.equal(rows[0]!.event_sequence, 0);
+
+    // 索引引用了「补列才会出现」的列（queue_sequence）。它必须在补列之后建 ——
+    // 若与建表放在同一条 exec 里，老库会在启动时直接 `no such column` 起不来。
+    const idx = await db.query<{ name: string }>(
+      "select name from sqlite_master where type = 'index' and name = 'idx_execution_queue'",
+    );
+    assert.equal(idx.rows.length, 1, '补列之后队列索引必须建起来');
+
+    // 升级后的老 session 能真的分配事件序号（说明 event_sequence 计数器可用）
+    const events = new SqlSessionEventRepository();
+    const first = await events.append({
+      sessionId: 'old-1',
+      type: 'participant.joined',
+      actorType: 'system',
+      createdAt: now,
+    });
+    assert.equal(first.sequence, 1);
 
     // 升级后老会话照旧可读可写（读路径不必区分「老库新库」）
     const record = await new SqlRegistryStore().get('old-1');
@@ -599,6 +624,7 @@ test('SQLite：execution 的发起人与来源消息必须读得回来（写进�
       initiatedByUserId: 'risk-1',
       kind: 'interactive',
       sourceMessageId: 'msg-1',
+      queueSequence: 7,
     });
 
     // 写入路径正确不代表读回路径正确：列写了但 toRecord 没映射，运行期才炸
@@ -607,6 +633,7 @@ test('SQLite：execution 的发起人与来源消息必须读得回来（写进�
     assert.equal(back?.userId, 'pm-1', 'userId 是数据归属（会话 owner）');
     assert.equal(back?.initiatedByUserId, 'risk-1', 'initiatedByUserId 是发起人');
     assert.equal(back?.sourceMessageId, 'msg-1');
+    assert.equal(back?.queueSequence, 7, '队列定序键要读得回来（= 来源消息 sequence）');
 
     // 列表路径同样要带上，否则 GET /api/executions 看不到是谁发起的
     const [listed] = await execution.list({ sessionId: 's-attr' });
@@ -617,8 +644,30 @@ test('SQLite：execution 的发起人与来源消息必须读得回来（写进�
     const plain = await execution.create({ sessionId: 's-attr', owner: OWNER });
     assert.equal((await execution.get(plain.executionId))?.initiatedByUserId, 'pm-1');
 
-    // 队列取活按 created 状态取，且顺序确定（created_at, execution_id）
+    // 队列取活：协作 execution（有来源消息）按 queue_sequence 定序
     assert.equal((await execution.nextQueued('s-attr'))?.executionId, exec.executionId);
+
+    // 边界：没有来源消息的后台 job 不算协作队列项 —— 它由显式 /run 驱动，
+    // 混进队列会被调度器当成"等 agent 输入"并直接判 failed。
+    const job = await execution.create({ sessionId: 's-attr', owner: OWNER, kind: 'job' });
+    assert.equal(job.status, 'created');
+    assert.equal(
+      (await execution.nextQueued('s-attr'))?.executionId,
+      exec.executionId,
+      'job 不参与协作队列，取到的仍是那条协作 execution',
+    );
+
+    // 定序键决定顺序，而不是创建时间：新建一条 queue_sequence 更小的，它应该排到前面
+    const earlier = await execution.create({
+      sessionId: 's-attr',
+      owner: OWNER,
+      initiatedByUserId: 'risk-1',
+      sourceMessageId: 'msg-0',
+      queueSequence: 3,
+    });
+    assert.equal((await execution.nextQueued('s-attr'))?.executionId, earlier.executionId);
+    const queuedSessions = await execution.queuedSessionIds();
+    assert.deepEqual(queuedSessions, ['s-attr']);
   } finally {
     teardown(db, dir);
   }
@@ -635,6 +684,120 @@ test('SQLite：created 的排队项可以直接落 failed（跑不起来时不�
     const after = await execution.get(exec.executionId);
     assert.equal(after?.status, 'failed');
     assert.match(after?.error ?? '', /缺少来源消息/);
+  } finally {
+    teardown(db, dir);
+  }
+});
+
+test('SQLite：事件序号冲突必须抛错，绝不能静默返回一个库里不存在的序号', async () => {
+  /**
+   * 回归目标：`max(sequence)+1` + `on conflict do nothing` 的组合。
+   *
+   * 两个并发 append 读到同一个 max、算出同一个序号，后到的被 `do nothing` 吞掉 ——
+   * 但调用方拿到的却是一个"成功"的序号。表现是审计链/SSE 游标里永远缺一条事件，
+   * 而没有任何一方报错。改成原子自增之后，这种状态只可能来自绕过分配器的写入，
+   * 此时必须**抛错**而不是假装成功。
+   */
+  const { dir, file } = newWorkdir();
+  const db = open(file);
+  const now = new Date().toISOString();
+  try {
+    await new SessionRegistry(new SqlRegistryStore()).create({
+      sessionId: 'conflict-1',
+      owner: OWNER,
+      workspacePath: '/workspaces/conflict-1',
+    });
+    const events = new SqlEventRepository();
+    const execution = new ExecutionService({
+      repository: new SqlExecutionRepository(),
+      events,
+    });
+    const exec = await execution.create({ sessionId: 'conflict-1', owner: OWNER });
+
+    // ---- session_event ----
+    const sessionEvents = new SqlSessionEventRepository();
+    const first = await sessionEvents.append({
+      sessionId: 'conflict-1',
+      type: 'message.created',
+      actorType: 'user',
+      createdAt: now,
+    });
+    assert.equal(first.sequence, 1);
+
+    // 把分配器回退，制造"下一次分配撞上已存在的序号"（等价于并发算出同一序号）
+    await db.query("update agent_session set event_sequence = 0 where session_id = 'conflict-1'");
+    await assert.rejects(
+      () =>
+        sessionEvents.append({
+          sessionId: 'conflict-1',
+          type: 'message.created',
+          actorType: 'user',
+          createdAt: now,
+        }),
+      (err: unknown) => /UNIQUE|写入失败/.test(String(err)),
+      '序号冲突必须抛错',
+    );
+    const afterSession = await db.query<{ n: number }>(
+      "select count(*) as n from session_event where session_id = 'conflict-1'",
+    );
+    assert.equal(Number(afterSession.rows[0]!.n), 1, '冲突不能留下第二条，也不能假装写入成功');
+
+    // ---- execution_event：同一条路径 ----
+    await db.query('update agent_execution set event_sequence = 0 where execution_id = ?1', [
+      exec.executionId,
+    ]);
+    await assert.rejects(
+      () =>
+        events.append({
+          executionId: exec.executionId,
+          type: 'execution.started',
+          actorType: 'system',
+          createdAt: now,
+        }),
+      (err: unknown) => /UNIQUE|写入失败/.test(String(err)),
+      'execution 事件序号冲突同样必须抛错',
+    );
+  } finally {
+    teardown(db, dir);
+  }
+});
+
+test('SQLite：事件序号是 durable 的（重启后接着分配，不回头重号）', async () => {
+  const { dir, file } = newWorkdir();
+  const now = new Date().toISOString();
+
+  let db = open(file);
+  try {
+    await new SessionRegistry(new SqlRegistryStore()).create({
+      sessionId: 'seq-durable',
+      owner: OWNER,
+      workspacePath: '/workspaces/seq-durable',
+    });
+    const events = new SqlSessionEventRepository();
+    for (let i = 0; i < 5; i += 1) {
+      await events.append({
+        sessionId: 'seq-durable',
+        type: 'message.created',
+        actorType: 'user',
+        createdAt: now,
+      });
+    }
+  } finally {
+    setTestDb(null);
+    await db.close();
+  }
+
+  // 关库重开：计数器在 agent_session 行上，不靠"数一遍已有事件"
+  db = open(file);
+  try {
+    const events = new SqlSessionEventRepository();
+    const next = await events.append({
+      sessionId: 'seq-durable',
+      type: 'message.created',
+      actorType: 'user',
+      createdAt: now,
+    });
+    assert.equal(next.sequence, 6, '重启后必须接着 6，而不是从 1 重来');
   } finally {
     teardown(db, dir);
   }

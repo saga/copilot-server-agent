@@ -85,6 +85,30 @@ export interface SessionRecord {
 
 export { DEFAULT_OWNER } from './session-registry.js';
 
+/**
+ * registry 记录 → 对外会话元信息（纯函数，便于直接验规则）。
+ *
+ * 时间取 registry 的 created_at / last_used_at 兜底：这两个字段是我们自己写的，
+ * 跨副本一致；磁盘索引里的 startTime/modifiedTime 只在本副本拉起过这个会话时才有。
+ * 所以「磁盘里查不到」不等于「会话不存在」—— 只说明本副本的 runtime 还没见过它，
+ * 不能据此回 404（多副本部署下会把别人的会话误判为不存在）。
+ */
+export function sessionMetaFrom(
+  record: RegistryRecord,
+  disk: SessionMetadata | undefined,
+  attached: boolean,
+): SessionMetadata & { attached: boolean } {
+  return {
+    sessionId: record.sessionId,
+    startTime: disk?.startTime ?? new Date(record.createdAt),
+    modifiedTime: disk?.modifiedTime ?? new Date(record.lastUsedAt),
+    isRemote: disk?.isRemote ?? false,
+    ...(disk?.summary ? { summary: disk.summary } : {}),
+    ...(disk?.context ? { context: disk.context } : {}),
+    attached,
+  };
+}
+
 /** 身份头只有在网关会剥离客户端自带头时才可信；否则一律按单租户处理 */
 let identityWarned = false;
 
@@ -717,20 +741,31 @@ class SessionService {
   }
 
   /**
-   * 当前调用方可读的会话：磁盘全量 ∩（自己拥有的 ∪ 额外给定的 sessionId）。
-   * 额外集合由调用方从协作层取（shared 会话里自己只是参与者）。
+   * 当前调用方可读的会话 =（自己拥有的 ∪ 额外给定的 sessionId）映射到 registry 记录。
+   *
+   * registry 是真相源，runtime 的 `listSessions()` 只用来补充 startTime/summary/context。
+   * 反过来（拿磁盘列表去 ∩ allowed）会漏会话：多副本部署下每个 Pod 有自己的 runtime 磁盘索引，
+   * 刚创建或由别的副本创建的会话不在本副本的 list 里，却明明在共享的 registry 里 —— 用户会在
+   * 列表里看不到自己的会话。额外集合由调用方从协作层取（shared 会话里自己只是参与者）。
    */
   async listSessions(
     owner: SessionOwner = DEFAULT_OWNER,
     opts: { extraSessionIds?: string[] } = {},
   ): Promise<(SessionMetadata & { attached: boolean })[]> {
-    const client = await this.getClient();
-    const mine = await this.registry.listByOwner(owner);
-    const allowed = new Set([...mine.map((r) => r.sessionId), ...(opts.extraSessionIds ?? [])]);
-    const all = await client.listSessions();
-    return all
-      .filter((m) => allowed.has(m.sessionId))
-      .map((m) => ({ ...m, attached: this.sessions.has(m.sessionId) }));
+    /** sessionId → registry 记录（owner 优先，extra 只补那些自己不是 owner 的） */
+    const allowed = new Map<string, RegistryRecord>();
+    for (const record of await this.registry.listByOwner(owner)) {
+      allowed.set(record.sessionId, record);
+    }
+    for (const id of opts.extraSessionIds ?? []) {
+      if (allowed.has(id)) continue;
+      const record = await this.registry.get(id);
+      if (record && record.status === 'active') allowed.set(id, record);
+    }
+    const disk = await this.diskMetaIndex();
+    return [...allowed.values()].map((record) =>
+      this.metaOf(record, disk.get(record.sessionId)),
+    );
   }
 
   async getSessionMeta(
@@ -745,10 +780,24 @@ class SessionService {
     if (!record && !this.isSingleTenant(owner)) {
       throw new Error(`无权访问 session："${sessionId}"（无归属记录）`);
     }
+    const disk = await this.diskMetaIndex();
+    // registry 有记录就以它为准（会话确实存在、归属已定）；磁盘元信息缺失只说明本副本
+    // 的 runtime 索引还没同步到它，不该让 GET /sessions/:id 误报 404。
+    if (record) return this.metaOf(record, disk.get(sessionId));
+    // 无 registry 记录 = 单租户下的历史会话：只能靠磁盘列表
+    const meta = disk.get(sessionId);
+    return meta ? { ...meta, attached: this.sessions.has(sessionId) } : null;
+  }
+
+  /** runtime 磁盘索引（补充元信息用；失败不该让会话读取整体 500） */
+  private async diskMetaIndex(): Promise<Map<string, SessionMetadata>> {
     const client = await this.getClient();
     const all = await client.listSessions();
-    const meta = all.find((m) => m.sessionId === sessionId);
-    return meta ? { ...meta, attached: this.sessions.has(sessionId) } : null;
+    return new Map(all.map((m) => [m.sessionId, m]));
+  }
+
+  private metaOf(record: RegistryRecord, disk: SessionMetadata | undefined) {
+    return sessionMetaFrom(record, disk, this.sessions.has(record.sessionId));
   }
 
   private isSingleTenant(owner: SessionOwner): boolean {

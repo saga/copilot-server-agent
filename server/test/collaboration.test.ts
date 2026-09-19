@@ -17,6 +17,7 @@ import {
   MemoryEventRepository,
   MemoryExecutionRepository,
 } from '../src/execution/memory-repository.js';
+import { isTerminal } from '../src/execution/types.js';
 import type { Principal } from '../src/services/principal.js';
 import { SessionAccessService } from '../src/services/session-access.js';
 import { MemoryRegistryStore, SessionRegistry } from '../src/services/session-registry.js';
@@ -80,15 +81,14 @@ function makeStack() {
     executions,
     messages,
     events,
-    run: async ({ execution, prompt, onAssistantMessage }) => {
+    run: async ({ execution, prompt }) => {
       inFlight += 1;
       peak = Math.max(peak, inFlight);
       started.push({ executionId: execution.executionId, prompt, overlap: inFlight });
       await sleep(20);
       inFlight -= 1;
+      // 终稿正文走返回值：协作层据此写 durable transcript（onAssistantMessage 只用于实时 UI）
       const content = `echo:${prompt}`;
-      // 真 AgentRunner 在收到终稿时会回调；协作层据此把 agent 消息写进会话时间线
-      onAssistantMessage?.(content);
       return { content, chars: content.length };
     },
   });
@@ -537,12 +537,14 @@ test('跑不起来的排队项必须落到 failed，而不是留在队头空转'
 
   // 直接造一个"取不到输入"的排队项：sourceMessageId 指向不存在的消息。
   // 这模拟的就是「execution 已入队但来源消息缺失 / 状态被外部改动」。
+  // queueSequence 必须有：它是协作队列项的判据之一（没有它的 job 不进队列）。
   const broken = await s.executions.create({
     sessionId: 'sess-stuck',
     owner: { tenantId: 't1', userId: 'alice' },
     initiatedByUserId: 'bob',
     kind: 'interactive',
     sourceMessageId: 'msg-does-not-exist',
+    queueSequence: 1,
   });
   assert.equal(broken.status, 'created');
 
@@ -582,4 +584,331 @@ test('排队项跑完之后队列继续推进下一条', async () => {
   }
 
   assert.deepEqual(s.started.map((r) => r.prompt), ['A', 'B'], '队列必须按顺序推进，不丢下一条');
+});
+
+// ---------- 权限：会话配置 / execution 指挥权 ----------
+
+test('共享会话：member 不能 resume 改会话配置（能力边界属于 owner）', async () => {
+  const s = makeStack();
+  await s.openSession('sess-resume', 'shared');
+  await s.participantService.add('sess-resume', ALICE, { userId: 'bob', role: 'member' });
+  await s.participantService.add('sess-resume', ALICE, { userId: 'carol', role: 'observer' });
+
+  // resume 能改 model / agents / customAgents / MCP / hooks / systemMessage —— 全体参与者共用。
+  // 只判 send 会让任一 member 改掉所有人的能力集与数据边界。
+  await assert.rejects(
+    () => s.access.assertCanManageSession('sess-resume', BOB),
+    /无权管理会话配置/,
+  );
+  await assert.rejects(
+    () => s.access.assertCanManageSession('sess-resume', CAROL),
+    /无权管理会话配置/,
+  );
+  assert.equal((await s.access.assertCanManageSession('sess-resume', ALICE)).role, 'owner');
+
+  // 对照：权限没有一放开就串档 —— member 也不能管理成员
+  await assert.rejects(
+    () => s.access.assertCanManageMembers('sess-resume', BOB),
+    /无权管理成员/,
+  );
+});
+
+test('共享会话：observer 不能启动 execution（run 要 send，不是 view）', async () => {
+  const s = makeStack();
+  await s.openSession('sess-run', 'shared');
+  await s.participantService.add('sess-run', ALICE, { userId: 'carol', role: 'observer' });
+
+  // observer 能看见这个会话
+  assert.equal((await s.access.assertCanView('sess-run', CAROL)).role, 'observer');
+  // 但看得见不等于能让执行跑起来
+  await assert.rejects(() => s.access.assertCanSend('sess-run', CAROL), /无权发消息到/);
+});
+
+test('共享会话：execution 指挥权按 发起人/owner 收窄，observer 与旁观 member 都不可', async () => {
+  const s = makeStack();
+  const DAVE = principal('dave');
+  await s.openSession('sess-cmd', 'shared');
+  await s.participantService.add('sess-cmd', ALICE, { userId: 'bob', role: 'member' });
+  await s.participantService.add('sess-cmd', ALICE, { userId: 'carol', role: 'observer' });
+  await s.participantService.add('sess-cmd', ALICE, { userId: 'dave', role: 'member' });
+
+  const submitted = await s.collaboration.submitMessage({
+    sessionId: 'sess-cmd',
+    principal: BOB,
+    prompt: 'bob 发起',
+  });
+  if (submitted.mode !== 'shared') throw new Error('应为 shared');
+  const exec = submitted.execution;
+
+  // owner 可指挥本会话内任意 execution
+  assert.equal((await s.access.assertCanCommandExecution('sess-cmd', ALICE, exec)).role, 'owner');
+  // 发起人本人（member）可以
+  assert.equal((await s.access.assertCanCommandExecution('sess-cmd', BOB, exec)).role, 'member');
+  // 另一个 member 不行 —— 能看见同会话的执行 ≠ 能取消/对它提业务动作
+  await assert.rejects(
+    () => s.access.assertCanCommandExecution('sess-cmd', DAVE, exec),
+    /无权操作该 execution/,
+  );
+  // observer 连"自己的"都不行（它本来也不该有执行）
+  await assert.rejects(
+    () => s.access.assertCanCommandExecution('sess-cmd', CAROL, exec),
+    /无权操作该 execution/,
+  );
+  // 跨租户先被会话访问判定拦掉
+  await assert.rejects(
+    () => s.access.assertCanCommandExecution('sess-cmd', MALLORY, exec),
+    /无权访问/,
+  );
+});
+
+// ---------- 序号分配：并发下不重不漏 ----------
+
+test('并发追加会话事件：序号 1..20 无重复、无丢失，游标可续传', async () => {
+  const s = makeStack();
+  await s.openSession('sess-ev', 'shared');
+
+  await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      s.events.append({
+        sessionId: 'sess-ev',
+        type: 'message.created',
+        actorType: 'user',
+        payload: { i },
+      }),
+    ),
+  );
+
+  const all = await s.events.listAfter('sess-ev', 0);
+  const expected = Array.from({ length: 20 }, (_, i) => i + 1);
+  assert.equal(all.length, 20, '一条都不能丢');
+  assert.deepEqual(all.map((e) => e.sequence), expected, '序号必须连续且唯一');
+
+  // 断线续传：after=10 只回放 11..20
+  assert.deepEqual(
+    (await s.events.listAfter('sess-ev', 10)).map((e) => e.sequence),
+    expected.slice(10),
+  );
+});
+
+test('并发追加 execution 事件：序号连续唯一（审计链不能少一条）', async () => {
+  const s = makeStack();
+  await s.openSession('sess-exev', 'shared');
+  const exec = await s.executions.create({
+    sessionId: 'sess-exev',
+    owner: { tenantId: 't1', userId: 'alice' },
+  });
+
+  await Promise.all(
+    Array.from({ length: 20 }, (_, i) =>
+      s.executions.appendEvent({
+        executionId: exec.executionId,
+        type: 'agent.tool_call.started',
+        actorType: 'agent',
+        payload: { i },
+      }),
+    ),
+  );
+
+  const events = await s.executions.events(exec.executionId, 100);
+  // create 自己写了一条 execution.created，加 20 条 = 21
+  const seqs = events.map((e) => e.sequence);
+  assert.equal(events.length, 21, '一条都不能丢');
+  assert.equal(new Set(seqs).size, 21, '不能有重复序号');
+  assert.deepEqual(seqs, Array.from({ length: 21 }, (_, i) => i + 1));
+});
+
+test('事件序号不靠数组长度推算：超过事件环容量后仍然唯一', async () => {
+  // 内存实现的事件环只保留最近 500 条。若序号取 `list.length + 1`，
+  // 环满之后每次都会算出同一个序号 —— 这是"记录被裁剪"与"序号分配"两件事被混在一起的经典 bug。
+  const repo = new MemoryEventRepository();
+  const seqs: number[] = [];
+  for (let i = 0; i < 520; i += 1) {
+    const event = await repo.append({
+      executionId: 'ex-trim',
+      type: 'agent.tool_call.completed',
+      actorType: 'agent',
+      createdAt: new Date().toISOString(),
+    });
+    seqs.push(event.sequence);
+  }
+  assert.equal(new Set(seqs).size, 520, '序号绝不能重复');
+  assert.equal(seqs[0], 1);
+  assert.equal(seqs[519], 520);
+  assert.equal((await repo.list('ex-trim', 500)).length, 500, '环容量仍然是 500');
+});
+
+// ---------- SSE：回放与订阅的竞态 ----------
+
+test('事件流：回放与订阅之间落库的事件不能丢（read-then-subscribe 竞态）', async () => {
+  const s = makeStack();
+  await s.openSession('sess-race', 'shared');
+  await s.events.append({ sessionId: 'sess-race', type: 'message.created', actorType: 'user' });
+
+  /**
+   * 场景 A：新事件在"读库拿到快照之后"才落库。
+   * 先读库再订阅的实现会把这条永久丢掉（订阅时尚不存在，回放时又不在快照里）；
+   * 先订阅的实现会把它送进缓冲，回放结束后补发。
+   */
+  const repo = s.sessionEventRepository;
+  const original = repo.listAfter.bind(repo);
+  let injected = false;
+  repo.listAfter = async (sessionId, after, limit) => {
+    const rows = await original(sessionId, after, limit);
+    if (!injected) {
+      injected = true;
+      await s.events.append({
+        sessionId: 'sess-race',
+        type: 'execution.queued',
+        actorType: 'system',
+      });
+    }
+    return rows;
+  };
+
+  const got: number[] = [];
+  (await s.events.subscribeWithReplay('sess-race', 0, (e) => got.push(e.sequence)))();
+  assert.deepEqual(got, [1, 2], '回放期间落库的事件必须补上，且不重复');
+
+  /**
+   * 场景 B：事件既在快照里、又走了广播（回放与缓冲必然重叠）。
+   * 这时的要求是**不重复**：按 sequence 去重。
+   */
+  repo.listAfter = async (sessionId, after, limit) => {
+    const rows = await original(sessionId, after, limit);
+    if (injected) {
+      injected = false;
+      await s.events.append({
+        sessionId: 'sess-race',
+        type: 'execution.started',
+        actorType: 'system',
+      });
+    }
+    return rows;
+  };
+  const again: number[] = [];
+  (await s.events.subscribeWithReplay('sess-race', 0, (e) => again.push(e.sequence)))();
+  assert.deepEqual(again, [1, 2, 3], '重叠的事件只交付一次');
+});
+
+// ---------- 启动恢复：队列与崩溃残留 ----------
+
+test('启动恢复：队列在库里，但 worker 是进程内的 —— 重启后必须重新 drain', async () => {
+  const s = makeStack();
+  await s.openSession('sess-recover', 'shared');
+
+  // 直接造一条"已入队但还没跑"的协作 execution：等价于入队后进程立刻重启
+  const { message } = await s.messages.fromUser({
+    sessionId: 'sess-recover',
+    tenantId: 't1',
+    userId: 'alice',
+    content: '重启前入队',
+  });
+  const queued = await s.executions.create({
+    sessionId: 'sess-recover',
+    owner: { tenantId: 't1', userId: 'alice' },
+    initiatedByUserId: 'alice',
+    kind: 'interactive',
+    sourceMessageId: message.messageId,
+    queueSequence: message.sequence,
+  });
+  assert.equal((await s.executions.get(queued.executionId))?.status, 'created');
+  assert.equal(s.started.length, 0, '重启前没有 worker 在跑它');
+
+  // 进程重启：chains 是空的，没有任何 HTTP 请求会来唤醒这个会话
+  const result = await s.collaboration.recoverPending();
+  assert.equal(result.sessions, 1, '应当识别出 1 个待恢复的会话');
+  assert.equal(result.interrupted, 0);
+
+  const deadline = Date.now() + 3000;
+  while ((await s.executions.get(queued.executionId))?.status !== 'completed') {
+    if (Date.now() > deadline) throw new Error('恢复 drain 超时');
+    await sleep(5);
+  }
+  assert.equal(s.started[0]?.prompt, '重启前入队', 'prompt 要从来源消息恢复');
+});
+
+test('启动恢复：running 的执行落成 interrupted 终态，且绝不自动重试', async () => {
+  const s = makeStack();
+  await s.openSession('sess-int', 'shared');
+  const { message } = await s.messages.fromUser({
+    sessionId: 'sess-int',
+    tenantId: 't1',
+    userId: 'alice',
+    content: '跑到一半崩了',
+  });
+  const exec = await s.executions.create({
+    sessionId: 'sess-int',
+    owner: { tenantId: 't1', userId: 'alice' },
+    initiatedByUserId: 'alice',
+    kind: 'interactive',
+    sourceMessageId: message.messageId,
+    queueSequence: message.sequence,
+  });
+  await s.executions.start(exec.executionId);
+  assert.equal((await s.executions.get(exec.executionId))?.status, 'running');
+
+  const result = await s.collaboration.recoverPending();
+  assert.equal(result.interrupted, 1);
+
+  const after = await s.executions.get(exec.executionId);
+  assert.equal(after?.status, 'interrupted');
+  assert.ok(isTerminal(after!.status), 'interrupted 必须是终态，否则会被反复恢复');
+
+  // 关键：不自动重跑 —— agent 可能已经执行过业务动作（下单/表决），重跑会重复提交
+  assert.equal(
+    s.started.filter((x) => x.executionId === exec.executionId).length,
+    0,
+    '恢复时绝不能重新执行 running 的项',
+  );
+
+  // 两处留痕：协作时间线 + 执行审计链
+  const sessionTypes = (await s.events.listAfter('sess-int', 0)).map((e) => e.type);
+  assert.ok(sessionTypes.includes(EVT.executionInterrupted), '会话事件流要有 interrupted');
+  const auditTypes = (await s.executions.events(exec.executionId, 50)).map((e) => e.type);
+  assert.ok(auditTypes.includes('execution.interrupted'), '审计链也要有');
+});
+
+// ---------- 顺序一致性 ----------
+
+test('并发提交：消息顺序 = 队列顺序 = agent 实际处理顺序', async () => {
+  const s = makeStack();
+  await s.openSession('sess-order', 'shared');
+  await s.participantService.add('sess-order', ALICE, { userId: 'bob', role: 'member' });
+
+  const [a, b] = await Promise.all([
+    s.collaboration.submitMessage({ sessionId: 'sess-order', principal: ALICE, prompt: 'A' }),
+    s.collaboration.submitMessage({ sessionId: 'sess-order', principal: BOB, prompt: 'B' }),
+  ]);
+  if (a.mode !== 'shared' || b.mode !== 'shared') throw new Error('应为 shared');
+
+  // ① transcript 顺序（就是参与者看到的顺序）
+  const userMessages = (await s.messages.list('sess-order', ALICE)).filter(
+    (m) => m.actorType === 'user',
+  );
+  const contentById = new Map<string, string>(
+    userMessages.map((m) => [m.messageId, m.content] as const),
+  );
+  const transcriptOrder = userMessages.map((m) => m.content);
+
+  // ② 队列顺序 = queueSequence 升序
+  const queued = (await s.executions.list({ sessionId: 'sess-order' }))
+    .filter((e) => e.sourceMessageId)
+    .sort((x, y) => (x.queueSequence ?? 0) - (y.queueSequence ?? 0));
+  const queueOrder = queued.map((e) => contentById.get(e.sourceMessageId!) ?? '?');
+
+  // ③ agent 实际处理顺序
+  const deadline = Date.now() + 3000;
+  while (s.started.length < 2) {
+    if (Date.now() > deadline) throw new Error('等待队列跑完超时');
+    await sleep(5);
+  }
+  const runOrder = s.started.map((r) => r.prompt);
+
+  assert.deepEqual(queueOrder, transcriptOrder, '队列顺序必须等于 transcript 顺序');
+  assert.deepEqual(runOrder, transcriptOrder, 'agent 处理顺序必须等于 transcript 顺序');
+  // 队列定序键就是消息 sequence，不是另算的时间戳
+  assert.deepEqual(
+    queued.map((e) => e.queueSequence),
+    userMessages.map((m) => m.sequence),
+  );
 });

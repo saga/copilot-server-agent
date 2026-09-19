@@ -5,7 +5,7 @@ import { healthRouter } from './routes/health.js';
 import { apiRouter } from './routes/api.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { sessionService } from './services/session-service.js';
-import { humanTaskService } from './wiring.js';
+import { humanTaskService, collaborationService } from './wiring.js';
 import { startTaskSweeper } from './services/task-sweeper.js';
 import { closeDb } from './db/connection.js';
 import { isShuttingDown, markShuttingDown } from './shutdown.js';
@@ -34,6 +34,28 @@ const server = app.listen(config.port, () => {
     });
   }
 });
+
+/**
+ * 启动恢复：durable 队列 + 崩溃残留状态。
+ *
+ * - `running`/`resuming` → `interrupted`（终态，**不自动重试**：agent 可能已经执行过
+ *   业务动作，重跑会重复提交）
+ * - 仍有 `created` 协作 execution 的 session 重新 drain（队列在库里，但"谁在跑"是进程内的）
+ *
+ * 不阻塞监听：恢复失败只记日志，服务照常可用（待处理的会话会在下一条消息时被唤醒）。
+ */
+void collaborationService
+  .recoverPending()
+  .then((r) => {
+    if (r.interrupted || r.sessions) {
+      console.log(
+        `[server] 启动恢复：interrupted ${r.interrupted} 条执行，重新入队 ${r.sessions} 个会话`,
+      );
+    }
+  })
+  .catch((err: unknown) => {
+    console.error('[server] 启动恢复失败：', err instanceof Error ? err.message : err);
+  });
 
 // 优雅退出：SIGTERM → readiness 先 503（K8s 摘流）→ 关 HTTP（drain SSE/请求）→ 断 sessions → exit
 let shuttingDown = false;

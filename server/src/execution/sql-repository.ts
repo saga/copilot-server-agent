@@ -1,6 +1,11 @@
 import { currentDialect, getDb } from '../db/connection.js';
 import { jsonParam, type SqlRow } from '../db/dialect.js';
-import type { EventRepository, ExecutionRepository, ExecutionStats } from './repository.js';
+import type {
+  AppendExecutionEventInput,
+  EventRepository,
+  ExecutionRepository,
+  ExecutionStats,
+} from './repository.js';
 import type {
   ExecutionEvent,
   ExecutionFilter,
@@ -40,6 +45,8 @@ function toRecord(r: ExecutionRow): ExecutionRecord {
       ? { initiatedByUserId: r.initiated_by_user_id }
       : {}),
     ...(typeof r.source_message_id === 'string' ? { sourceMessageId: r.source_message_id } : {}),
+    // 队列定序键（= 来源消息的 sequence）。读回来才能让单测比对"消息顺序 = 队列顺序"。
+    ...(typeof r.queue_sequence === 'number' ? { queueSequence: r.queue_sequence } : {}),
     kind: (r.kind ?? 'interactive') as ExecutionRecord['kind'],
     status: r.status as ExecutionRecord['status'],
     createdAt: iso(r.created_at) ?? new Date(0).toISOString(),
@@ -77,6 +84,7 @@ const COLUMNS = [
   'user_id',
   'initiated_by_user_id',
   'source_message_id',
+  'queue_sequence',
   'kind',
   'status',
   'input',
@@ -112,6 +120,7 @@ function toValues(rec: ExecutionRecord): unknown[] {
     rec.userId,
     rec.initiatedByUserId ?? null,
     rec.sourceMessageId ?? null,
+    rec.queueSequence ?? null,
     rec.kind,
     rec.status,
     jsonParam(rec.input),
@@ -209,19 +218,54 @@ export class SqlExecutionRepository implements ExecutionRepository {
     return rows.map(toRecord);
   }
 
-  /** 队列里最早创建、仍未开始的那条（created 状态即排队中） */
-  async nextCreated(sessionId: string): Promise<ExecutionRecord | undefined> {
+  /**
+   * 队列取活：FIFO，按 `queue_sequence`（= 来源消息 sequence）升序。
+   *
+   * 不用 created_at 定序：它是毫秒级 ISO 串，两个并发提交的 execution 建行顺序
+   * 可能与消息落库顺序相反，而 FIFO 必须等于 transcript 顺序（用户看到的顺序 =
+   * agent 实际处理顺序）。次级键 execution_id 让两个后端给出同一答案。
+   */
+  async nextQueued(sessionId: string): Promise<ExecutionRecord | undefined> {
     const dialect = d();
-    // 队列取活：FIFO。created_at 是毫秒级 ISO 串，同一毫秒内会并列，
-    // 因此再按 execution_id 定序 —— 它是确定的，两个后端因此给出同一个答案。
     const { rows } = await getDb().query<ExecutionRow>(
       `select * from agent_execution
-       where session_id = ${dialect.ph(1)} and status = 'created'
-       order by created_at asc, execution_id asc limit 1`,
+       where session_id = ${dialect.ph(1)}
+         and status = 'created'
+         and source_message_id is not null
+         and queue_sequence is not null
+       order by queue_sequence asc, execution_id asc limit 1`,
       [sessionId],
     );
     const row = rows[0];
     return row ? toRecord(row) : undefined;
+  }
+
+  async queuedSessionIds(): Promise<string[]> {
+    const { rows } = await getDb().query<SqlRow>(
+      `select distinct session_id from agent_execution
+       where status = 'created' and source_message_id is not null`,
+    );
+    return rows.map((r) => String(r.session_id));
+  }
+
+  /**
+   * 启动恢复：把 running/resuming 落成 interrupted 终态。
+   * duration_ms 刻意不补：进程被 kill，这段"时长"没有意义，留空比编一个数字诚实。
+   */
+  async interruptActive(reason: string): Promise<ExecutionRecord[]> {
+    const dialect = d();
+    const now = new Date().toISOString();
+    const { rows } = await getDb().query<ExecutionRow>(
+      `update agent_execution
+       set status = 'interrupted',
+           updated_at = ${dialect.ph(1)},
+           completed_at = coalesce(completed_at, ${dialect.ph(1)}),
+           error = coalesce(error, ${dialect.ph(2)})
+       where status in ('running', 'resuming')
+       returning *`,
+      [dialect.tsParam(now), reason],
+    );
+    return rows.map(toRecord);
   }
 
   async stats(): Promise<ExecutionStats> {    const dialect = d();
@@ -249,20 +293,30 @@ export class SqlExecutionRepository implements ExecutionRepository {
 }
 
 export class SqlEventRepository implements EventRepository {
-  async append(input: Omit<ExecutionEvent, 'eventId'>): Promise<ExecutionEvent> {
+  /**
+   * sequence 从 `agent_execution.event_sequence` 原子自增分配。
+   *
+   * 不用 `max(sequence)+1`：两个并发 append 会读到同一个 max、算出同一个序号，
+   * 后到的被 `on conflict do nothing` 静默丢弃 —— 但调用方拿到的却是一个"成功"的
+   * 序号，于是审计链少一条事件而没人知道。`update ... returning` 天然串行化同一 execution。
+   */
+  async append(input: AppendExecutionEventInput): Promise<ExecutionEvent> {
     const dialect = d();
     return getDb().transaction(async (tx) => {
-      const seq = await tx.query<SqlRow>(
-        `select coalesce(max(sequence), 0) + 1 as seq from execution_event
-         where execution_id = ${dialect.ph(1)}`,
+      const bumped = await tx.query<SqlRow>(
+        `update agent_execution
+         set event_sequence = event_sequence + 1
+         where execution_id = ${dialect.ph(1)}
+         returning event_sequence`,
         [input.executionId],
       );
-      const sequence = Number(seq.rows[0]?.seq ?? 1);
+      const sequence = Number(bumped.rows[0]?.event_sequence);
+      if (!sequence) throw new Error(`execution 不存在："${input.executionId}"`);
+
       const createdAt = input.createdAt ?? new Date().toISOString();
       const { rows } = await tx.query<SqlRow>(
         `insert into execution_event (execution_id, sequence, type, actor_type, actor_id, payload, created_at)
          values (${dialect.ph(1)}, ${dialect.ph(2)}, ${dialect.ph(3)}, ${dialect.ph(4)}, ${dialect.ph(5)}, ${dialect.ph(6)}, ${dialect.ph(7)})
-         on conflict (execution_id, sequence) do nothing
          returning event_id`,
         [
           input.executionId,
@@ -274,8 +328,15 @@ export class SqlEventRepository implements EventRepository {
           dialect.tsParam(createdAt),
         ],
       );
+      const eventId = rows[0]?.event_id;
+      // 序号来自原子自增，冲突说明有并发写入绕过了分配器 —— 抛错，别伪装成成功
+      if (eventId === undefined || eventId === null) {
+        throw new Error(
+          `execution_event 写入失败（序号冲突？）：execution=${input.executionId} sequence=${sequence}`,
+        );
+      }
       return {
-        eventId: String(rows[0]?.event_id ?? `${input.executionId}-${sequence}`),
+        eventId: String(eventId),
         executionId: input.executionId,
         sequence,
         type: input.type,

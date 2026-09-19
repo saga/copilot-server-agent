@@ -57,6 +57,45 @@ export interface CollaborationServiceDeps {
 export class CollaborationService {
   constructor(private readonly deps: CollaborationServiceDeps) {}
 
+  /**
+   * 启动恢复（Pod 重启后调一次）。
+   *
+   * 两件事，缺一不可：
+   *   1. `running`/`resuming` 的执行落成 `interrupted` 终态 —— 进程被杀时它永远停在 running，
+   *      而**不能自动重试**（agent 可能已经执行过业务动作，重跑会重复提交）。
+   *   2. 重新 drain 还有 `created` 协作 execution 的 session —— 队列数据在库里是 durable 的，
+   *      但"谁在跑"（`SessionCoordinator.chains`）是进程内的，重启后没有任何东西会主动唤醒它。
+   *      持久化了队列却没有恢复 worker，等于没 durable。
+   *
+   * 单副本前提下由 index.ts 在 listen 之后调用；多副本需要先落实 DB 租约，否则会重复 drain。
+   */
+  async recoverPending({ reason }: { reason?: string } = {}): Promise<{
+    interrupted: number;
+    sessions: number;
+  }> {
+    const interrupted = await this.deps.executions.recoverInterrupted(reason);
+    for (const rec of interrupted) {
+      await this.deps.events.append({
+        sessionId: rec.sessionId,
+        type: EVT.executionInterrupted,
+        actorType: 'system',
+        executionId: rec.executionId,
+        payload: { phase: 'startup' },
+      });
+    }
+
+    const sessionIds = await this.deps.executions.queuedSessionIds();
+    for (const sessionId of sessionIds) {
+      // 逐个 drain，互不阻塞：一个 session 的恢复不该卡住其他 session
+      void this.deps.coordinator.drain(sessionId).catch((err) => {
+        console.error(
+          `[collaboration] 恢复 drain 失败 session=${sessionId}：${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+    return { interrupted: interrupted.length, sessions: sessionIds.length };
+  }
+
   async submitMessage(input: SubmitMessageInput): Promise<SubmitMessageResult> {
     const access = await this.deps.access.assertCanSend(input.sessionId, input.principal);
 
@@ -108,6 +147,8 @@ export class CollaborationService {
       ...(input.model ? { model: input.model } : {}),
       streaming: false,
       sourceMessageId: message.messageId,
+      // 队列顺序 = 消息顺序：并发提交时两边的先后可能不一致，必须显式带上消息序号
+      queueSequence: message.sequence,
     });
     await this.deps.messages.attachExecution(message.messageId, execution.executionId);
 

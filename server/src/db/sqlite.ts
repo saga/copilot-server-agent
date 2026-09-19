@@ -10,7 +10,7 @@ import {
   type SqlExecutor,
   type SqlRow,
 } from './dialect.js';
-import { SQLITE_COLUMN_UPGRADES, SQLITE_SCHEMA_SQL } from './sqlite-schema.js';
+import { SQLITE_COLUMN_UPGRADES, SQLITE_INDEX_SQL, SQLITE_SCHEMA_SQL } from './sqlite-schema.js';
 
 /**
  * SQLite 后端（默认）。用 Node 内置的 `node:sqlite`，不引入任何原生依赖。
@@ -90,8 +90,12 @@ export class SqliteDatabase implements SqlExecutor {
     this.db.exec('pragma journal_mode = WAL');
     this.db.exec('pragma foreign_keys = ON');
     this.db.exec('pragma busy_timeout = 5000');
+    // 顺序不能换：建表 → 补列 → 建索引。
+    // 索引可能引用补列才出现的列（例如 queue_sequence），跟建表一起执行会在老库上报
+    // `no such column`，服务直接起不来。
     this.db.exec(SQLITE_SCHEMA_SQL);
     this.applyColumnUpgrades();
+    this.db.exec(SQLITE_INDEX_SQL);
     this.loadExtensions();
   }
 

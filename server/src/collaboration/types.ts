@@ -21,13 +21,22 @@ export type SessionParticipantRole = 'owner' | 'member' | 'observer';
 export type SessionParticipantStatus = 'active' | 'left' | 'removed';
 
 /**
- * 会话权限：固定四个，不做动态 ACL。
+ * 会话权限：固定五个，不做动态 ACL。
  * 会话角色、业务角色、审批策略、工具策略已经是四层，再叠一套 permission DSL 会失控。
+ *
+ * `manage_session` 与 `manage_members` 刻意分开：
+ * 前者改的是**会话能力边界**（model / agents / MCP / hooks / systemMessage —— 全体参与者共用），
+ * 后者只是增减成员。member 能 send 不等于能改共享会话的能力集会——那会改变所有人的工具与数据边界。
  */
-export type SessionPermission = 'view' | 'send' | 'manage_members' | 'delete';
+export type SessionPermission =
+  | 'view'
+  | 'send'
+  | 'manage_members'
+  | 'manage_session'
+  | 'delete';
 
 const ROLE_PERMISSIONS: Record<SessionParticipantRole, readonly SessionPermission[]> = {
-  owner: ['view', 'send', 'manage_members', 'delete'],
+  owner: ['view', 'send', 'manage_members', 'manage_session', 'delete'],
   member: ['view', 'send'],
   observer: ['view'],
 };
@@ -97,6 +106,8 @@ export const SESSION_EVENT_TYPES = {
   executionFailed: 'execution.failed',
   executionCancelled: 'execution.cancelled',
   executionWaiting: 'execution.waiting',
+  /** 进程在 turn 中途退出：状态由 running 落成 interrupted，等人工决定是否重跑（不自动重试） */
+  executionInterrupted: 'execution.interrupted',
   assistantMessage: 'assistant.message',
   humanTaskCreated: 'human_task.created',
   humanTaskResolved: 'human_task.resolved',

@@ -11,11 +11,20 @@
 alter table agent_session add column if not exists collaboration_mode varchar(32) not null default 'single';
 -- session 级消息序号分配器（单人模式不使用）
 alter table agent_session add column if not exists message_sequence integer not null default 0;
+-- session 级事件序号分配器：session_event.sequence 由它原子自增，不用 max()+1（并发下会重号）
+alter table agent_session add column if not exists event_sequence integer not null default 0;
 
 -- 发起人（shared 会话里是发消息的 participant，不是 session owner）
 alter table agent_execution add column if not exists initiated_by_user_id varchar(128);
 -- 触发本次执行的 session 消息（审计链：session message → execution）
 alter table agent_execution add column if not exists source_message_id varchar(64);
+-- 队列定序键：镜像来源消息的 sequence（created_at 并发下会与消息顺序相反）。仅协作 execution 有值。
+alter table agent_execution add column if not exists queue_sequence integer;
+-- execution 级事件序号分配器：execution_event.sequence 由它原子自增
+alter table agent_execution add column if not exists event_sequence integer not null default 0;
+
+-- 队列取活：where session_id=? and status='created' order by queue_sequence
+create index if not exists idx_execution_queue on agent_execution(session_id, status, queue_sequence);
 
 create table if not exists session_participant (
   session_id varchar(128) not null references agent_session(session_id) on delete cascade,

@@ -91,6 +91,10 @@ sessionRouter.get('/:id', async (req, res, next) => {
 /**
  * POST /api/sessions/:id/resume — 恢复磁盘会话，可附带重配（BYOK 凭证服务端重传）。
  * 不接受 collaborationMode：模式是授权、并发、可见性、传输四件事的根，改了会全盘失效。
+ *
+ * 要 `manage_session` 而不是 `send`：resume 可以重配 model / agents / MCP / hooks /
+ * systemMessage —— 那是**整个会话的能力边界**，全体参与者共用。member 能发言不等于
+ * 能改所有人的工具集与数据范围（能 send 就放行会让 shared 会话被任一成员改配置）。
  */
 sessionRouter.post('/:id/resume', async (req, res, next) => {
   try {
@@ -101,7 +105,7 @@ sessionRouter.post('/:id/resume', async (req, res, next) => {
         error: 'resume 不能修改 collaborationMode（会话模式创建后不可修改）',
       });
     }
-    const access = await sessionAccessService.assertCanSend(id, principalOf(req));
+    const access = await sessionAccessService.assertCanManageSession(id, principalOf(req));
     const body = sessionConfigSchema.parse(req.body ?? {});
     const { mcpServers, ...rest } = body;
     const session = await sessionService.resumeSession(

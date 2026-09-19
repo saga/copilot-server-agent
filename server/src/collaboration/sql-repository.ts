@@ -240,21 +240,32 @@ export class SqlMessageRepository implements MessageRepository {
 }
 
 export class SqlSessionEventRepository implements SessionEventRepository {
+  /**
+   * sequence 从 `agent_session.event_sequence` 原子自增分配。
+   *
+   * 不用 `max(sequence)+1`：两个并发 append 会读到同一个 max、算出同一个序号，
+   * 后到的被 `on conflict do nothing` 静默丢弃 —— 但调用方拿到的却是一个"成功"的序号，
+   * 于是 SSE 游标里永远缺一条、客户端也不会报错。`update ... returning` 天然把
+   * 同一 session 的分配串行化（与 agent_message.sequence 同一套做法）。
+   */
   async append(input: AppendSessionEventInput): Promise<SessionEvent> {
     const dialect = d();
     return getDb().transaction(async (tx) => {
-      const seq = await tx.query<SqlRow>(
-        `select coalesce(max(sequence), 0) + 1 as seq from session_event
-         where session_id = ${dialect.ph(1)}`,
+      const bumped = await tx.query<SqlRow>(
+        `update agent_session
+         set event_sequence = event_sequence + 1
+         where session_id = ${dialect.ph(1)}
+         returning event_sequence`,
         [input.sessionId],
       );
-      const sequence = Number(seq.rows[0]?.seq ?? 1);
+      const sequence = Number(bumped.rows[0]?.event_sequence);
+      if (!sequence) throw new Error(`session 不存在："${input.sessionId}"`);
+
       const createdAt = input.createdAt;
       const { rows } = await tx.query<SqlRow>(
         `insert into session_event
            (session_id, sequence, type, actor_type, actor_id, execution_id, message_id, payload, created_at)
          values (${dialect.ph(1)},${dialect.ph(2)},${dialect.ph(3)},${dialect.ph(4)},${dialect.ph(5)},${dialect.ph(6)},${dialect.ph(7)},${dialect.ph(8)},${dialect.ph(9)})
-         on conflict (session_id, sequence) do nothing
          returning event_id`,
         [
           input.sessionId,
@@ -268,8 +279,15 @@ export class SqlSessionEventRepository implements SessionEventRepository {
           dialect.tsParam(createdAt),
         ],
       );
+      const eventId = rows[0]?.event_id;
+      // 序号来自原子自增，冲突说明有并发写入绕过了分配器 —— 抛错，别伪装成成功
+      if (eventId === undefined || eventId === null) {
+        throw new Error(
+          `session_event 写入失败（序号冲突？）：session=${input.sessionId} sequence=${sequence}`,
+        );
+      }
       return {
-        eventId: String(rows[0]?.event_id ?? `${input.sessionId}-${sequence}`),
+        eventId: String(eventId),
         sessionId: input.sessionId,
         sequence,
         type: input.type,

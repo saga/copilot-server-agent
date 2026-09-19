@@ -104,6 +104,44 @@ export class SessionAccessService {
     return this.assertCan(sessionId, principal, 'manage_members');
   }
 
+  /**
+   * 改会话能力边界（resume / 重配 model、agents、MCP、hooks、systemMessage）。
+   * 只有 owner：这些配置对全体参与者生效，member 能 send 不等于能改所有人的能力集。
+   */
+  assertCanManageSession(sessionId: string, principal: Principal): Promise<ResolvedSessionAccess> {
+    return this.assertCan(sessionId, principal, 'manage_session');
+  }
+
+  /**
+   * 对某个 execution 下达命令（取消 / 提出业务动作）。
+   *
+   * 只判 `view` 是不够的 —— 看得见不等于能指挥别人的执行。规则：
+   *   owner    可操作该会话内任意 execution
+   *   member   只能操作自己发起的（initiatedByUserId）
+   *   observer 一律不可
+   *
+   * 判定放在这里而不是路由：它同时依赖会话角色与 execution 的发起人，
+   * 散在路由里迟早出现"某个端点只判了 view"。
+   */
+  async assertCanCommandExecution(
+    sessionId: string,
+    principal: Principal,
+    execution: { initiatedByUserId?: string },
+  ): Promise<ResolvedSessionAccess> {
+    const access = await this.resolve(sessionId, principal);
+    if (access.role === 'owner') return access;
+    if (access.role !== 'member') {
+      throw new Error(`无权操作该 execution：当前会话角色 ${access.role}（只读）`);
+    }
+    // member 只能指挥自己发起的那条；发起人未知（历史行）时保守拒绝
+    if (!execution.initiatedByUserId || execution.initiatedByUserId !== principal.userId) {
+      throw new Error(
+        `无权操作该 execution：只有会话 owner 或发起人本人可以（发起人 ${execution.initiatedByUserId ?? '未知'}）`,
+      );
+    }
+    return access;
+  }
+
   assertCanDelete(sessionId: string, principal: Principal): Promise<ResolvedSessionAccess> {
     return this.assertCan(sessionId, principal, 'delete');
   }
@@ -135,5 +173,6 @@ const PERMISSION_LABEL: Record<SessionPermission, string> = {
   view: '查看',
   send: '发消息到',
   manage_members: '管理成员',
+  manage_session: '管理会话配置',
   delete: '删除',
 };

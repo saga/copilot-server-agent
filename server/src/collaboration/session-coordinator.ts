@@ -175,12 +175,12 @@ export class SessionCoordinator {
             delta,
             executionId: execution.executionId,
           }),
-        onAssistantMessage: (content) => {
-          void this.recordAssistantMessage(execution, content).catch((err) => {
-            console.warn(`[coordinator] 写入 agent 消息失败：${errMsg(err)}`);
-          });
-        },
       });
+      // 顺序不能反：agent 终稿先落 transcript，再落 execution 终态。
+      // 之前这里用 onAssistantMessage 里 `void` 掉一个异步写，与 complete() 竞速，
+      // 时间线会变成「execution.completed → agent 消息」，下一条 execution 甚至可能插到中间。
+      // 终稿正文以 runTurn 的返回值为准（onAssistantMessage 只用于实时 UI，不做 durable 写）。
+      await this.recordAssistantMessage(execution, result.content);
       await this.deps.executions.complete(execution.executionId, {
         contentChars: result.chars || result.content.length,
         result: { content: result.content },
@@ -205,11 +205,15 @@ export class SessionCoordinator {
     }
   }
 
-  /** agent 终稿进同一条会话时间线；随后所有人从事件流里看到 */
+  /**
+   * agent 终稿进同一条会话时间线；随后所有人从事件流里看到。
+   * 空正文不写：agent 只调工具、没产出文字时留一条空消息只会污染 transcript。
+   */
   private async recordAssistantMessage(
     execution: ExecutionRecord,
     content: string,
   ): Promise<void> {
+    if (!content.trim()) return;
     const message = await this.deps.messages.fromAgent({
       sessionId: execution.sessionId,
       tenantId: execution.tenantId,

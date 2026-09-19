@@ -81,6 +81,58 @@ export class SessionEventService {
     };
   }
 
+  /**
+   * 回放 + 实时接续（SSE 的原子接管）。**顺序不能颠倒**：
+   *
+   *   subscribe（此刻起把新事件缓冲）→ 读库回放 → 放开缓冲 → 进入实时
+   *
+   * 若反过来先读库再订阅，中间落库的事件会永久丢失：
+   *
+   *   listAfter() →（事件落库 + broadcast）→ subscribe()   ← 这条永远发不出去
+   *
+   * 按 sequence 去重只能防**重复**，防不了**丢失** —— 这是两个不同的问题，
+   * 所以这里既做缓冲接续，也在放开时按 sequence 去重（回放与缓冲必然重叠）。
+   * 瞬时事件（sequence=0，如 assistant.delta）不参与去重，也不落库。
+   *
+   * 返回取消订阅的函数。
+   */
+  async subscribeWithReplay(
+    sessionId: string,
+    afterSequence: number,
+    listener: SessionEventListener,
+  ): Promise<() => void> {
+    let replaying = true;
+    const buffered: SessionEvent[] = [];
+    /** 已交付的最大序号。回放先推进它，之后放开缓冲时据此去掉重叠部分 */
+    let delivered = afterSequence;
+
+    const deliver = (event: SessionEvent): void => {
+      if (event.sequence > 0 && event.sequence <= delivered) return;
+      if (replaying) {
+        buffered.push(event);
+        return;
+      }
+      if (event.sequence > 0) delivered = Math.max(delivered, event.sequence);
+      listener(event);
+    };
+
+    // ① 先订阅：从这一刻起，新事件进缓冲而不是丢进虚空
+    const unsubscribe = this.subscribe(sessionId, deliver);
+    try {
+      // ② 读库回放（严格大于游标）
+      for (const event of await this.listAfter(sessionId, afterSequence)) {
+        if (event.sequence > 0 && event.sequence <= delivered) continue;
+        if (event.sequence > 0) delivered = Math.max(delivered, event.sequence);
+        listener(event);
+      }
+    } finally {
+      replaying = false;
+    }
+    // ③ 放开缓冲：与回放重叠的按 sequence 去掉，其余的按实时事件交付
+    for (const event of buffered.splice(0)) deliver(event);
+    return unsubscribe;
+  }
+
   subscriberCount(sessionId: string): number {
     return this.listeners.get(sessionId)?.size ?? 0;
   }

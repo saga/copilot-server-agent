@@ -140,12 +140,16 @@ export class MemoryMessageRepository implements MessageRepository {
 
 export class MemorySessionEventRepository implements SessionEventRepository {
   private rows = new Map<string, SessionEvent[]>();
+  /** 与 SQL 侧的 agent_session.event_sequence 同义：独立计数器，不靠数组长度推算 */
+  private seq = new Map<string, number>();
 
   async append(input: AppendSessionEventInput): Promise<SessionEvent> {
     const list = this.rows.get(input.sessionId) ?? [];
+    const sequence = (this.seq.get(input.sessionId) ?? 0) + 1;
+    this.seq.set(input.sessionId, sequence);
     const event: SessionEvent = {
       ...clone(input),
-      sequence: list.length + 1,
+      sequence,
       eventId: `sev_${randomUUID()}`,
     };
     list.push(event);
@@ -167,5 +171,6 @@ export class MemorySessionEventRepository implements SessionEventRepository {
 
   clear(): void {
     this.rows.clear();
+    this.seq.clear();
   }
 }

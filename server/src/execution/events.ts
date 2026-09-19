@@ -21,7 +21,6 @@ export class ExecutionEventLog {
   }): Promise<ExecutionEvent> {
     return this.repo.append({
       executionId: input.executionId,
-      sequence: 0, // 由 repository 分配（PG 取 max+1，内存取数组长度+1）
       type: input.type,
       actorType: input.actorType,
       ...(input.actorId ? { actorId: input.actorId } : {}),

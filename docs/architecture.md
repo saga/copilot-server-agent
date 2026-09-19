@@ -83,6 +83,8 @@ Session ── Participant（owner / member / observer）
 
 ## 3. Session 访问模型（single / shared）
 
+### 3.1 single / shared
+
 会话的访问模型在创建时确定，**生命周期内不变**：
 
 | | `single`（缺省） | `shared` |
@@ -95,6 +97,8 @@ Session ── Participant（owner / member / observer）
 字段名叫 `collaborationMode`，刻意避开 SDK 的 `mode: "empty"`：那是 runtime / 工具模式，
 这是业务会话模式，两者不能混。它属于业务会话元数据（`agent_session` 的列），
 **不属于 `PersistedSessionConfig`** —— 后者是给 SDK 的 resume 配置。
+
+### 3.2 Participant 与 Session Role
 
 ```text
 POST /:id/chat
@@ -109,86 +113,186 @@ SessionAccessService.assertCanSend
                  agent turn → 终稿进 agent_message + session_event
 ```
 
-### 角色与权限
-
 会话角色（owner / member / observer）与业务角色（risk / compliance / …）是两层，不能互相替代：
 
-| 会话角色 | view | send | manage_members | delete |
-|---------|------|------|----------------|--------|
-| owner | ✓ | ✓ | ✓ | ✓ |
-| member | ✓ | ✓ | | |
-| observer | ✓ | | | |
+| 会话角色 | view | send | manage_members | manage_session | delete |
+|---------|------|------|----------------|----------------|--------|
+| owner | ✓ | ✓ | ✓ | ✓ | ✓ |
+| member | ✓ | ✓ | | | |
+| observer | ✓ | | | | |
 
-权限固定这四档，不做动态 ACL —— 会话角色、业务角色、审批策略、工具策略已经是四层，
+`manage_session` 单独一档而不是并入 `send`：`resume` 可以重配 model / agents / MCP / hooks /
+systemMessage —— 那是**整个会话的能力边界**，全体参与者共用同一份。member 能发言不等于
+能改所有人的工具集与数据范围。`POST /:id/resume` 因此要 `manage_session`（owner-only）。
+
+权限固定这五档，不做动态 ACL —— 会话角色、业务角色、审批策略、工具策略已经叠了好几层，
 再叠一套 permission DSL 会失控。成员资格由 owner 控制（邀请制）：参与者共享同一个
 conversation / workspace / data scope / 工具与 MCP 能力，所以"这个人的数据权限是否覆盖
 本会话的数据范围"这件事发生在 owner 决定邀请的那一刻。
 
 判定只有一条路径：`SessionAccessService.resolve(sessionId, principal) → { mode, role, owner }`，
-再经 `assertCanView / assertCanSend / assertCanManageMembers / assertCanDelete`。
+再经 `assertCanView / assertCanSend / assertCanManageMembers / assertCanManageSession / assertCanDelete`。
 `SessionRegistry.assertOwner` 只回答"你是 owner 吗"，不再承担"你能做什么"。
 
-### 不变式
+**会话读取的真相源是 registry（`agent_session`），不是 runtime 的磁盘索引**：
+会话的**存在与归属**以 registry 为准，runtime 的 `client.listSessions()` 只用来补充
+`startTime / modifiedTime / summary / context`、以及标记 `attached`。反过来（拿磁盘列表 ∩
+允许集合）会漏会话：多副本部署下每个 Pod 有自己的 runtime 磁盘索引，刚创建或由别的副本创建的
+会话不在本 Pod 的列表里，却明明在共享的 registry 里 —— 用户会在会话列表里看不到自己的会话，
+`GET /sessions/:id` 也会误报 404。registry 有记录就直接返回，磁盘索引缺失只说明本 Pod 的
+runtime 还没见过它。
 
-1. `collaborationMode` 创建后不可修改：`resume` 传模式返回 400；存储层 `update` 不写这一列，
-   只有"单→共享"迁移脚本能经 `setCollaborationMode` 改（要求会话空闲、无在途执行、owner 确认）。
+### 3.3 Session Access / Execution Command / Business Authorization
+
+授权逐层收窄，三层不能互相替代：
+
+```text
+Session Access          能不能进这个会话、能不能发言          （3.2 的五档权限）
+      ↓
+Execution Command       能不能指挥这一个 execution          （run / cancel / propose action）
+      ↓
+Business Authorization  能不能做这个业务动作、要不要人批、谁有资格批
+```
+
+**指挥一次 execution 是独立的一层**，不属于 `view / send / manage_members / manage_session / delete`
+里的任何一档，判定走 `SessionAccessService.assertCanCommandExecution(sessionId, principal, execution)`：
+
+- owner：可指挥本会话任意 execution；
+- member：只能指挥**自己发起**的（`initiated_by_user_id` 是自己）；
+- observer：不可。
+
+`view` 是"看得见"，`command` 是"能动手"。observer 有 `view` 不等于有 `run / cancel / propose-action`：
+只判 `view` 会让 observer 取消别人的执行、或对别人的 execution 提 `submit_proxy_vote` 这类业务意图。
+`POST /executions/:id/run` 另按 `send` 判定 —— 能看见不等于能让执行跑起来。
+本层通过与否**都不影响第三层**：高风险动作照旧要过 ActionPolicy 与人工审批（见第 6 节），
+只是连会话门都进不来的请求根本走不到那一层。
+
+### 3.4 Shared Session 不变式
+
+1. `collaborationMode` 创建后不可修改：`resume` 传模式返回 400；存储层 `update` 不写这一列。
+   改模式的唯一入口是 `SessionRegistry.setCollaborationMode()`（一条裸 `update collaboration_mode`），
+   它**当前不暴露为 HTTP API、也没有调用方**，只预留给受控迁移。
+   要在生产里用它做 `single → shared` 迁移，必须先补上 owner authorization、会话空闲、
+   无在途 execution 三项前置检查 —— 这三项**目前不在代码里**，是迁移脚本自身要承担的责任，
+   不能指望 registry 兜住（`setCollaborationMode` 是无条件的）。
 2. shared 会话只有一个 Copilot runtime session，**同一时刻最多跑一个 agent turn**。
-3. 参与人共享同一个 conversation / workspace / data scope 与 session 级工具、MCP 能力。
+3. **session 级能力是全体 active participant 的共同边界**：conversation / workspace / data scope /
+   session 级工具与 MCP，participant 不因自己的 membership 获得任何额外 MCP / skill / workspace /
+   data capability；要被加进来，得先满足本会话的 data / capability eligibility。
+   也就是 shared session = shared data boundary，这一点在邀请那一刻定死。
 4. 会话成员资格只给**协作访问权**，不给业务授权：审批仍由 `Principal.roles` → `ApprovalPolicy` 决定。
    加进共享会话 ≠ 获得高风险动作的执行权。
-5. 每次 execution 都记发起人，且与数据归属分开：
-   `agent_execution.user_id` 是**会话 owner**（resume 的归属校验、数据范围），
+5. **session owner 永远不是 execution actor 的隐式替代。** 每次 human-initiated execution 都必须
+   记录真实发起人：`agent_execution.user_id` 是**会话 owner**（resume 的归属校验、数据范围），
    `initiated_by_user_id` 是**发起人**（审计、以及 SoD"发起人不能自批"）。
    session owner 从不被当作 execution 的 actor。
 6. execution / human task 的可见性跟随它所属的 session：shared 会话里，参与者能看到同会话中
    别人发起的 execution 与待办任务 —— 这正是协作的语义，按 `tenantId/userId` 收窄会漏掉它们。
+7. 改会话配置（`resume`）与指挥一次 execution 是两件不同的事，判定分开：
+   前者 owner-only（`manage_session`），后者 owner 可指挥任意、member 只能指挥自己发起的（见 3.3）。
+8. 读接口的准入是"管理令牌 = 可见范围放大器"，不是独立闸门（见第 10 节）：
+   带 `x-admin-token` 看全量，否则退到会话可见性；否则配了令牌的部署里，
+   参与者读不到自己会话的执行时间线，而会话详情却读得到。
 
-### 队列
+### 3.5 Shared Message / Execution Queue
+
+`agent_message` 是应用层 transcript，**不是 Copilot history 的替代品**：Copilot history 是
+agent context，这里记的是"谁在什么时候说了什么"，用于协作展示与审计（runtime session 丢了也查得到）。
+`client_message_id` 是幂等键：多人 UI 必然出现"已保存但响应丢失 → 客户端重试"，
+没有它就会为同一条消息跑两次 agent turn；命中时沿用已有的消息与 execution，不再排队。
+`sequence` 由 `agent_session.message_sequence` 原子自增分配（见 3.6）。
 
 队列就是 `agent_execution` 本身：`status = 'created'` 即"排队中"，不需要另建队列表
 （多一张表就多一处不一致要维护）。`SessionCoordinator` 对同一 session 的 drain 串行排队
-（链式 promise，因此不会丢唤醒），取活按 `created_at, execution_id` 定序
-（时间戳毫秒级会并列，所以带一个确定的次级键），跑之前把 execution 置 `running`。
+（链式 promise，因此不会丢唤醒），跑之前把 execution 置 `running`。
+
+**什么算排队项**：`status = 'created'` **且** `source_message_id is not null`。
+后者是"这条 execution 由某条会话消息触发"的标记 —— 只有协作路径会有。手工/内部创建的
+后台 job 没有来源消息，不该被协作调度器顺手跑掉。
+
+**按什么定序**：`queue_sequence`（镜像来源消息的 `sequence`），不是 `created_at`。
+`created_at` 是毫秒串，并发提交时会与消息顺序相反；而 FIFO 必须与 transcript 顺序一致 ——
+**用户看到的顺序就是 agent 处理的顺序**。用同一个序号还顺带让"消息序号 / 队列序号 /
+agent 执行顺序"三者可互相印证，排查时不需要另做时间对齐。
 
 shared 的 prompt 来自它绑定的会话消息（`execution.sourceMessageId → agent_message.content`）：
 execution 上只留脱敏预览，不能当输入用。同一会话并发恒为 1，跨会话仍可并行
 （外层还有全局 semaphore 兜底）。
 
-这份"谁在跑"是**进程内状态**：单副本部署成立。多副本需要 DB 租约 + runtime affinity，
-见第 7 节。
+**启动恢复**：`SessionCoordinator.chains` 是进程内状态，Pod 重启后内存里的 worker 就没了 ——
+队列（DB 行）还在，但没人会去 drain 它。所以 `index.ts` 在 `listen` 之后跑一次
+`CollaborationService.recoverPending()`：
 
-### 消息与事件
+- `running` / `resuming` → 终态 `interrupted`（**不自动重试**）。理由：崩溃时那次 turn
+  可能已经把业务动作做出去了（下单、投票、发邮件），自动重跑会二次执行。标志"服务中断过、
+  结果未知、需要人看一眼"，重跑必须由人显式发起。
+- `created`（排队项）→ 按 `queue_sequence` 重新入队 drain。
 
-- `agent_message` 是应用层 transcript，**不是 Copilot history 的替代品**：Copilot history 是
-  agent context，这里记的是"谁在什么时候说了什么"，用于协作展示与审计（runtime session 丢了也查得到）。
-- `client_message_id` 是幂等键：多人 UI 必然出现"已保存但响应丢失 → 客户端重试"，
-  没有它就会为同一条消息跑两次 agent turn。命中时沿用已有 execution，不再排队。
-- `sequence` 从 `agent_session.message_sequence` **原子自增**分配（`update ... returning`），
-  不用时间戳 —— 并发下时间戳会并列，做不了唯一次序。
-- `session_event` 与 `execution_event` 职责不同、不互相取代（见第 8 节）。token 级
-  `assistant.delta` 只走 SSE、不落库：每个 delta 写一行会造成巨大写放大。
-- 事件 `sequence` 同 session 内单调递增，客户端用 `?after=` / `Last-Event-ID` 断线续传；
-  进程内广播只在单副本成立，多副本要把 publish 换成 PG 通知或消息总线。
+多副本下这份"谁在跑"仍是进程内状态，需要 DB 租约 + runtime affinity，见第 7 节。
+
+### 3.6 SessionEvent
+
+`session_event` 与 `execution_event` 职责不同、不互相取代（见第 8 节）：前者是协作时间线
+（谁发言、谁加入、队列怎么动，供 UI 与断线续传），后者是长期保存的审计证据链。
+token 级 `assistant.delta` 只走 SSE、不落库（每个 delta 写一行会造成巨大写放大）。
+事件 `sequence` 同 session 内单调递增，客户端用 `?after=` / `Last-Event-ID` 断线续传。
+
+**序号由分配器列原子自增给出，不用 `select max(sequence)+1`**：
+
+```text
+agent_message.sequence     ← agent_session.message_sequence     update ... set x = x + 1 returning
+session_event.sequence     ← agent_session.event_sequence       update ... set x = x + 1 returning
+execution_event.sequence   ← agent_execution.event_sequence     update ... set x = x + 1 returning
+```
+
+`max(sequence)+1` 在并发下会让两个写入算出同一个号，再靠 `on conflict do nothing` 兜住就等于
+**静默丢事件**，而且调用方拿到的还是一个库里并不存在的序号（广播出去的事件 id 与实际存储对不上）。
+序号冲突必须抛错。
+
+**`unique(session_id, sequence)` 是最后一道护栏，不是序号生成机制**：它只保证不重复写进去，
+保证不了分配正确 —— 把唯一约束当序号来源，正是上面那个 bug 的成因（见第 7 节）。
+
+内存实现（`COPILOT_STATE_BACKEND=memory`）用独立的计数器，不用 `list.length + 1` ——
+事件环形缓冲会裁剪旧事件，长度回退就会重号。
+
+agent 的终稿正文由 `runTurn()` 的**返回值**写入 transcript，且在 execution 落 `completed`
+**之前**完成。不能用 `void` 开一个异步回调去写：那样它和 `execution.complete()` 谁先落库不确定，
+时间线会错位（完成事件先于它自己的正文）。流式 `onMessage` 只服务实时 UI，不承担持久化。
+
+**SSE 断线续传要先订阅再回放**（`subscribeWithReplay`）：先 subscribe（新事件进缓冲区）→
+再按 `after` 从库里回放 → 最后 flush 缓冲区并按 sequence 去重。反过来的
+「先 list 再 subscribe」会漏掉两步之间写入的那条事件（既不在回放结果里，也不在订阅之后）。
+进程内广播只在单副本成立，多副本要把 publish 换成 PG 通知或消息总线（见第 7 节）。
 
 ## 4. Execution 状态机
 
 ```text
 CREATED ──→ RUNNING ──→ COMPLETED / FAILED / CANCELLED
-              │
-              ├─→ WAITING_FOR_INPUT ──→ RESUMING ──→ RUNNING
-              │                      └→ CANCELLED / EXPIRED
-              └─→ WAITING_FOR_APPROVAL ──→ RESUMING ──→ RUNNING
-                                      └→ REJECTED / CANCELLED / EXPIRED
+   │          │
+   │          └─→ INTERRUPTED（启动恢复：进程崩过，结果未知）
+   │
+   ├─→ WAITING_FOR_INPUT ──→ RESUMING ──→ RUNNING
+   │                      └→ CANCELLED / EXPIRED
+   └─→ WAITING_FOR_APPROVAL ──→ RESUMING ──→ RUNNING
+                           └→ REJECTED / CANCELLED / EXPIRED
 ```
 
 - `ExecutionKind`：`interactive`（HTTP chat）/ `job`（后台作业）/ `workflow`
 - 非法迁移直接抛错（`ALLOWED_TRANSITIONS`）
+- 上面是**状态机允许的迁移**，不等于每条都有人驱动：`WAITING_FOR_INPUT → RESUMING → RUNNING`
+  目前没有驱动者（`resuming` 是悬挂态），见 5.2；approval 分支是闭环的
 - `created` 在 shared 会话里额外承担"排队中"的语义（见第 3 节）
-- **等待人工期间不持有 session lock**：持久化状态 → `session.disconnect()` → 释放锁；
-  审批完成后 `resumeSession` 继续（`resumeExecutionSession()` 用持久化的会话配置恢复）——
-  `SessionCoordinator.afterRun` 在 execution 落到 `waiting_*` 时做这件事
+- `interrupted` 是**终态**，只由启动恢复写入，没有自动出边：崩溃时那次 turn 可能已经把业务
+  动作做出去了，自动重跑等于二次执行。要重来必须由人显式发起新 execution。
+- **等待人工期间不持有 session lock**：session lock 只覆盖一个 agent turn，不能横跨审批的整个
+  生命周期（审批可以几小时）。execution 落到 `waiting_*` 时 `SessionCoordinator.afterRun` 断开
+  runtime（`session.disconnect()`）释放锁，会话配置留在 registry；之后要真正再跑 agent turn，
+  得经 `resumeExecutionSession()` 用持久化配置重新附着 —— approval 分支由 server 侧执行器收尾、
+  用不到它，input 分支需要它但当前没有调用方（见 5.2）
 
 ## 5. Human-in-the-loop
+
+### 5.1 Approval：从提议到执行，闭环
 
 ```text
 agent 提出 ActionIntent
@@ -221,7 +325,65 @@ ExecutionService.onHumanTaskResolved
 - Delegation：`POST /human-tasks/:id/delegate` 留痕 `delegated_from/to/by/at + reason`
 - 过期：进程内定时扫描（默认 60s），`OPEN → EXPIRED`，execution 随之 `EXPIRED`
 
-## 6. 授权三层（Tool Policy ≠ Business Action Policy）
+### 5.2 Input：人工补数据，目前没有续跑
+
+input 与 approval 共用 `human_task`，但**收尾方式不同，而且 input 这条链当前是断的**。
+
+```text
+execution → WAITING_FOR_INPUT
+      ↓  POST /human-tasks/:id/input（按 inputSchema 校验）→ 落 inputValues
+HumanTaskService.submitInput → onResolved('input_submitted')
+      ↓
+ExecutionService.onHumanTaskResolved → transition(resuming)
+      ↓
+   （到此为止）
+```
+
+`input_submitted` 只把 execution 置为 `resuming`，**没有组件接着做**：没人去
+`resumeExecutionSession()`、没人把 `inputValues` 拼回 prompt、没人继续 agent turn。
+`resuming` 因此是个**没有出边的悬挂态**。
+
+要让 input 也闭环，得补一个 **continuation runner**：在 `input_submitted` 之后接管 `resuming`
+的 execution，用 `inputValues` 续跑 agent turn，跑完走 `resuming → running → completed`。
+在它存在之前，一个 `resuming` 的 execution 不会自己动，只能靠人显式发起新 execution 兜底；
+进程重启时启动恢复会把残留的 `resuming` 归到终态 `interrupted`（见 3.5），
+所以它不会无声无息地永久卡在库里。
+
+approval 不需要这个 runner：批准后由 server 侧执行器直接执行动作并收尾 ——
+`runAction` 内部一次走完 `waiting_for_approval → resuming → running → completed`。
+
+## 6. 授权分层（Session Access → Execution Command → Business Action → Approval）
+
+请求从外到内要过四道判定，每道回答不同的问题，不能互相替代：
+
+```text
+                          Principal
+                              │
+                              ▼
+                  SessionAccessService
+                 （3.2 的五档权限：view / send /
+                  manage_members / manage_session / delete）
+                              │
+                 ┌────────────┴────────────┐
+                 ▼                         ▼
+           Session View            Execution Command        ← 能不能指挥这一个 execution
+                                   run / cancel /               （run / cancel / propose-action）
+                                   propose-action                见 3.3
+                                            │
+                                            ▼
+                                Business Action Policy       ← 让不让 agent 做这个动作
+                                （actionType → 策略：要不要人批、谁能批）
+                                            │
+                                      Human Approval
+                                            │
+                                            ▼
+                                 Final Authorization         ← hash + resourceVersion + policy 复核
+                                            │
+                                            ▼
+                             Server-controlled executor（真正的 mutation）
+```
+
+工具调用那一侧是另一条正交的链，决定 agent 能用哪些工具、能写到哪：
 
 ```text
 availableTools（session 级最大集合）
@@ -230,23 +392,17 @@ Permission Policy（onPermissionRequest：read / write / shell / mcp / url）
       ↓
 PreToolUse Policy（强制 hook：写类工具路径必须在 session workspace）
       ↓
-Business Action Policy（actionType → 策略：要不要人批、谁能批）
-      ↓
-Human Approval
-      ↓
-Final Authorization（hash + resourceVersion + policy 复核）
-      ↓
-Server-controlled executor（真正的 mutation）
+Business Action Policy（与上面那条链的第三层是同一个）
 ```
 
-```text
-会话访问判定（SessionAccessService）  ← 谁能进这个会话、能发消息吗
-              ↓ 与上面这条链正交
-业务授权（ActionPolicy + ApprovalPolicy） ← 能不能做这个动作、要不要审批、谁有资格批
-```
+两个最容易混的边界：
 
-两层不能合并：前者是数据边界，后者是业务边界。会话访问判定不通过，请求根本进不来；
-通过之后，高风险动作照旧要过 ActionPolicy 与人工审批。
+- **`view` ≠ `command`**：能看见一个 execution 不等于能指挥它。observer 只有 `view`，
+  没有 `run / cancel / propose-action`（见 3.3）。
+- **`Session Access` ≠ `Business Authorization`**：前者是数据边界（谁能进这个会话、
+  能发消息吗），后者是业务边界（能不能做这个动作、要不要审批、谁有资格批）。会话访问不通过，
+  请求根本进不来；通过之后（含 execution command 也通过），高风险动作照旧要过 ActionPolicy
+  与人工审批。两层合并就等于把"能进这个会"当成"能替这个会签字"。
 
 高风险 mutation（`submit_proxy_vote` / `submit_trade` / `send_external_message` / `delete_data`）
 **不作为普通模型工具暴露**：agent 只能 `propose_action`，执行器在服务端
@@ -260,12 +416,25 @@ Server-controlled executor（真正的 mutation）
 | session lock | **一个 agent turn** | 不能覆盖 human task 的整个生命周期（审批几小时不占锁） |
 | per-session 队列 | **一个 session** | `status='created'` 的 execution 即队列项；shared 的 drain 串行，跨 session 并行 |
 | 全局 semaphore | 全进程 | `COPILOT_MAX_CONCURRENT_EXECUTIONS`，防止 N 个用户同时烧满 runtime |
-| DB 唯一约束 | 跨副本 | `unique(task_id, approver_id)`、`unique(session_id, sequence)`、`unique(session_id, client_message_id)` |
+| DB 唯一约束 | 跨副本 | **最后一道护栏，不是序号生成机制**：`unique(task_id, approver_id)`、`unique(session_id, sequence)`、`unique(execution_id, sequence)`、`unique(session_id, client_message_id)` |
 
-`replicas > 1` 时这份状态不再够用：内存 session lock、进程内 session 事件广播、
-"谁在跑这个会话"三处都要换。方向是 PostgreSQL advisory lock
-（`pg_advisory_xact_lock(hash(sessionId))`）+ DB 租约 + runtime affinity
-（session 的 Copilot runtime 只在持有租约的实例上可 resume），不需要引入 Redis。
+**唯一约束 ≠ 序号分配器**：`unique(session_id, sequence)` 能在重号时把第二个写入挡回去，
+但它挡不住"两个写入先算出同一个号"这件事本身 —— 那是分配阶段的职责（见 3.6）。
+把唯一约束当序号来源（`select max(sequence)+1` + `on conflict do nothing`）的后果是
+**静默丢事件**，而且对外广播的是库里并不存在的序号。分配器是独立的列，走原子自增。
+
+### 多副本要补的三件事
+
+`replicas = 1` 下，上面这些进程内状态都成立。要多副本，缺的是三件具体的东西：
+
+1. **谁拥有这个 session 的 turn** —— 现在是进程内 session lock；要换 DB 租约
+   （`pg_advisory_xact_lock(hash(sessionId))` 或一张 lease 行）。
+2. **哪个 Pod 持有 Copilot runtime session** —— runtime 是本地进程里的对象，
+   不能跨 Pod 附着；要 runtime affinity，让某个 session 的 resume 只落在持租约的实例上。
+3. **SessionEvent 怎么跨 Pod 广播** —— 现在是进程内 EventEmitter；要换成 PG `listen/notify`
+   或消息总线，SSE 订阅端才能收到别的 Pod 写的事件。
+
+方向是 PostgreSQL（advisory lock + lease 行 + notify），不需要引入 Redis / Kafka。
 当前保持 `replicas: 1`。
 
 ## 8. 审计分层（不要互相取代）
@@ -310,14 +479,27 @@ psql "$DATABASE_URL" -f server/src/db/migrations/002_collaboration.sql
 
 | 表 | 关键字段 |
 |----|---------|
-| `agent_session` | session_id, tenant_id, user_id, workspace_path, status, **collaboration_mode**, **message_sequence**（消息序号分配器）, **config**（resume 用，不含凭证） |
+| `agent_session` | session_id, tenant_id, user_id, workspace_path, status, **collaboration_mode**, **message_sequence**（消息序号分配器）, **event_sequence**（会话事件序号分配器）, **config**（resume 用，不含凭证） |
 | `session_participant` | session_id, tenant_id, user_id, role(owner/member/observer), status(active/left/removed), joined_at, left_at, `primary key(session_id, user_id)` |
 | `agent_message` | message_id, session_id, sequence, actor_type(user/agent), actor_id, **client_message_id**（幂等键）, content, execution_id, `unique(session_id, sequence)`、`unique(session_id, client_message_id)` |
 | `session_event` | event_id, session_id, sequence, type, actor_type, actor_id, execution_id, message_id, payload, `unique(session_id, sequence)` |
-| `agent_execution` | execution_id, session_id, tenant/user（= 会话 owner）, **initiated_by_user_id**（发起人）, **source_message_id**, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars |
+| `agent_execution` | execution_id, session_id, tenant/user（= 会话 owner）, **initiated_by_user_id**（发起人）, **source_message_id**, **queue_sequence**（队列定序键，镜像来源消息序号）, **event_sequence**（执行事件序号分配器）, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars |
 | `human_task` | task_id, execution_id, type, status, payload, **input_values**（人工输入回填）, input_schema, policy_id, strategy, required_count, eligible_roles/users, initiated_by, expires_at, delegated_* |
 | `human_task_decision` | decision_id, task_id, approver_id, approver_role, decision, comment, `unique(task_id, approver_id)` |
 | `execution_event` | execution_id, sequence, type, actor_type, actor_id, payload, `unique(execution_id, sequence)` |
+
+`*_sequence` 三列都是**分配器**，不属于对外记录本身：registry 的 `insert` / `update` 都不写它们
+（只写归属、workspace、status、config、时间戳），所以 `saveConfig` / `touch` 这类高频写入
+不会把序号打回 0。
+
+**多副本要用的列，现在不建**：第 7 节那三件事的落地载体，是 `agent_session` 上的
+`session_lease_owner` / `session_lease_until` / `runtime_instance_id`。它们**不属于当前的
+SQLite / single-replica 模型**，现在不加 —— 加了也没有写入方，只会变成误导性的空列。
+真要上多副本，连同租约续期与 runtime affinity 一起补，而不是先把列摆上占位。
+
+**索引必须在补列之后建**：`create table if not exists` 不会给老表加列，若索引与建表放在同一条
+exec 里，老库文件就会在建出 `queue_sequence` 之前引用它 → `no such column`，服务起不来。
+所以 schema 拆成「建表 SQL → 补列 → 建索引 SQL」三步，新库老库走同一条路径。
 
 类型映射（SQLite）：`jsonb → text`（JSON 文本）、`timestamptz → text`（ISO 8601）、
 `boolean → integer`（0/1）、`bigserial → integer primary key autoincrement`。
@@ -340,9 +522,35 @@ psql "$DATABASE_URL" -f server/src/db/migrations/002_collaboration.sql
 
 `POST /:id/chat` 的行为按模式分叉：**single** 返回 SSE（首帧 `execution`，随后
 `delta/message/subagent`，结束 `done`）；**shared** 落消息 + 入队后立刻 202，结果走
-`GET /:id/events`。写接口都带会话访问判定：`chat` / `POST /participants` 要 `send` 或
-`manage_members`，读接口要 `view`。`GET /:id/events` 支持 `?after=<sequence>` 与
-`Last-Event-ID` 续传，另有心跳帧。
+`GET /:id/events`。`GET /:id/events` 支持 `?after=<sequence>` 与 `Last-Event-ID` 续传
+（先订阅再回放，见第 3 节），另有心跳帧。
+
+写接口的准入分两层：先会话权限（3.2 的五档），再过额外授权（command 判定、状态机、业务策略）。
+一律挂 `view` 是不行的：
+
+| 端点 | 会话权限 | 额外授权 |
+|------|---------|---------|
+| `POST /:id/chat` | `send` | — |
+| `POST /:id/participants` / `DELETE .../:userId` | `manage_members` | — |
+| `POST /:id/resume` | `manage_session` | collaborationMode 不可变（传了 400） |
+| `DELETE /:id` | `delete` | — |
+| `POST /executions` | `send` | — |
+| `POST /executions/:id/run` | `send` | execution 当前状态（状态机约束，见第 4 节） |
+| `POST /executions/:id/cancel` | — | command 判定：owner 任意 / member 仅自己发起 / observer 不可 |
+| `POST /executions/:id/actions` | — | command 判定 + Business Action Policy（未登记 → 403、需审批 → 202 + taskId） |
+
+读端点（`GET /:id`、`GET /:id/events`、`GET /:id/tasks`、`GET /executions/*`）一律要 `view`
+再加下面的读准入 —— **没有额外授权**。
+
+**读接口的准入**：`readAccess(req)` 给出 `all | scoped | denied` 三态 ——
+带 `x-admin-token`（且部署真的配了令牌）为 `all`（看全量）；否则若信任身份头则为 `scoped`
+（收窄到自己拥有/参与的会话）；两者都没有、又配了令牌则为 `denied`（401）。
+没配令牌也不信任身份头 = 单租户本地开发，直接 `all`。
+
+为什么不是 `requireAdmin`：execution 的可见性本就跟着 session 走，管理令牌只回答
+"是否无视会话边界看全量"，不回答"能否读这个会话"。挂成 `requireAdmin` 会让配了令牌的部署里，
+共享会话的参与者读不到同会话的执行时间线（而 `GET /sessions/:id` 却读得到），协作读路径被截断。
+`/api/human-tasks/all` 与 `/api/debug`、`/api/hooks` 仍是纯管理视图，继续用 `requireAdmin`。
 
 **等待审批不靠 SSE 长连接** —— 用 `GET /executions/:id/events` 轮询或订阅。
 
@@ -383,10 +591,12 @@ server/src/
 ├── approval/    types approval-policy approval-service
 ├── actions/     action-registry（server-controlled executor） action-service
 ├── db/          connection.ts（后端选择） dialect.ts（方言钩子）
-│                sqlite.ts + sqlite-schema.ts（默认后端，含补列升级）
+│                sqlite.ts + sqlite-schema.ts（默认后端：建表 / 补列 / 建索引 三步）
 │                postgres.ts（可选） migrations/001_agent_execution.sql 002_collaboration.sql
+├── middleware/  error-status.ts（错误→状态码的单一真相源） errorHandler.ts（兜底）
 ├── providers/ agents/ skills/ mcp/ hooks/
-└── wiring.ts    依赖装配（SQLite / PostgreSQL / Memory）
+├── wiring.ts    依赖装配（SQLite / PostgreSQL / Memory）
+└── index.ts     启动：listen 之后跑 collaborate.recoverPending()（崩溃恢复）
 ```
 
 ## 12. 明确不做
@@ -399,8 +609,19 @@ Temporal / BPMN / Camunda / Kafka / Redis / 通用 workflow DSL / A2A EventBus�
    协作语义随之消失；
 2. **按参与人切换 MCP 与 runtime**（同一会话不同人看到不同工具）—— 工具集属于会话，不属于人；
 3. **运行中改会话模式**（`single ⇄ shared`）—— 模式不可变是访问判定的前提；
-4. **分布式队列**（Redis / Kafka）与多副本租约 —— 队列就是 execution 表，
-   `replicas: 1` 下进程内串行已足够，扩展方向见第 7 节。
+4. **通用分布式队列 / 消息中间件**（Redis / Kafka / 通用 workflow engine）—— 队列就是
+   execution 表，`replicas: 1` 下进程内串行已足够。
+
+"不做分布式队列"与"将来要支持多副本"不冲突，两者是不同的东西：
+
+| | 现在 | 扩展方向 |
+|---|---|---|
+| 队列 | `agent_execution` 表 + 进程内 per-session 串行 | 不变（表就是队列，不需要中间件） |
+| 多副本调度 | 不做（`replicas: 1`） | PostgreSQL advisory lock + DB 租约 + runtime affinity（第 7 节） |
+| 跨副本事件广播 | 进程内 EventEmitter | PG `listen/notify` 或消息总线 |
+
+也就是说：**不做 Redis / Kafka 这类通用分布式队列 ≠ 永远不做多副本 session lease。**
+前者是"不引入中间件"，后者是"把进程内状态搬进已有的 PostgreSQL"。
 
 **向量检索**：当前没有语义检索需求（无 embedding 通道，也没有"按相似度召回"的功能），
 因此不建向量表、不接 embedding 服务 —— 留出接入点而不是先堆空壳：
