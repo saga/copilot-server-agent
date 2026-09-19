@@ -160,3 +160,69 @@ test('COPILOT_BUSINESS_ROLES：把业务角色映射到 Entra group object ID（
   assert.deepEqual(cr.groups, ['3a7f1c2e-0000-0000-0000-000000000001']);
   assert.ok(roles.some((x) => x.id === 'approver'), '内置角色仍然在（配置是覆盖而不是替换）');
 });
+
+/**
+ * Skill Flow 的两条 `@agent` 相关配置。
+ *
+ * 这里刻意**从配置走到生效集合**（config → parseAgentTools），而不是只断言配置字符串：
+ * 真正要证明的是"配置写 mcp 也拿不到 mcp"。只测 `cfg.workflowAgentTools === 'mcp'`
+ * 反而会让人以为那是生效值。
+ */
+function loadAgentCeiling(extra: Record<string, string>): {
+  code: number;
+  stdout: string;
+  stderr: string;
+} {
+  const res = spawnSync(
+    process.execPath,
+    [
+      '--import',
+      'tsx',
+      '--input-type=module',
+      '-e',
+      "const { config } = await import('./src/config.ts');" +
+        "const { parseAgentTools } = await import('./src/workflow/capability.ts');" +
+        "console.log(JSON.stringify({ raw: config.workflowAgentTools," +
+        " effective: parseAgentTools(config.workflowAgentTools, ['read','write','url'])," +
+        " requireAgentOutput: config.workflowRequireAgentOutput }));",
+    ],
+    { cwd: serverRoot, env: { ...process.env, ...extra }, encoding: 'utf-8' },
+  );
+  return { code: res.status ?? -1, stdout: res.stdout ?? '', stderr: res.stderr ?? '' };
+}
+
+test('COPILOT_WORKFLOW_AGENT_TOOLS 写 mcp / shell 也不生效（硬禁止，不是默认值）', () => {
+  const r = loadAgentCeiling({ COPILOT_WORKFLOW_AGENT_TOOLS: 'mcp' });
+  assert.equal(r.code, 0, r.stderr);
+  const cfg = JSON.parse(r.stdout.trim().split('\n').at(-1)!);
+  assert.equal(cfg.raw, 'mcp', '配置本身照原样读进来');
+  assert.deepEqual(
+    cfg.effective,
+    ['read', 'write', 'url'],
+    '但生效集合里不会出现 mcp —— 它是代码里的不变式，一条环境变量放不开',
+  );
+
+  const both = loadAgentCeiling({ COPILOT_WORKFLOW_AGENT_TOOLS: 'mcp,shell' });
+  assert.deepEqual(JSON.parse(both.stdout.trim().split('\n').at(-1)!).effective, [
+    'read',
+    'write',
+    'url',
+  ]);
+
+  const narrowed = loadAgentCeiling({ COPILOT_WORKFLOW_AGENT_TOOLS: 'read' });
+  assert.deepEqual(JSON.parse(narrowed.stdout.trim().split('\n').at(-1)!).effective, ['read']);
+});
+
+test('COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT 默认开（没有契约的 @agent 一律校验不过）', () => {
+  // 注意不能用 `''` 表示"未配置"：config 的 env() 是 `?? fallback`，
+  // 空串不是 nullish，会原样生效（`'' === 'true'` = false）—— 那就把默认值测反了
+  const byDefault = loadAgentCeiling({});
+  assert.equal(
+    JSON.parse(byDefault.stdout.trim().split('\n').at(-1)!).requireAgentOutput,
+    true,
+    '默认必须要求完成契约：否则"turn 没抛异常"就等于业务做完了',
+  );
+
+  const off = loadAgentCeiling({ COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT: 'false' });
+  assert.equal(JSON.parse(off.stdout.trim().split('\n').at(-1)!).requireAgentOutput, false);
+});

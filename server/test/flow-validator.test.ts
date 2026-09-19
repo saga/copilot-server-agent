@@ -469,6 +469,9 @@ test('校验：真实示例技能 server/skills/investment-research 通过全部
     registry: flowRegistryLookup,
     hasSkill: (n) => Boolean(loadSkill(n, dirs)),
     hasRole: businessRoleLookup.hasRole,
+    // 与生产默认一致：每个 @agent 都必须有完成契约（见 config.workflowRequireAgentOutput）
+    requireAgentOutput: true,
+    agentTools: ['read', 'write', 'url'],
   });
   assert.deepEqual(
     r.issues,
@@ -602,6 +605,65 @@ test('校验：@review 属性全部合法时不报错（属性只是收窄，不
   });
 });
 
+/**
+ * `strategy: ALL` 必须真的全员。
+ *
+ * ANY 与 ALL 的唯一区别落在票数上，所以 `ALL + required: 1`（3 个资格角色）
+ * 实际仍然只需要 1 票 —— 它只是**名字叫 ALL 的 ANY**。这种写法比写错更危险：
+ * 审批链上写着 ALL，没人会再去核对票数。
+ */
+test('校验：strategy: ALL 的票数必须覆盖全部生效角色（否则 ALL 只是名字）', () => {
+  const base = basePolicy(['risk', 'compliance', 'ops'], { strategy: 'ANY', requiredCount: 1 });
+
+  // 基策略 ANY + 3 个角色 + required 1 → ALL 被削弱成 ANY，必须报错
+  const weakened = ok(reviewFlow('strategy: ALL', 'required: 1'), {
+    registry: withPolicy(base),
+  }).issues.find((i) => i.code === 'review-all-required');
+  assert.ok(weakened, 'ALL + required 1（3 个角色）必须报错');
+  assert.match(weakened!.message, /ALL 被削弱成了 ANY/);
+  assert.match(weakened!.message, /required: 3/, '要告诉作者改成几票');
+  assert.equal(weakened!.nodeId, 'rev');
+
+  // 不写 required 时，基策略的 1 票同样不够（ALL 需要 3 票）
+  assert.ok(
+    ok(reviewFlow('strategy: ALL'), { registry: withPolicy(base) }).issues.some(
+      (i) => i.code === 'review-all-required',
+    ),
+    'ALL 不写 required 时按基策略票数算，同样不够全员',
+  );
+
+  // required 补齐到角色数 → 合法
+  assert.deepEqual(
+    ok(reviewFlow('strategy: ALL', 'required: 3'), { registry: withPolicy(base) }).issues,
+    [],
+  );
+
+  // 票数更多也合法（只能加不能减）：5 票比"全员"更严
+  assert.deepEqual(
+    ok(reviewFlow('strategy: ALL', 'required: 5'), { registry: withPolicy(base) }).issues,
+    [],
+  );
+
+  // role 把角色收窄到 1 个之后，ALL + required 1 就是合法的全员通过
+  assert.deepEqual(
+    ok(reviewFlow('role: risk', 'strategy: ALL', 'required: 1'), {
+      registry: withPolicy(base),
+    }).issues,
+    [],
+    '生效角色只剩 1 个时，1 票就是全员',
+  );
+
+  // 基策略本身就是 ALL 且票数够 → 通过
+  assert.deepEqual(
+    ok(reviewFlow(), {
+      registry: withPolicy(
+        basePolicy(['risk', 'compliance'], { strategy: 'ALL', requiredCount: 2 }),
+      ),
+    }).issues,
+    [],
+  );
+});
+
 // ---------- @gate 的出口必须与注册表声明一致 ----------
 
 test('校验：@gate 声明的出口必须有 route，route 的出口必须被声明', () => {
@@ -686,7 +748,7 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
   assert.deepEqual(r.issues, []);
   assert.deepEqual(r.definition!.nodes['work']!.attrs.tools, ['read']);
 
-  // 声明 mcp = 超出上限（默认上限刻意不含 mcp/shell）
+  // 部署把上限收窄到 read 时，声明 read,write 就是超限
   const widened = ok(
     flow(
       '## @flow demo',
@@ -695,7 +757,7 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
       '',
       '## @agent work',
       '',
-      'tools: read,mcp',
+      'tools: read,write',
       '',
       '干活。',
       '',
@@ -706,10 +768,10 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
       '',
       'ok',
     ),
-    { agentTools: ceiling },
+    { agentTools: ['read'] },
   ).issues.find((i) => i.code === 'agent-tools-widens');
   assert.ok(widened, 'tools 超出上限必须报错');
-  assert.match(widened!.message, /mcp/);
+  assert.match(widened!.message, /write/);
   assert.match(widened!.message, /COPILOT_WORKFLOW_AGENT_TOOLS/, '要告诉运维改哪里');
 
   // 未知权限类别 → attr-invalid
@@ -718,6 +780,52 @@ test('校验：@agent 的 tools 只能比服务端上限更严', () => {
       (i) => i.code === 'attr-invalid',
     ),
   );
+});
+
+/**
+ * `mcp` / `shell` 是**永久禁止**的类别，不是"默认上限里没有"。
+ *
+ * 差别很关键：做成默认值的话，把 `COPILOT_WORKFLOW_AGENT_TOOLS=mcp` 一写，
+ * `@agent` 就重新拿到了绕开 `@action` 审批的路径 —— 一条环境变量取消了整条流程的
+ * 授权模型，而 SKILL.md、审批记录、审计链上都看不出任何异常。
+ *
+ * 所以校验是**无条件**的：不传 agentTools（只做结构校验的场景）也要报。
+ */
+test('校验：@agent 的 tools 里写 mcp / shell 一律拒绝（与部署配置无关）', () => {
+  const withTools = (tools: string): string =>
+    flow(
+      '## @flow demo',
+      '',
+      'start -> work',
+      '',
+      '## @agent work',
+      '',
+      `tools: ${tools}`,
+      '',
+      '干活。',
+      '',
+      '- success -> done',
+      '- fail -> done',
+      '',
+      '## @end done',
+      '',
+      'ok',
+    );
+
+  for (const bad of ['mcp', 'shell', 'read,mcp', 'read,shell,url']) {
+    // 连"不提供上限"的结构校验场景也要拒绝
+    const hit = ok(withTools(bad)).issues.find((i) => i.code === 'agent-tools-forbidden');
+    assert.ok(hit, `tools: ${bad} 必须报 agent-tools-forbidden`);
+    assert.match(hit!.message, /永久禁止/);
+    assert.match(hit!.message, /@action/, '要指出业务动作该走哪里');
+    assert.ok(
+      !ok(withTools(bad)).issues.some((i) => i.code === 'agent-tools-widens'),
+      '不该同时报成"超出配置上限"—— 那会让人以为改配置就能放开',
+    );
+  }
+
+  // 合法的收窄照常通过
+  assert.deepEqual(ok(withTools('read,write,url'), { agentTools: ['read', 'write', 'url'] }).issues, []);
 });
 
 test('校验：@agent 的 output 必须是已注册的完成契约，且可被要求必填', () => {
@@ -752,7 +860,7 @@ test('校验：@agent 的 output 必须是已注册的完成契约，且可被�
   assert.ok(missing);
   assert.match(missing!.message, /不能自己定义/);
 
-  // requireAgentOutput：没写 output 的 @agent 直接报错（生产环境的推荐配置）
+  // requireAgentOutput：没写 output 的 @agent 直接报错（生产默认配置）
   const noOutput = flow(
     '## @flow demo',
     '',
@@ -774,7 +882,8 @@ test('校验：@agent 的 output 必须是已注册的完成契约，且可被�
   );
   assert.ok(required, '开启 requireAgentOutput 后没写契约必须报错');
   assert.match(required!.message, /output:/);
-  // 默认不要求（否则存量 SKILL.md 全部校验不过）
+  // 校验器**选项**的缺省仍然是不要求：这里测的是纯函数，是否要求由调用方决定
+  // （生产 wiring 传的是 config.workflowRequireAgentOutput，那个默认是 true）
   assert.deepEqual(ok(noOutput, { registry: withOutput }).issues, []);
 });
 

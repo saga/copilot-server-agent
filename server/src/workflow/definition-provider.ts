@@ -1,4 +1,4 @@
-import { findSkill, loadSkill, type LoadedSkill } from '../skills/index.js';
+import { loadSkill, type LoadedSkill } from '../skills/index.js';
 import { parseSkillFlow } from '../skills/flow-parser.js';
 import { validateSkillFlow, type FlowRegistryLookup } from '../skills/flow-validator.js';
 import { businessRoleLookup } from '../identity/index.js';
@@ -53,6 +53,18 @@ export interface SkillFileProviderOptions {
  *
  * 校验用的注册表/角色表由构造参数注入（默认取全局的那两份），
  * 这样单测可以塞一份假的注册表，不必污染全局状态。
+ *
+ * ## 一次读、一次解析、一次校验
+ *
+ * `load()` 的全部产物 —— **正文、sourceHash、FlowDefinition** —— 必须来自
+ * **同一份字节**。这不是洁癖：`sourceHash` 的唯一用途是"这个执行还在用建立时那一版
+ * 流程定义吗"。如果哈希来自一次读、定义来自另一次读，文件在两次读之间被替换，
+ * 就会得到"定义是旧版、哈希是新版"的组合 —— 之后 `reload()` 会判定"版本没变"
+ * 而放行，流程继续跑在一个**从未被校验过**的定义上，审计链上完全看不出来。
+ *
+ * 所以这里刻意不走 `findSkill()`（它为了拿 frontmatter 的 name 会把每个候选
+ * SKILL.md 各读一遍，赢了之后再读一遍）。`loadSkill()` 只读一次，那次读同时用于
+ * 匹配技能名、解析 frontmatter、算哈希；下游的解析与校验全部消费它的 `markdown`。
  */
 export class SkillFileDefinitionProvider implements FlowDefinitionProvider {
   constructor(private readonly opts: SkillFileProviderOptions) {}
@@ -71,11 +83,14 @@ export class SkillFileDefinitionProvider implements FlowDefinitionProvider {
         ],
       };
     }
+    // 解析与校验都只消费 skill.markdown —— 与上面那个 sourceHash 同一份字节
     const parsed = parseSkillFlow(skill.markdown);
     const validated = validateSkillFlow(parsed, {
       flow: input.flow,
       ...(this.opts.registry ? { registry: this.opts.registry } : {}),
-      hasSkill: (name) => Boolean(findSkill(name, [...this.opts.dirs])),
+      // `@agent <id>` 指向的技能是否存在：用与 loadSkill 相同的匹配器，
+      // 避免"校验说存在、加载却找不到"这种两套匹配规则带来的分歧
+      hasSkill: (name) => Boolean(loadSkill(name, [...this.opts.dirs])),
       // `role:` 必须指向已登记的业务角色（RoleRegistry），不是随便一个字符串
       hasRole: this.opts.hasRole ?? businessRoleLookup.hasRole,
       ...(this.opts.agentTools ? { agentTools: this.opts.agentTools } : {}),

@@ -388,8 +388,10 @@ registerFlowOutput({
 契约没过 → 走 `fail` 出口（**可路由**，不是编排器崩溃）。契约 id 必须在服务端注册，
 SKILL.md 不能自己定义“什么叫做完了”（`registry-missing-output`）。
 
-生产环境建议开启 `COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT=true`：每个 `@agent` 都必须声明契约
-（`agent-output-missing`）。默认关闭只是为了让存量 SKILL.md 不突然全部校验不过。
+**默认强制**：每个 `@agent` 都必须声明契约，否则 `prepare()` 直接 400
+（`agent-output-missing`）。理由就是上面那句 —— 没有契约时 `@agent success`
+只等于“这次 turn 没抛异常”。迁移期可以用
+`COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT=false` 临时关掉，但那是例外而非常态。
 
 ### `tools: <权限类别>` —— 能力边界
 
@@ -403,12 +405,26 @@ SKILL.md 不能自己定义“什么叫做完了”（`registry-missing-output`�
 read    允许（只读无副作用）
 write   允许（只能落在 session workspace 内，路径守卫仍然生效）
 url     允许（出站请求另有 SSRF 检查 + 域名 allowlist）
-shell   默认拒绝 —— 命令可以绕过路径守卫触达任意外部系统
-mcp     默认拒绝 —— MCP server 就是外部业务系统，正是"绕开 @action"的路径
+shell   永久禁止 —— 命令可以绕过路径守卫触达任意外部系统
+mcp     永久禁止 —— MCP server 就是外部业务系统，正是"绕开 @action"的路径
 ```
 
-上限由**企业配置**决定（`COPILOT_WORKFLOW_AGENT_TOOLS`，默认 `read,write,url`）；
-`tools:` 只能在它之内**收窄**（超出上限 → `agent-tools-widens`）。
+`mcp` / `shell` 是**代码里的不变式**（`WORKFLOW_AGENT_ALLOWED_KINDS`），不是配置：
+
+```md
+tools: read,mcp    # ❌ agent-tools-forbidden（与部署配置无关，永远拒绝）
+tools: read,url    # ✅
+```
+
+这条区别很关键。做成“配置默认值不含 mcp”的话，把 `COPILOT_WORKFLOW_AGENT_TOOLS=mcp`
+一写，`@agent` 就重新拿到了绕开审批的路径 —— 一条**环境变量**取消了整条流程的授权模型，
+而 SKILL.md、审批记录、审计链上都看不出任何异常。所以：
+
+- 配置只能在 `read` / `write` / `url` 之内选，写 `mcp` 会被直接丢掉（不生效）
+- SKILL.md 的 `tools:` 只能在这个硬上限之上再**收窄**
+- 超出**部署上限**是另一条规则（`agent-tools-widens`，改配置可以放开）
+- 要真正放开 `mcp` / `shell`，必须改代码（一次代码评审）
+
 这条与 `role:` 是同一条规则：SKILL.md 是会被 LLM 读到、也会被人随手改的文件，
 不能靠它扩大授权面或能力边界。
 
@@ -627,9 +643,36 @@ exclude: initiator
 | 属性 | 含义 | 相对服务端基策略 |
 | --- | --- | --- |
 | `role` | 审核业务角色（**不是 AD Group**） | 必须是基策略 `eligibleRoles` 的**子集**（交集） |
-| `strategy` | `ANY` / `ALL` | 只能 `ANY → ALL` |
+| `strategy` | `ANY` / `ALL` | 只能 `ANY → ALL`；且 `ALL` 必须真的全员（见下） |
 | `required` | 需要几票 | 只能 **≥** 基策略的 `requiredCount` |
 | `exclude` | `initiator`（禁止自批）/ `none` | 不能把基策略的禁止自批改成允许 |
+
+### `strategy: ALL` 必须真的全员
+
+`ANY` 与 `ALL` 的唯一区别落在**票数**上。所以 `strategy: ALL` 配 `required: 1`
+（3 个资格角色）实际仍然只需要 1 票 —— 它只是**名字叫 ALL 的 ANY**。这种写法比写错
+更危险：审批链上写着 `ALL`，没人会再去核对票数。
+
+```md
+strategy: ALL
+required: 1      # ❌ review-all-required：生效角色有 3 个，ALL 要求 ≥3 票
+```
+
+规则是**票数必须覆盖全部生效角色**（`requiredVotes()`，`types.ts` 里唯一定义，
+注册表 / 校验器 / runner 三处共用）：
+
+| 场景 | 结果 |
+| --- | --- |
+| 基策略 `ANY` + 3 个角色 + `strategy: ALL` + `required: 1` | ❌ `review-all-required` |
+| 同上但 `required: 3` | ✅ 全员通过 |
+| 同上但 `required: 5` | ✅ 更严（票数只能加不能减） |
+| `role: risk` 把角色收窄到 1 个 + `strategy: ALL` + `required: 1` | ✅ 1 个角色的全员就是 1 票 |
+| 服务端注册 `strategy: 'ALL'` 但 `requiredCount: 1`（2 个角色） | ❌ **启动即失败**（`registerFlowReview`） |
+| 服务端注册 `strategy: 'ALL'` 不写 `requiredCount` | ✅ 缺省 = 角色数（不是 1） |
+
+判定用的是**生效值**（`role` 收窄之后），而不是 SKILL.md 的字面值。
+runner 在运行时还会再 clamp 一次（`reviewPolicyFor`）：校验器可能没被调用
+（比如直接构造 `WorkflowState`），那一道是 fail-closed 的最后防线。
 
 服务端注册的基策略才是**权威**：
 
@@ -1486,12 +1529,14 @@ Successful Terminal State
 
 ---
 
-# 17. 运行时加固：不确定性的三个来源
+# 17. 运行时加固：不确定性的来源
 
 前面 16 节描述的是**语义**。这一节描述的是**运行期**：一个已经跑起来的流程，
 在进程崩溃、并发推进、人工任务乱序到达时，怎么保证它不会悄悄走错一步。
 
-三条规则，分别对应三种不确定性。
+每一条对应一种不确定性 —— 状态机的不确定性（17.1 / 17.2 / 17.3 / 17.6）、
+接口边界的不确定性（17.4）、授权面的不确定性（17.5 / 17.7）、
+以及“校验的和执行的到底是不是同一份东西”（17.8 / 17.9）。
 
 ## 17.1 步骤持久化：`current` 一个字段是不够的
 
@@ -1593,5 +1638,97 @@ runner.ts                状态怎么推进、什么时候落库、冲突怎么�
 - `@action` 的审批资格来自 ApprovalPolicy，不是 SKILL.md 的自然语言
 - `@review` 的四个属性只能比服务端基策略更严
 - `@agent` 只能走 `success` / `fail`，且 `success` 要先过服务端注册的完成契约
-- `@agent` 执行期间套着能力边界（默认碰不到 MCP 与 shell）——
+- `@agent` 执行期间套着能力边界（**永远**碰不到 MCP 与 shell）——
   否则它可以绕开 `@action` 直接对外产生副作用
+
+## 17.6 进入等待态的顺序：先落 workflow，再迁移 execution
+
+`@review` / `@action` 进入等待态是**三步**，顺序不能换：
+
+```text
+1. 建人工任务（拿到 taskId）
+2. CAS 落 workflow.stepStatus = waiting + waitingTaskId
+3. 把 execution 迁移到 waiting_for_approval
+```
+
+先做 3 再做 2 会留下一个**不可判定**的崩溃窗口：
+
+```text
+execution = waiting_for_approval   +   workflow.stepStatus = running
+```
+
+恢复时“这一步在等人工”和“这一步要重放”**同时成立** —— 没有任何字段能判断该信哪个。
+信前者会漏掉一步，信后者会重复提交（`@action` 那一步可能已经发出去过）。
+
+按上面的顺序，崩溃留下的最长是 `stepStatus = waiting` + `execution = running`。
+那是一个**可判定**的状态：任务确实已经建出来了，只需要把它接回来
+（`reconcileWaiting()`，重跑时补一次 `waiting_for_approval` 迁移 + 一条
+`workflow.waiting.reconciled` 审计），然后等任务回调。
+
+为什么这件事必须由编排器做、而不是让 `ExecutionService` 顺手迁完：两个写者
+（执行器 + 编排器）都改 execution 时，崩溃窗口里的状态是**不可判定**的。
+状态机的所有权必须只有一份 —— 所以 `runtime.runAction()` 的契约是
+“只建审批任务、绝不改 execution 状态”。
+
+代价：2 与 3 之间崩溃会留下一条**孤儿人工任务**（流程那边会重新走一遍）。
+这是刻意选的 —— 任务会自然过期，过期回调也会被 17.3 的绑定校验拦下；
+而“流程状态不可判定”是没法靠超时自愈的。
+
+## 17.7 能力边界属于哪条 execution
+
+`@agent` 的能力边界是**会话级存放、execution 级生效**的（`capability.ts`）：
+
+```ts
+interface AgentCapability { executionId: string; nodeId: string; flow: string; kinds: Set<...> }
+```
+
+工具授权上下文在建会话时就固定了，而 `@agent` 节点是在会话生命周期**中间**跑的，
+没法烘进 session config —— 所以按 `sessionId` 存一份，权限回调每次现取。
+
+但一条会话会先后（甚至排队）承载多条 execution。只按 `sessionId` 取一份，
+A 的边界就会作用到 B 上：A 的节点允许 `write`、B 的节点只声明了 `read`，
+B 却拿到了 `write` —— 一次**跨 execution 的能力放宽**，而审计链上只会看到
+“B 用了 write 工具”，看不出是边界串了台。
+
+所以权限回调（`tool-policy.ts` 第 0 层）先对账一次：`capability.executionId`
+必须等于当前正在跑的 executionId，否则**拒绝**。
+
+对不上必须拒绝，而不是“忽略这份边界、退回会话策略”：会话策略本来就允许 mcp / shell，
+退回等于把它们重新交回 agent 手上 —— 那正是这一层要挡的东西。拒绝会让问题立刻可见，
+包括“未来的某个 runtime 忘了设 execution 上下文”这种会让边界**静默失效**的改法。
+
+清除时同样要比对 `executionId + nodeId`：`@agent` 的 `finally` 在 turn 槽**外面**跑，
+槽一释放，同一会话里的下一条 execution 就可能已经设上自己的边界了。
+
+## 17.8 定义只读一次：`read → hash → parse → validate`
+
+`sourceHash` 的唯一用途是回答“这个执行还在用建立时那一版流程定义吗”。
+如果**解析用的内容**与**算哈希的内容**来自两次读，文件在两次读之间被替换就会得到
+一份自相矛盾的结果：
+
+```text
+定义来自旧版本、哈希来自新版本（或者反过来）
+```
+
+之后 `reload()` 会判定“版本没变”而放行，流程继续跑在一个**从未被校验过**的定义上，
+审计链上完全看不出来。
+
+所以 `loadSkill()` 只读一次文件，那次读同时用于：匹配技能名、解析 frontmatter、算哈希；
+解析与校验全部消费同一份 `markdown`。
+
+同理，`runAgentStep()` **不再**回头调 `findSkill()` 做存在性检查 —— 那是第二条解析路径
+（`findSkill` 会把每个候选 SKILL.md 重读一遍、重新解析 frontmatter），
+会让“校验时看到的定义”和“执行时用的定义”变成两份内容。技能是否存在已经在校验期
+查过（`hasSkill`），而且每次 resume 都会重新校验一遍。
+
+## 17.9 注册表在启动时就自洽
+
+四张注册表（gate / review / action / output）的错误都是**静默失效**型的，
+所以它们在登记时就校验，宁可让进程起不来：
+
+| 登记 | 校验 |
+| --- | --- |
+| `registerFlowGate` | `outcomes` 非空、不重复、归一化成小写（route 出口名由 parser 统一小写，写 `PASS` 会永远匹配不上） |
+| `registerFlowReview` | `eligibleRoles` 非空（空 = 建出来的任务没人有资格批，流程挂到超时）、`requiredCount ≥ 1`、`ALL ⇒ requiredCount ≥ 角色数` |
+| 全部 | 登记名归一化成小写（查找侧一律 `norm`，登记侧不归一化 = 大小写不同就查不到） |
+

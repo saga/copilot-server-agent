@@ -121,6 +121,12 @@ export function skillSearchDirs(extra: string[] = []): string[] {
 /**
  * 按名找技能。目录名与 frontmatter 的 `name` 都算命中（大小写不敏感）。
  * 找不到返回 undefined —— 调用方（Flow 校验）据此报错，而不是让 LLM 自己猜一个技能。
+ *
+ * **注意**：它为了拿 frontmatter 的 `name` 会把每个候选 SKILL.md 各读一遍。
+ * 需要"技能正文 + 内容哈希"时请用 `loadSkill()`（只读一次，那次读同时用于匹配、
+ * 解析与算哈希）。用 `findSkill()` 拿到路径再自己读一次，就等于让"解析用的内容"和
+ * "算哈希的内容"来自两次读 —— 文件在两次读之间被替换会产生一份自相矛盾的结果，
+ * 而流程的版本校验正是靠这个哈希。详见 `loadSkill()`。
  */
 export function findSkill(name: string, dirs: string[] = skillSearchDirs()): SkillMeta | undefined {
   const want = name.trim().toLowerCase();
@@ -135,12 +141,43 @@ export function findSkill(name: string, dirs: string[] = skillSearchDirs()): Ski
   return undefined;
 }
 
-/** 读取技能正文并算内容哈希 */
+/**
+ * 读取技能正文并算内容哈希。
+ *
+ * **只读一次文件**，而且这次读同时用于三件事：匹配技能名、解析 frontmatter、算哈希。
+ *
+ * 为什么这件事重要（而不是性能问题）：Flow 的版本校验拿 `sourceHash` 和解析出来的
+ * 定义做比较。如果"解析用的内容"与"算哈希的内容"来自两次读，文件在两次读之间被替换
+ * 就会产生一份**自相矛盾**的结果 —— 定义来自旧版本、哈希来自新版本，或者反过来。
+ * 那时 `reload()` 会认为"版本没变"而放行，流程接着跑在一个从未被校验过的定义上。
+ * 一次读让"看到的内容"和"记录的哈希"必然指向同一份字节。
+ *
+ * 匹配顺序与 `findSkill()` 一致（目录顺序 → 目录内条目顺序），所以两者挑中的是同一个技能。
+ */
 export function loadSkill(name: string, dirs: string[] = skillSearchDirs()): LoadedSkill | undefined {
-  const meta = findSkill(name, dirs);
-  if (!meta) return undefined;
-  const markdown = readFileSync(path.join(meta.directory, 'SKILL.md'), 'utf-8');
-  return { meta, markdown, sourceHash: sha256(markdown) };
+  const want = name.trim().toLowerCase();
+  if (!want) return undefined;
+  for (const dir of dirs) {
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) continue;
+    for (const sub of readdirSync(dir)) {
+      const file = path.join(dir, sub, 'SKILL.md');
+      if (!existsSync(file)) continue;
+      const markdown = readFileSync(file, 'utf-8');
+      const fm = parseFrontmatter(markdown);
+      const skillName = fm.name || sub;
+      if (skillName.toLowerCase() !== want && sub.toLowerCase() !== want) continue;
+      return {
+        meta: {
+          name: skillName,
+          ...(fm.description ? { description: fm.description } : {}),
+          directory: path.join(dir, sub),
+        },
+        markdown,
+        sourceHash: sha256(markdown),
+      };
+    }
+  }
+  return undefined;
 }
 
 /** 与 execution 上保存的 sourceHash 比对用 */

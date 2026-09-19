@@ -1,5 +1,5 @@
 import type { ActionIntent } from '../execution/types.js';
-import type { FlowContext, ReviewBasePolicy } from './types.js';
+import { requiredVotes, type FlowContext, type ReviewBasePolicy } from './types.js';
 
 /**
  * Skill Flow 的四类服务端扩展点。
@@ -18,6 +18,11 @@ import type { FlowContext, ReviewBasePolicy } from './types.js';
  * （`role` ∩ eligibleRoles、`strategy` 只能 ANY→ALL、`required` 只能加不能减、
  * `exclude` 不能把注册表的禁止自批改成允许）。否则一个可编辑的 Markdown
  * 就能把"要 3 个人批"降成"1 个人批"。
+ *
+ * 还有一条与"收窄"同样重要、但方向不同的规则：**ALL 必须真的是全员**。
+ * ANY 与 ALL 的唯一区别落在票数上，所以 `strategy: ALL + required: 1` 只是
+ * 名字叫 ALL 的 ANY（见 `requiredVotes()`）。三处都要拦：注册表（启动时）、
+ * 校验器（建 execution 前）、runner（运行时 clamp）。
  *
  * 刻意用四个 Map 而不是插件框架：现在是轻量 TS dependency wiring，没有第二个消费者。
  */
@@ -95,23 +100,92 @@ export const flowReviews = new Map<string, FlowReview>();
 export const flowActions = new Map<string, FlowAction>();
 export const flowOutputs = new Map<string, FlowOutput>();
 
+const norm = (s: string): string => s.toLowerCase();
+
+/** 登记名统一小写：查找侧一律 `norm`，登记侧不归一化的话大小写不同 = 查不到 */
+function requireName(kind: string, name: string): string {
+  const id = name.trim();
+  if (!id) throw new Error(`${kind} 的 name 不能为空（它同时是 SKILL.md 里引用的 id）`);
+  return norm(id);
+}
+
+/**
+ * 登记一个 `@gate`。
+ *
+ * `outcomes` 在**启动时**就校验（而不是等跑到那个 gate 才发现）：
+ *
+ *   非空     —— 没有它，校验器无法回答"gate 返回的出口有没有 route"
+ *   归一化   —— route 的出口名由 parser 统一小写，声明里写 `PASS` 会永远匹配不上
+ *   不重复   —— 重复声明只会让作者以为自己声明了两个出口
+ *
+ * 这些在运行期都是"静默失效"型的错误（流程走到那一步才掉进 fail），
+ * 所以宁可让进程起不来。
+ */
 export function registerFlowGate(gate: FlowGate): void {
   if (!gate.outcomes.length) {
     throw new Error(`gate "${gate.name}" 没有声明 outcomes：校验器无法判断出口是否都有 route`);
   }
-  flowGates.set(gate.name, gate);
-}
-export function registerFlowReview(review: FlowReview): void {
-  flowReviews.set(review.name, review);
-}
-export function registerFlowAction(action: FlowAction): void {
-  flowActions.set(action.name, action);
-}
-export function registerFlowOutput(output: FlowOutput): void {
-  flowOutputs.set(output.name, output);
+  const seen = new Set<string>();
+  const outcomes: string[] = [];
+  for (const raw of gate.outcomes) {
+    const outcome = norm(raw.trim());
+    if (!outcome) throw new Error(`gate "${gate.name}" 的 outcomes 里有空字符串`);
+    if (seen.has(outcome)) {
+      throw new Error(`gate "${gate.name}" 的 outcome "${outcome}" 重复声明`);
+    }
+    seen.add(outcome);
+    outcomes.push(outcome);
+  }
+  flowGates.set(requireName('gate', gate.name), { ...gate, outcomes });
 }
 
-const norm = (s: string): string => s.toLowerCase();
+/**
+ * 登记一个 `@review` 的**基策略**。
+ *
+ * 这里校验的是基策略本身的自洽性 —— 它是服务端权威值，一旦不自洽，
+ * SKILL.md 那边无论怎么写都救不回来：
+ *
+ *   eligibleRoles 非空  —— 空数组 = 建出来的任务没人有资格批（流程必然卡死）
+ *   requiredCount ≥ 1   —— 0 票等于自动通过
+ *   ALL ⇒ 票数 ≥ 角色数 —— `ALL + requiredCount: 1` 实际只需要 1 票，
+ *                          ALL 的语义被削弱成 ANY（正是本轮要修的缺陷）
+ */
+export function registerFlowReview(review: FlowReview): void {
+  const key = requireName('review', review.name);
+  const base = reviewBasePolicy(review);
+  if (!base.eligibleRoles.length) {
+    throw new Error(
+      `review "${review.name}" 的 eligibleRoles 为空：一个没人有资格批的任务建出来只会卡住流程`,
+    );
+  }
+  if (!Number.isInteger(base.requiredCount) || base.requiredCount < 1) {
+    throw new Error(
+      `review "${review.name}" 的 requiredCount 必须是 ≥1 的整数（当前：${review.requiredCount}）`,
+    );
+  }
+  if (
+    requiredVotes({
+      strategy: base.strategy,
+      requiredCount: base.requiredCount,
+      roleCount: base.eligibleRoles.length,
+    }) > base.requiredCount
+  ) {
+    throw new Error(
+      `review "${review.name}" 声明了 strategy: ALL 但 requiredCount=${base.requiredCount} < ` +
+        `资格角色数 ${base.eligibleRoles.length}：ALL 的语义是全员通过，票数不能低于角色数` +
+        '（否则它只是名字叫 ALL 的 ANY）。请把 requiredCount 提到 ≥ 角色数，或改成 ANY',
+    );
+  }
+  flowReviews.set(key, review);
+}
+
+export function registerFlowAction(action: FlowAction): void {
+  flowActions.set(requireName('action', action.name), action);
+}
+
+export function registerFlowOutput(output: FlowOutput): void {
+  flowOutputs.set(requireName('output', output.name), output);
+}
 
 export function findFlowGate(name: string): FlowGate | undefined {
   return flowGates.get(norm(name));
@@ -132,12 +206,20 @@ export function findFlowOutput(name: string): FlowOutput | undefined {
  * runner 与校验器都从这里取，避免两边各写一份 `?? 'ANY'` / `?? 1` 的默认值后漂移 ——
  * 一旦漂移，"校验通过但运行时不通过"就会变成一个只在生产出现的怪现象。
  * 类型定义在 `types.ts`（校验器只依赖类型，不依赖注册表实现）。
+ *
+ * `requiredCount` 的缺省值**按策略分叉**：ALL 的语义是全员通过，缺省就该是角色数；
+ * 缺省成 1 会让 `{ strategy: 'ALL', eligibleRoles: [a, b] }` 变成"任一通过"，
+ * 而写它的人明明选了 ALL。这里**不 clamp**（不取 max）—— clamp 会把
+ * "ALL 配了 1 票"这种自相矛盾悄悄抹平，而 `registerFlowReview()` 正需要看见它。
  */
 export function reviewBasePolicy(review: FlowReview): ReviewBasePolicy {
+  const eligibleRoles = review.eligibleRoles.map(norm);
+  const strategy = review.strategy ?? 'ANY';
+  const declared = review.requiredCount ?? (strategy === 'ALL' ? eligibleRoles.length : 1);
   return {
-    eligibleRoles: review.eligibleRoles.map(norm),
-    strategy: review.strategy ?? 'ANY',
-    requiredCount: review.requiredCount ?? 1,
+    eligibleRoles,
+    strategy,
+    requiredCount: declared,
     allowInitiator: review.allowInitiator ?? false,
     ...(review.timeoutSeconds !== undefined ? { timeoutSeconds: review.timeoutSeconds } : {}),
   };

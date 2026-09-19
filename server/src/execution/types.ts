@@ -264,6 +264,24 @@ export const EXECUTION_EVENT_TYPES = {
    */
   workflowWriteConflict: 'workflow.write.conflict',
   workflowWaiting: 'workflow.waiting',
+  /**
+   * 人工任务建出来了，但 workflow 状态没写进去（CAS 冲突）：这条任务成了**孤儿**，
+   * 不会被任何 durable 状态认领，也不会被流程续跑时接上。
+   *
+   * 它会自然过期，过期回调也会被绑定校验拦下（`waitingTaskId` 对不上）。
+   * 单独一条事件是为了让运维排查"多出来的待办"时能找到原因 ——
+   * 它是"先建任务、后落状态"这个顺序的已知代价（见 runner 的类注释）。
+   */
+  workflowOrphanTask: 'workflow.orphan_task',
+  /**
+   * 启动 / 重跑时把"等一个已经存在的任务"的状态接回来。
+   *
+   * 落库顺序是「建任务 → 落 workflow = waiting → 推 execution = waiting_for_approval」，
+   * 所以崩溃可能停在第二与第三步之间：durable 状态说"这一步在等任务 T"，
+   * 而 execution 还是 running。没有这一步对账，重跑会把那个节点**再执行一遍**，
+   * 于是同一个 review 建出第二条人工任务（第一条还挂在别人的"我的任务"里）。
+   */
+  workflowWaitingReconciled: 'workflow.waiting.reconciled',
   workflowResumed: 'workflow.resumed',
   workflowCompleted: 'workflow.completed',
   workflowFailed: 'workflow.failed',

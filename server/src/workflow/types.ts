@@ -199,6 +199,32 @@ export function isFlowPermissionKind(value: string): value is FlowPermissionKind
 }
 
 /**
+ * workflow `@agent` **永远**允许的权限类别，也就是它的硬上限。
+ *
+ * 这是代码里的不变式，不是配置：`COPILOT_WORKFLOW_AGENT_TOOLS` 只能从中挑选，
+ * 挑不出 `mcp` / `shell`；`resolveAgentTools()` 也会再过滤一遍（fail-closed 的最后一道）。
+ *
+ * 为什么必须是硬编码而不是"配置默认值"：`mcp` / `shell` 是 agent **绕开 `@action`
+ * 审批直接对外产生业务副作用**的两条路（调 MCP server 把报告发出去、用 shell curl
+ * 一个内部下单接口）。把它们做成配置默认值等于说"一个环境变量就能取消整条流程的
+ * 授权模型"—— 而 SKILL.md、审批记录、审计链上都不会留下任何痕迹。
+ * 要放开必须先改这一行（一次代码评审）。
+ */
+export const WORKFLOW_AGENT_ALLOWED_KINDS: readonly FlowPermissionKind[] = [
+  'read',
+  'write',
+  'url',
+];
+
+/** 相对硬上限被禁止的类别（用于报错信息：说清"为什么它不行"） */
+export const WORKFLOW_AGENT_FORBIDDEN_KINDS: readonly FlowPermissionKind[] =
+  FLOW_PERMISSION_KINDS.filter((k) => !WORKFLOW_AGENT_ALLOWED_KINDS.includes(k));
+
+export function isWorkflowAgentKind(value: string): value is FlowPermissionKind {
+  return (WORKFLOW_AGENT_ALLOWED_KINDS as readonly string[]).includes(value);
+}
+
+/**
  * `@review` 的**生效基策略** —— 服务端注册表的权威值（可选字段已补成确定值）。
  *
  * 放在这里而不是 registry.ts，是为了让校验器只依赖类型定义，不依赖注册表实现：
@@ -212,6 +238,31 @@ export interface ReviewBasePolicy {
   /** 是否允许发起人自批（SoD）；false 时 SKILL.md 不能写 `exclude: none` */
   allowInitiator: boolean;
   timeoutSeconds?: number;
+}
+
+/**
+ * `strategy: ALL` 下**至少**要几票 —— 也就是"全员通过"这一条语义的唯一出处。
+ *
+ * 为什么需要它：ANY 与 ALL 的唯一区别就落在票数上。`strategy: ALL` 配 `required: 1`
+ * 时，`evaluateApproval()` 拿到的还是 `required = 1`，实际效果与 ANY 完全一样 ——
+ * ALL 只是**一个名字**，审批强度一点没变。这种"看起来更严、实际一样"的写法
+ * 比写错更危险，因为审计链上写着 ALL，没人会再去核对票数。
+ *
+ * 三处共用这一条规则，避免各写一份后漂移：
+ *   registry   启动时拒绝自相矛盾的基策略（`ALL + requiredCount < 角色数`）
+ *   validator  执行前拒绝自相矛盾的 SKILL.md 属性（`ALL + required < 角色数`）
+ *   runner     运行时 clamp 一次（fail-closed 的最后一道，不信任校验器被调用过）
+ *
+ * 用 `max` 而不是直接取角色数：票数只能加不能减。声明了比角色数更多的票
+ * （`ALL + required: 5`、3 个角色）仍然允许 —— 那需要 5 个人批，比"全员"更严。
+ */
+export function requiredVotes(input: {
+  strategy: 'ANY' | 'ALL';
+  requiredCount: number;
+  roleCount: number;
+}): number {
+  const { strategy, requiredCount, roleCount } = input;
+  return strategy === 'ALL' ? Math.max(requiredCount, roleCount) : requiredCount;
 }
 
 /** 完成契约 / gate 名等流程内引用的 id 形态（与业务角色 id 同一套规则） */

@@ -62,7 +62,10 @@ export interface FlowGateRun {
 export type FlowActionRun =
   /** 动作已经有结论（auto_approve 执行完 / 审批通过后执行完） */
   | { status: 'executed'; ok: boolean; error?: string; detail: Record<string, unknown> }
-  /** 需要人工审批：流程暂停，等任务收敛后续跑 */
+  /**
+   * 需要人工审批：审批任务**已经建好**（taskId 有效），但 execution 还没被推到
+   * waiting_for_approval —— 那是 runner 的事（见下面的 runAction 契约）。
+   */
   | { status: 'waiting'; taskId: string; detail: Record<string, unknown> }
   /** 策略直接拒绝（含"动作类型未登记"、"流程角色越界"）—— 走 fail 出口 */
   | { status: 'denied'; reason: string; detail: Record<string, unknown> };
@@ -76,6 +79,18 @@ export interface FlowNodeRuntime {
     prompt: string;
   }): Promise<FlowAgentRun>;
   runGate(input: { ctx: FlowContext; node: FlowNode }): Promise<FlowGateRun>;
+  /**
+   * 执行一个 `@action` 节点。
+   *
+   * **契约：它只负责"把审批任务建出来"，绝不改 execution 的状态。**
+   * 需要审批时返回 `{ status: 'waiting', taskId }` 就结束，`waiting_for_approval`
+   * 由 runner 在把 `workflow.stepStatus = waiting` 落库之后自己迁移。
+   *
+   * 为什么把这件事从执行器里拿出来：两个写者（执行器 + runner）都改 execution 时，
+   * 崩溃窗口里留下的状态是**不可判定**的 —— `execution = waiting_for_approval`
+   * 配 `workflow.stepStatus = running`，"这一步在等人工"与"这一步要重放"同时成立。
+   * 状态机的所有权必须只有一份。
+   */
   runAction(input: {
     execution: ExecutionRecord;
     node: FlowNode;
@@ -133,7 +148,8 @@ export class DefaultFlowNodeRuntime implements FlowNodeRuntime {
   }): Promise<FlowAgentRun> {
     const { execution, state, node, ctx, prompt } = input;
     const kinds = new Set(resolveAgentTools(this.deps.agentTools, node.attrs.tools));
-    setAgentCapability(execution.sessionId, { kinds, nodeId: node.id, flow: state.flow });
+    const ref = { executionId: execution.executionId, nodeId: node.id };
+    setAgentCapability(execution.sessionId, { ...ref, kinds, flow: state.flow });
     try {
       const result = await this.deps.runTurn({
         execution: {
@@ -176,7 +192,9 @@ export class DefaultFlowNodeRuntime implements FlowNodeRuntime {
       // 跑不动是流程里一个**可路由**的出口（`- fail -> research-failed`），不是编排器崩溃
       return { ok: false, content: '', chars: 0, error: errMsg(err) };
     } finally {
-      clearAgentCapability(execution.sessionId, node.id);
+      // 只清自己设的那一份（executionId + nodeId 都要对得上）：本 finally 在 turn 槽
+      // **外面**跑，槽一释放，同一会话里的下一条 execution 就可能已经设上自己的边界了
+      clearAgentCapability(execution.sessionId, ref);
     }
   }
 
@@ -201,6 +219,9 @@ export class DefaultFlowNodeRuntime implements FlowNodeRuntime {
    *
    * `@action role:` 只**收窄**该动作类型的审批资格，不会放宽；
    * 交集为空时 ActionService 直接拒绝，流程走 `- fail -> ...`。
+   *
+   * 需要审批时走 `deferWaitingTransition`：**只建任务，不推 execution 状态**。
+   * 原因是 durable 状态必须由 runner 单写 —— 见 `FlowNodeRuntime.runAction` 的契约说明。
    */
   async runAction(input: {
     execution: ExecutionRecord;
@@ -221,6 +242,7 @@ export class DefaultFlowNodeRuntime implements FlowNodeRuntime {
       workflow: {
         nodeId: node.id,
         ...(node.attrs.role ? { restrictRoles: [node.attrs.role] } : {}),
+        deferWaitingTransition: true,
       },
     });
 

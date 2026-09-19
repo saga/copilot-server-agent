@@ -48,6 +48,8 @@ start -> flow-demo
 
 ## @agent flow-demo
 
+output: non-empty
+
 做研究，输出带证据的结论。
 
 - success -> demo-gate
@@ -125,6 +127,9 @@ const LEGACY_MD = SKILL_MD.replace('## @agent flow-demo', '## @subagent flow-dem
 /**
  * 保留属性：`@review` 声明**业务角色**（不是 AD Group），`@action` 把审批资格收窄。
  * 校验器要求 role 必须已登记，所以在用例里注册一个（组 ID 用可读串，等价于 Entra object ID）。
+ *
+ * `@agent` 上的 `output: non-empty` 不是装饰：`COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT`
+ * 默认开，没有完成契约的 `@agent` 会直接校验不过（见 config.ts）。
  */
 const ROLE_MD = `---
 name: flow-role
@@ -136,6 +141,8 @@ description: 保留属性用
 start -> flow-role
 
 ## @agent flow-role
+
+output: non-empty
 
 做研究。
 
@@ -184,6 +191,8 @@ start -> flow-bad-role
 
 ## @agent flow-bad-role
 
+output: non-empty
+
 做研究。
 
 - success -> demo-action
@@ -209,10 +218,15 @@ role: demo.reviewer
 
 /**
  * 在 `@agent flow-demo` 正文最前面插入保留属性行。
- * 属性区必须**紧跟标题**（parser 只认最前面连续的一段 `name: value`）。
+ *
+ * 属性区必须**紧跟标题、且连续**（parser 只认最前面连续的一段 `name: value`）——
+ * 所以已有的 `output:` 和追加的属性之间不能有空行，否则后面那些会被当成正文。
  */
 const agentWithAttrs = (...attrs: string[]): string =>
-  SKILL_MD.replace('## @agent flow-demo\n\n', `## @agent flow-demo\n\n${attrs.join('\n')}\n\n`);
+  SKILL_MD.replace(
+    '## @agent flow-demo\n\noutput: non-empty\n',
+    `## @agent flow-demo\n\n${['output: non-empty', ...attrs].join('\n')}\n`,
+  );
 
 function writeSkills(files: Record<string, string>): string {
   const dir = mkdtempSync(path.join(tmpdir(), 'copilot-flow-'));
@@ -893,7 +907,7 @@ test('编排：@agent 的 tools 只能收窄（tools: read → 只剩 read）', 
 });
 
 test('编排：@agent 的完成契约没过 → 走可路由的 fail 出口，不是 success', async () => {
-  const dir = writeSkills({ 'flow-demo/SKILL.md': agentWithAttrs('output: non-empty') });
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
 
@@ -911,9 +925,159 @@ test('编排：@agent 的完成契约没过 → 走可路由的 fail 出口，�
 });
 
 test('编排：@agent 的完成契约过了就照常推进', async () => {
-  const dir = writeSkills({ 'flow-demo/SKILL.md': agentWithAttrs('output: non-empty') });
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
   const w = wire(dir);
   const id = await startWorkflow(w);
   await w.runner.run(id);
   assert.equal((await w.executions.get(id))!.status, 'waiting_for_approval');
+});
+
+test('校验：@agent 没声明完成契约时 prepare 直接失败（默认强制）', () => {
+  // 把 output: 那行去掉 —— 没有契约的 @agent 在默认配置下不该能建出 execution
+  const noOutput = SKILL_MD.replace('output: non-empty\n\n', '');
+  const dir = writeSkills({ 'flow-demo/SKILL.md': noOutput });
+  const w = wire(dir);
+  const r = w.runner.validate({ skill: 'flow-demo', flow: 'demo' });
+  assert.equal(r.ok, false);
+  const hit = r.issues.find((i) => i.code === 'agent-output-missing');
+  assert.ok(hit, '没有完成契约必须报 agent-output-missing');
+  assert.match(hit!.message, /output:/);
+});
+
+// ---------- 进入等待态的顺序（崩溃窗口） ----------
+
+/**
+ * 落库顺序必须是「建任务 → 落 workflow=waiting → 迁移 execution」。
+ *
+ * 反过来的话，中间崩溃会留下 `execution = waiting_for_approval` + `workflow.stepStatus
+ * = running`：恢复时"这一步在等人工"和"这一步要重放"同时成立，谁也不知道该信哪个 ——
+ * 信前者会漏掉一步，信后者会重复提交。
+ *
+ * 本用例构造的是**新顺序**下的崩溃残留（`workflow = waiting` + `execution = running`），
+ * 它必须是**可判定**的：任务已经建出来了，重跑只该把它接回来，绝不能再执行一遍节点。
+ */
+test('编排：crash 在建任务与迁移之间 → 重跑只接回任务，不重复执行节点、不重复建任务', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+  await w.runner.run(id);
+
+  const paused = (await w.executions.get(id))!;
+  assert.equal(paused.status, 'waiting_for_approval');
+  const taskId = paused.workflow!.waitingTaskId!;
+  const promptsBefore = seenPrompts.length;
+
+  // 构造崩溃残留：workflow 已经是 waiting（任务也建好了），但 execution 回到 running。
+  // 走的是状态机允许的路径（waiting_for_approval → resuming → running），
+  // 也就是"进程在落完 workflow 状态、还没迁移 execution 时被杀"的等价形态。
+  await w.executions.transition(id, 'resuming');
+  await w.executions.transition(id, 'running');
+
+  await w.runner.run(id);
+
+  const after = (await w.executions.get(id))!;
+  assert.equal(
+    after.status,
+    'waiting_for_approval',
+    '重跑必须把它接回等待态，而不是重放 @review（那会再建一条人工任务）',
+  );
+  assert.equal(after.workflow?.stepStatus, 'waiting');
+  assert.equal(after.workflow?.current, 'demo-review');
+  assert.equal(after.workflow?.waitingTaskId, taskId, '等的还是原来那条任务');
+  assert.equal(seenPrompts.length, promptsBefore, '@agent 一步都不该重跑');
+  assert.equal(
+    (await w.humanTasks.repository.list({ executionId: id })).length,
+    1,
+    '不能出现第二条人工任务（重复的待办会同时挂到审核人的"我的任务"里）',
+  );
+  assert.ok(
+    (await eventTypes(w, id)).includes(EVT.workflowWaitingReconciled),
+    '对账必须在时间线上留痕',
+  );
+
+  // 接回来的任务仍然能正常续跑（对账没有破坏绑定校验）
+  await w.humanTasks.approve(taskId, { principal: REVIEWER });
+  const resumed = (await w.executions.get(id))!;
+  assert.equal(resumed.status, 'waiting_for_approval', '继续走到 @action 的审批');
+  assert.equal(resumed.workflow?.current, 'demo-action');
+});
+
+test('编排：等待态但没记任务 id → 落 failed，而不是永远等一个不存在的任务', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 手工构造一个不完整的状态：在等待态，但没有任何任务可等
+  const rec = (await w.executions.get(id))!;
+  await w.executions.updateWorkflowState(id, {
+    ...rec.workflow!,
+    current: 'demo-review',
+    stepStatus: 'waiting',
+    waitingTaskId: undefined,
+  });
+
+  await w.runner.run(id);
+  const after = (await w.executions.get(id))!;
+  assert.equal(after.status, 'failed');
+  assert.match(String(after.error), /没有记录任务 id/);
+});
+
+test('编排：落 workflow=waiting 撞上版本冲突 → 不迁移 execution，任务记为孤儿', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 只让"落 waiting"那一次写入冲突（其余写入照常）：模拟另一个推进者刚好在这时抢到版本
+  const orig = w.executions.updateWorkflowState.bind(w.executions);
+  w.executions.updateWorkflowState = async (execId, state, version) =>
+    state.stepStatus === 'waiting' ? { ok: false, conflict: true } : orig(execId, state, version);
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(
+    rec.status,
+    'running',
+    '迁移排在落状态之后：状态没写进去就绝不能把 execution 推到 waiting_for_approval',
+  );
+  assert.equal(rec.workflow?.stepStatus, 'running', 'durable 状态没有被写进去');
+  assert.ok(!rec.workflow?.waitingTaskId);
+
+  const types = await eventTypes(w, id);
+  assert.ok(types.includes(EVT.workflowWriteConflict));
+  assert.ok(types.includes(EVT.workflowOrphanTask), '孤儿任务必须留痕（运维要能解释多出来的待办）');
+  assert.ok(
+    !types.includes(EVT.waitingForApproval),
+    '没有真的进入等待，就不该有"已进入等待"的事件 —— 那会让审计链说谎',
+  );
+  assert.equal(
+    (await w.humanTasks.repository.list({ executionId: id })).length,
+    1,
+    '任务确实已经建出来了 —— 这正是"先建任务"这个顺序的已知代价',
+  );
+});
+
+test('编排：crash 在 @review 中途 → 不重放（重放会建出第二条一样的待办）', async () => {
+  const dir = writeSkills({ 'flow-demo/SKILL.md': SKILL_MD });
+  const w = wire(dir);
+  const id = await startWorkflow(w);
+
+  // 进程在"建任务"与"落 waiting"之间退出：durable 状态停在 running，但任务可能已经存在
+  const rec0 = (await w.executions.get(id))!;
+  await w.executions.updateWorkflowState(id, {
+    ...rec0.workflow!,
+    current: 'demo-review',
+    stepStatus: 'running',
+    steps: 2,
+  });
+
+  await w.runner.run(id);
+  const rec = (await w.executions.get(id))!;
+  assert.equal(rec.status, 'failed', '不确定任务建没建出来 → 停下来问人');
+  assert.match(String(rec.error), /不自动重放/);
+  assert.match(String(rec.error), /我的任务/, '要告诉人先去哪里核对，而不是只说"失败了"');
+  assert.equal(
+    (await w.humanTasks.repository.list({ executionId: id })).length,
+    0,
+    '一步都不该重跑，所以不该有任务被建出来',
+  );
 });

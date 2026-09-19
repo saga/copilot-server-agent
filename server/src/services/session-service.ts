@@ -34,6 +34,7 @@ import type { CollaborationMode } from '../collaboration/types.js';
 import { createPermissionHandler } from './tool-policy.js';
 import { createToolEvidenceHooks } from './tool-evidence.js';
 import { agentCapabilityFor } from '../workflow/capability.js';
+import { executionContext } from '../agent/agent-context.js';
 import { sqliteFilePath, type StateBackend } from '../db/connection.js';
 import type { ExecutionStats } from '../execution/repository.js';
 
@@ -476,6 +477,9 @@ class SessionService {
       mcpServers: mcpServers ? Object.keys(mcpServers) : [],
       // Skill Flow 的 @agent 能力边界：跑到流程节点时才有值，所以按请求现取（见 capability.ts）
       capability: () => agentCapabilityFor(sessionId),
+      // 边界是"会话级存放、execution 级生效"：再对一次账，避免上一轮节点的边界
+      // 作用到本轮的另一条 execution 上（见 tool-policy 第 0 层）
+      activeExecution: () => executionContext.current(sessionId),
     };
     // Hooks：预设按名启用；传 sessionContext/agentStopChecklist 自动启用对应预设；
     // 工具证据 + workspace 守卫（onPreToolUse/onPostToolUse/onPostToolUseFailure）为强制项，

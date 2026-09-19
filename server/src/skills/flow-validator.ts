@@ -3,7 +3,9 @@ import { BUSINESS_ROLE_ID } from '../identity/business-roles.js';
 import {
   FLOW_CONTRACT_ID,
   NODE_OUTCOMES,
+  WORKFLOW_AGENT_ALLOWED_KINDS,
   isFlowPermissionKind,
+  requiredVotes,
   type FlowDefinition,
   type FlowIssue,
   type FlowNode,
@@ -16,7 +18,7 @@ import {
 /**
  * Flow 静态校验。**在执行之前**把问题全部报出来，不要跑到一半才发现路由指向不存在的节点。
  *
- * 只做 13 件事（刻意不做 DAG 校验）：
+ * 只做 14 件事（刻意不做 DAG 校验）：
  *   1. 恰好一个 @flow（v1 一个技能一条流程）
  *   2. @flow 声明了 start，且 start 不重复
  *   3. 节点 id 唯一
@@ -30,8 +32,11 @@ import {
  *  11. **属性只能比服务端更严**：`role` 必须落在注册表的 eligibleRoles 里，
  *      `strategy` 只能 ANY→ALL，`required` 只能加不能减，`exclude` 不能把禁止自批改成允许
  *      （否则一份可编辑的 Markdown 就能把"要 3 个人批"降成"1 个人批"）
- *  12. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
- *  13. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 只能比服务端上限更严
+ *  12. **`strategy: ALL` 必须真的全员**：生效票数 < 生效角色数 → `review-all-required`
+ *      （`ALL + required: 1` 只是名字叫 ALL 的 ANY，审计链上却写着 ALL）
+ *  13. **@gate 的出口与注册表声明一致**：声明的出口必须有 route，route 的出口必须被声明
+ *  14. **@agent 的完成契约与能力边界**：`output:` 必须已注册；`tools:` 里
+ *      `mcp` / `shell` 永久禁止（`agent-tools-forbidden`），其余只能比服务端上限更严
  *
  * `@agent <skill>` 指向的技能是否存在由调用方补校验（校验器不认识技能目录）；
  * `role:` 指向的业务角色是否已登记同理（见 `opts.hasRole`）。
@@ -258,6 +263,14 @@ function checkDuplicateOutcomes(
  *   strategy  原先是覆盖（ALL 3 票 → ANY 1 票）→ 现在只能 ANY→ALL
  *   required  原先是覆盖（要 3 票 → 要 1 票）→ 现在只能 ≥ 基策略
  *   exclude   原先是覆盖（禁止自批 → 允许自批）→ 现在不能把 false 改成 true
+ *
+ * 还有一条不是"放宽 vs 收窄"、而是"名不副实"的检查：**`strategy: ALL` 必须真的全员**。
+ * ANY 与 ALL 的唯一区别落在票数上，所以 `ALL + required: 1`（3 个资格角色）
+ * 实际仍然只需要 1 票 —— 它只是名字叫 ALL 的 ANY。这种写法比写错更危险：
+ * 审批链上写着 ALL，没人会再去核对票数。
+ *
+ * 判定用的是**生效值**（属性收窄之后），而不是 SKILL.md 的字面值：
+ * `role: risk` 把 3 个角色收窄成 1 个之后，`ALL + required: 1` 就是合法的全员通过。
  */
 function checkNarrowing(input: {
   node: FlowNode;
@@ -270,6 +283,14 @@ function checkNarrowing(input: {
   const push = (message: string): void => {
     issues.push({ code: 'attr-widens', line: node.headingLine, nodeId: node.id, message });
   };
+
+  // 生效策略：四个属性全部按"只能更严"折算之后的结果（与 runner.reviewPolicyFor 一致）
+  const strategy = base.strategy === 'ALL' ? 'ALL' : (attrs.strategy ?? 'ANY');
+  const roles = attrs.role
+    ? base.eligibleRoles.filter((r) => r === attrs.role)
+    : base.eligibleRoles;
+  const required =
+    attrs.required !== undefined ? Math.max(base.requiredCount, attrs.required) : base.requiredCount;
 
   if (attrs.role && !base.eligibleRoles.includes(attrs.role)) {
     issues.push({
@@ -297,6 +318,24 @@ function checkNarrowing(input: {
     push(
       `${label} 的 exclude: none 放宽了注册表的 SoD 要求（基策略不允许发起人自批）`,
     );
+  }
+
+  // ALL 的语义校验：票数必须覆盖全部**生效**角色，否则 ALL 只是一个名字。
+  // 只有 role 合法时才有意义 —— role 越界时 roles 是空集，这里不再叠一条报错。
+  if (roles.length) {
+    const need = requiredVotes({ strategy, requiredCount: required, roleCount: roles.length });
+    if (need > required) {
+      issues.push({
+        code: 'review-all-required',
+        line: node.headingLine,
+        nodeId: node.id,
+        message:
+          `${label} 的 strategy: ALL 要求全员通过，但生效票数是 ${required}，` +
+          `而生效的资格角色有 ${roles.length} 个（${roles.join(' / ')}）—— ` +
+          `实际仍然只需要 ${required} 票，ALL 被削弱成了 ANY。` +
+          `要么写 required: ${roles.length}（或更多），要么把 strategy 改回 ANY`,
+      });
+    }
   }
 }
 
@@ -549,30 +588,54 @@ export function validateSkillFlow(
     }
   }
 
-  // 8c. `@agent tools:` 只能比服务端上限更严。
-  // 上限默认不含 mcp/shell —— 那两样正是绕开 @action 审批直接产生业务副作用的路径。
-  const ceiling = opts.agentTools;
-  if (ceiling) {
-    for (const node of Object.values(nodes)) {
-      if (node.type !== 'agent' || !node.attrs.tools) continue;
-      const outside = node.attrs.tools.filter((t) => !ceiling.includes(t));
-      if (outside.length) {
-        issues.push({
-          code: 'agent-tools-widens',
-          line: node.headingLine,
-          nodeId: node.id,
-          message:
-            `@agent ${node.id} 的 tools: ${outside.join('、')} 超出服务端允许的 ` +
-            `${ceiling.join(' / ') || '(空)'} —— 能力边界只能收窄。` +
-            '要放开请改服务端配置（COPILOT_WORKFLOW_AGENT_TOOLS），不要改 SKILL.md',
-        });
-      }
+  // 8c. `@agent tools:`：**硬禁止** + 部署上限。
+  //
+  // 硬禁止（mcp / shell）与部署配置无关，所以**无条件**检查 —— 它们是 agent 绕开
+  // `@action` 审批、直接对外产生业务副作用的两条路（调 MCP server 发报告、
+  // 用 shell curl 内部接口）。SKILL.md 写 `tools: mcp` 就是在要求放宽授权模型，
+  // 必须在校验期拦住，而不是"等它落进上限判定、看起来像个配置问题"。
+  //
+  // 上限（opts.agentTools）是部署侧的（COPILOT_WORKFLOW_AGENT_TOOLS），只在提供时检查。
+  for (const node of Object.values(nodes)) {
+    if (node.type !== 'agent' || !node.attrs.tools) continue;
+
+    const forbidden = node.attrs.tools.filter(
+      (t) => !WORKFLOW_AGENT_ALLOWED_KINDS.includes(t),
+    );
+    if (forbidden.length) {
+      issues.push({
+        code: 'agent-tools-forbidden',
+        line: node.headingLine,
+        nodeId: node.id,
+        message:
+          `@agent ${node.id} 的 tools: ${forbidden.join('、')} 是**永久禁止**的权限类别。` +
+          'MCP server 与 shell 都是"绕过流程审批直接对外产生副作用"的路径，' +
+          '业务动作只能走流程里声明的 @action 节点（策略 → 审批 → hash/版本复核 → executor）。' +
+          `这不是配置项：改 COPILOT_WORKFLOW_AGENT_TOOLS 也不会生效（可用：${WORKFLOW_AGENT_ALLOWED_KINDS.join(' / ')}）`,
+      });
+      continue;
+    }
+
+    const ceiling = opts.agentTools;
+    if (!ceiling) continue;
+    const outside = node.attrs.tools.filter((t) => !ceiling.includes(t));
+    if (outside.length) {
+      issues.push({
+        code: 'agent-tools-widens',
+        line: node.headingLine,
+        nodeId: node.id,
+        message:
+          `@agent ${node.id} 的 tools: ${outside.join('、')} 超出服务端允许的 ` +
+          `${ceiling.join(' / ') || '(空)'} —— 能力边界只能收窄。` +
+          '要放开请改服务端配置（COPILOT_WORKFLOW_AGENT_TOOLS），不要改 SKILL.md',
+      });
     }
   }
 
   // 8d. 完成契约：开启 requireAgentOutput 时，每个 @agent 都必须声明。
-  // 不做成默认，是因为它会让已有的 SKILL.md 全部校验不过；但生产环境应当开启 ——
+  // 生产 wiring 默认就是开的（config.workflowRequireAgentOutput 默认 true）——
   // 没有契约时 `@agent success` 只等于"turn 没抛异常"，模型回一句"我无法完成"也是 success。
+  // 这个开关留给"存量 SKILL.md 还没补契约"的迁移期。
   if (opts.requireAgentOutput) {
     for (const node of Object.values(nodes)) {
       if (node.type !== 'agent' || node.attrs.output) continue;

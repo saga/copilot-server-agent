@@ -5,7 +5,7 @@ import type { ExecutionRecord } from '../execution/types.js';
 import { EXECUTION_EVENT_TYPES as EVT, isTerminal } from '../execution/types.js';
 import type { HumanTaskService } from '../human-tasks/human-task-service.js';
 import type { HumanTask } from '../human-tasks/types.js';
-import { findSkill, loadSkill, skillSearchDirs, type LoadedSkill } from '../skills/index.js';
+import { skillSearchDirs, type LoadedSkill } from '../skills/index.js';
 import type { ApprovalPolicy } from '../approval/types.js';
 import { parseAgentTools } from './capability.js';
 import {
@@ -20,6 +20,7 @@ import {
 import { findFlowReview, flowRegistryLookup, reviewBasePolicy } from './registry.js';
 import {
   MAX_FLOW_STEPS,
+  requiredVotes,
   type FlowContext,
   type FlowDefinition,
   type FlowIssue,
@@ -58,6 +59,25 @@ import {
  * 恢复策略见 `admitInterruptedStep()`：`@agent` / `@gate` 是纯计算，允许重放；
  * `@action` 有真实副作用，**不自动重放**，落 failed 交人工核对（幂等键只能防重复提交，
  * 防不了"外部系统已经生效但本地没记上"）。
+ *
+ * ## 进入等待态的顺序（`@review` / `@action`）
+ *
+ * 三步，顺序不能换：
+ *
+ *   1. 建人工任务（拿到 taskId）
+ *   2. CAS 落 `workflow.stepStatus = waiting` + `waitingTaskId`
+ *   3. 把 execution 迁移到 `waiting_for_approval`
+ *
+ * 先做 3 再做 2 会留下一个**不可判定**的崩溃窗口：`execution = waiting_for_approval`
+ * 配 `workflow.stepStatus = running` —— 恢复时"这一步在等人工"和"这一步要重放"
+ * 同时成立，没有任何字段能判断该信哪个（前者会漏掉一步，后者会重复提交）。
+ *
+ * 按上面的顺序，崩溃留下的最长是 `stepStatus = waiting` + `execution = running`：
+ * 任务确实已经建出来了，只需要把它接回来（`reconcileWaiting()`）。
+ *
+ * 代价是 2 与 3 之间崩溃会留下一条**孤儿人工任务**（流程那边会重新走一遍）。这是
+ * 刻意选的：任务会自然过期，过期回调也会被 `resumeFromTask()` 的绑定校验拦下；
+ * 而"流程状态不可判定"是没法靠超时自愈的。
  *
  * ## 单写者（single writer）
  *
@@ -110,6 +130,10 @@ const OUTPUT_MAX_CHARS = 4000;
  * 允许"重放"的节点类型：纯计算，重跑只是多花一次算力，不会留下副作用。
  *
  * `@action` **刻意不在里面**：它可能已经把动作做出去了，重放等于重复提交。
+ *
+ * `@review` 同样不在里面：它的产物是一条人工任务，而"任务建没建出来"没法从 durable
+ * 状态判断（`waitingTaskId` 是建完之后才写的）。重放会建出第二条一样的待办，
+ * 审核人无从分辨哪条作数。见 `admitInterruptedStep()`。
  */
 const REPLAY_SAFE_NODE_TYPES: ReadonlySet<FlowNodeType> = new Set<FlowNodeType>(['agent', 'gate']);
 
@@ -171,10 +195,17 @@ class StateWriter {
  *   required  → 只能 ≥ 基策略票数
  *   exclude   → 只能把"允许自批"关掉，不能打开
  *
+ * 外加一条**与收窄方向不同**的规则：`strategy: ALL` 必须真的是全员。
+ * ANY 与 ALL 的唯一区别落在票数上，所以 `ALL + required: 1`（3 个资格角色）
+ * 实际仍然只需要 1 票 —— 它只是名字叫 ALL 的 ANY。校验器会静态拒绝这种写法，
+ * 这里再用 `requiredVotes()` clamp 一次（见 types.ts）。
+ *
  * 运行时再 clamp 一次（而不是信任校验器）：校验器可能没被调用（比如直接构造
  * WorkflowState），而这里的 clamp 是 fail-closed 的最后一道。
+ *
+ * 导出给单测：这是一个纯函数，直接验它比"造一份校验器拦不住的定义再跑一遍流程"清楚得多。
  */
-function reviewPolicyFor(
+export function reviewPolicyFor(
   node: FlowNode,
   base: ReturnType<typeof reviewBasePolicy>,
 ): { policy: ApprovalPolicy } | { error: string } {
@@ -192,16 +223,20 @@ function reviewPolicyFor(
         '（一个没人有资格批的任务不该被建出来）',
     };
   }
+  // 基策略是 ALL 时无论 SKILL.md 写什么都保持 ALL
+  const strategy = base.strategy === 'ALL' ? 'ALL' : (attrs.strategy ?? 'ANY');
+  const requiredCount = requiredVotes({
+    strategy,
+    requiredCount:
+      attrs.required !== undefined ? Math.max(base.requiredCount, attrs.required) : base.requiredCount,
+    roleCount: roles.length,
+  });
   return {
     policy: {
       policyId: `workflow-review:${node.id}`,
       actionType: `workflow.review.${node.id}`,
-      // 基策略是 ALL 时无论 SKILL.md 写什么都保持 ALL
-      strategy: base.strategy === 'ALL' ? 'ALL' : (attrs.strategy ?? 'ANY'),
-      requiredCount:
-        attrs.required !== undefined
-          ? Math.max(base.requiredCount, attrs.required)
-          : base.requiredCount,
+      strategy,
+      requiredCount,
       eligibleRoles: roles,
       // SoD：基策略没开就一律不许自批（`exclude: none` 不能把 false 改成 true）
       allowInitiator: base.allowInitiator && attrs.exclude !== 'initiator',
@@ -309,9 +344,61 @@ export class WorkflowRunner {
           start: state.current,
         });
       }
+      // 等待态对账必须在"重跑节点"之前：这一步不是在等新东西，它在等一个**已经存在**的任务
+      if (await this.reconcileWaiting(rec, state)) return;
       if (!(await this.admitInterruptedStep(executionId, state, loaded.definition))) return;
       await this.loop(rec, state, loaded.definition, rec.workflowVersion ?? 0);
     });
+  }
+
+  /**
+   * 等待态的**对账**：durable 状态说"这一步在等任务 T"，execution 该不该在 waiting。
+   *
+   * 为什么需要它 —— 落库顺序是
+   *
+   *     建人工任务 → 落 workflow.stepStatus = waiting（带 waitingTaskId）→ 推 execution
+   *
+   * 崩溃可能停在第二步与第三步之间，留下 `stepStatus = waiting` + `execution = running`。
+   * 那是一个**可判定**的状态（任务已经建出来了，只是没接上），但只有主动对账才能把它接上：
+   * 不管它的话，`/run` 会把那个节点**再执行一遍** —— 同一个 review 建出第二条人工任务
+   * （第一条还挂在审核人的"我的任务"里），或者同一个动作被再次提交。
+   *
+   * 反过来的顺序（先 transition 再落 workflow）就没法对账了：`execution =
+   * waiting_for_approval` + `workflow.stepStatus = running` 时，"在等人工"与
+   * "要重放这一步"同时成立，没有任何字段能判断该信哪个。
+   *
+   * @returns true = 已经收敛（调用方必须停止推进，等任务回调）
+   */
+  private async reconcileWaiting(rec: ExecutionRecord, state: WorkflowState): Promise<boolean> {
+    if (state.stepStatus !== 'waiting') return false;
+    const executionId = rec.executionId;
+    const taskId = state.waitingTaskId;
+
+    if (!taskId) {
+      // 等一个不存在的任务 = 永远等下去。宁可落 failed 让人看见，也不要留在这里
+      await this.failWorkflow(
+        executionId,
+        state,
+        `节点 "${state.current}" 处于等待态但没有记录任务 id：状态不完整，无法接回人工任务`,
+      );
+      return true;
+    }
+
+    if (rec.status === 'running') {
+      // 崩溃窗口：任务已经存在，把 execution 接回等待态，然后等任务回调（不再重跑节点）
+      await this.append(executionId, EVT.workflowWaitingReconciled, {
+        nodeId: state.current,
+        taskId,
+        note: '任务已存在但 execution 仍是 running（上一次推进在建任务与迁移之间退出），已接回等待态',
+      });
+      await this.deps.executions.transition(executionId, 'waiting_for_approval', {
+        currentHumanTaskId: taskId,
+        waitReason: 'approval',
+      });
+      return true;
+    }
+    // waiting_for_approval = 正常在等；终态 = 已经收敛（任务回调被绑定校验拦下）
+    return true;
   }
 
   /**
@@ -343,7 +430,11 @@ export class WorkflowRunner {
    * 这是 `stepStatus` 存在的全部意义：只有它能把"这一步已经开始过"和"这一步还没跑"区分开。
    *
    *   @agent / @gate  纯计算 → 记一条审计后直接重跑
-   *   @action         有副作用 → 不重放，落 failed 交人工核对
+   *   @review / @action  已经开始过 → **不重放**，落 failed 交人工核对
+   *
+   * `@review` 也归到"不重放"：它的执行结果是一条人工任务，而任务一旦建出来就没法从
+   * durable 状态里看出来（`waitingTaskId` 是在建完之后才写的）。重放会建出第二条任务，
+   * 审核人看到两条一样的待办，却没有任何字段能说清哪条作数。宁可停下来问人。
    *
    * @returns false = 已落终态 / 不该继续推进
    */
@@ -361,12 +452,17 @@ export class WorkflowRunner {
     });
     // 节点不存在交给 loop() 报"节点不存在"，这里不重复判定
     if (!node || REPLAY_SAFE_NODE_TYPES.has(node.type)) return true;
+    const guidance =
+      node.type === 'review'
+        ? '请先检查"我的任务"里是否已经有一条对应这个节点的人工任务：有就人工处理它，' +
+          '没有（或已过期）再重新发起'
+        : '请人工核对外部系统是否已生效（幂等键 action:<executionId>:<actionHash>），' +
+          '确认后再决定是否重新发起';
     await this.failWorkflow(
       executionId,
       state,
       `节点 "${state.current}" 已开始执行但未确认完成（进程在步骤中途退出）：` +
-        '有副作用的步骤不自动重放。请人工核对外部系统是否已生效（幂等键 action:<executionId>:<actionHash>），' +
-        '确认后再决定是否重新发起',
+        `已经开始过的步骤不自动重放 —— 重放可能重复提交或建出第二条人工任务。${guidance}`,
     );
     return false;
   }
@@ -579,15 +675,23 @@ export class WorkflowRunner {
 
   // ---------- 节点实现（状态机这一侧：只决定出口，不管怎么执行） ----------
 
+  /**
+   * `@agent`：只把节点正文当 prompt 交给 runtime，**不再回头去技能目录里找一遍技能**。
+   *
+   * 原先这里会再调一次 `findSkill(node.id)` 做存在性检查。那看起来更保险，实际上
+   * 引入了**第二条解析路径**：`findSkill` 会把每个候选 SKILL.md 重新读一遍、重新解析
+   * frontmatter，于是"校验时看到的定义"和"执行时用的定义"可以是两份不同的内容
+   * （文件在两次读之间被替换）。真正该保证的是"校验与执行用的是同一份内容"，
+   * 而那由 `FlowDefinitionProvider` 单次读 + 单次解析负责（见 definition-provider.ts）。
+   *
+   * 技能是否存在已经在校验期查过（`validateSkillFlow` 的 `hasSkill`），而且每次
+   * resume 都会重新校验一遍 —— 这里不需要第二个真相来源。
+   */
   private async runAgentStep(
     rec: ExecutionRecord,
     state: WorkflowState,
     node: FlowNode,
   ): Promise<StepResult> {
-    const skill = findSkill(node.id, this.skillDirs());
-    if (!skill) {
-      return { outcome: 'fail', detail: { nodeId: node.id, error: `技能 "${node.id}" 不存在` } };
-    }
     const prompt = node.body.trim() || `执行技能「${node.id}」`;
     const result = await this.runtime().runAgent({
       execution: rec,
@@ -622,8 +726,11 @@ export class WorkflowRunner {
       ctx: this.flowContext(rec, state, node),
       node,
     });
+    // 出口名统一小写后再路由：注册表登记时已归一化，route 的出口名由 parser 归一化，
+    // 这里是第三处 —— 服务端实现的 gate 返回值是代码写的，大小写不该改变路由结果
+    const outcome = result.outcome.trim().toLowerCase();
     return {
-      outcome: result.outcome,
+      outcome,
       detail: {
         nodeId: node.id,
         gate: node.id,
@@ -633,6 +740,17 @@ export class WorkflowRunner {
     };
   }
 
+  /**
+   * `@action` 的"需要审批"分支：**先落 workflow 状态，再迁移 execution**。
+   *
+   * 任务此时已经建好了（runtime 只建任务、不改状态，见 runtime.ts 的契约），
+   * 所以顺序必须是
+   *
+   *     CAS workflow = waiting(带 taskId)  →  transition execution = waiting_for_approval
+   *
+   * 反过来的话，两步之间崩溃会留下 `execution = waiting_for_approval` +
+   * `workflow.stepStatus = running` —— 恢复时既像"在等人工"又像"要重放这一步"。
+   */
   private async runActionStep(
     rec: ExecutionRecord,
     state: WorkflowState,
@@ -655,7 +773,15 @@ export class WorkflowRunner {
         stepStatus: 'waiting',
         waitingTaskId: result.taskId,
       };
-      if ((await writer.write(waiting)) === 'conflict') return 'conflict';
+      if ((await writer.write(waiting)) === 'conflict') {
+        await this.orphanTaskNote(rec.executionId, node.id, result.taskId, 'action');
+        return 'conflict';
+      }
+      await this.deps.executions.transition(rec.executionId, 'waiting_for_approval', {
+        currentHumanTaskId: result.taskId,
+        waitReason: 'approval',
+      });
+      await this.append(rec.executionId, EVT.waitingForApproval, { taskId: result.taskId });
       await this.append(rec.executionId, EVT.workflowWaiting, {
         nodeId: node.id,
         taskId: result.taskId,
@@ -669,7 +795,12 @@ export class WorkflowRunner {
     };
   }
 
-  /** @review：复用 HumanTask + ApprovalPolicy，不重新发明人工任务 */
+  /**
+   * `@review`：复用 HumanTask + ApprovalPolicy，不重新发明人工任务。
+   *
+   * 顺序：建任务 → CAS 落 `stepStatus = waiting` → 迁移 execution 到 waiting_for_approval。
+   * 理由见类注释的"进入等待态的顺序"。
+   */
   private async pauseForReview(
     rec: ExecutionRecord,
     state: WorkflowState,
@@ -696,6 +827,19 @@ export class WorkflowRunner {
       title: review.title,
       ...(description ? { description } : {}),
     });
+
+    if (
+      (await writer.write({
+        ...state,
+        current: node.id,
+        stepStatus: 'waiting',
+        waitingTaskId: opened.taskId,
+      })) === 'conflict'
+    ) {
+      await this.orphanTaskNote(rec.executionId, node.id, opened.taskId, 'review');
+      return false;
+    }
+
     await this.deps.executions.transition(rec.executionId, 'waiting_for_approval', {
       currentHumanTaskId: opened.taskId,
       waitReason: 'approval',
@@ -710,14 +854,32 @@ export class WorkflowRunner {
       taskId: opened.taskId,
       kind: 'review',
     });
-    return (
-      (await writer.write({
-        ...state,
-        current: node.id,
-        stepStatus: 'waiting',
-        waitingTaskId: opened.taskId,
-      })) === 'ok'
+    return true;
+  }
+
+  /**
+   * 任务建出来了、但 workflow 状态没写进去（CAS 冲突 = 另一个推进者已经在推）。
+   *
+   * 这条任务成了**孤儿**：它不会挂到任何 durable 状态上，也就永远不会被流程认领。
+   * 刻意不在这里取消它 —— 取消需要一个人工身份，而且另一个推进者可能已经在用它。
+   * 它会自然过期，过期回调也会被 `resumeFromTask()` 的绑定校验拦下（`waitingTaskId`
+   * 对不上）。这里至少留一条痕，运维排查"多出来的待办"时能找到原因。
+   */
+  private async orphanTaskNote(
+    executionId: string,
+    nodeId: string,
+    taskId: string,
+    kind: 'review' | 'action',
+  ): Promise<void> {
+    console.warn(
+      `[workflow] execution ${executionId} 节点 ${nodeId} 的任务 ${taskId} 未被认领（状态写入冲突），将成为孤儿任务`,
     );
+    await this.append(executionId, EVT.workflowOrphanTask, {
+      nodeId,
+      taskId,
+      kind,
+      note: '人工任务已创建但 workflow 状态写入冲突：该任务不会被流程认领，等待过期',
+    });
   }
 
   /** @stop：失败/拒绝终态。execution 落 failed（终态，不自动重试） */

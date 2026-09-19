@@ -36,12 +36,40 @@ Principal { userId, roles, groups }
   `@review role` 与注册表 `eligibleRoles` 取**交集**；`strategy` 只能 ANY→ALL；
   `required` 只能 ≥ 基策略；`exclude: none` 在基策略禁止自批时报错。
   注册表 `FlowReview` 是权威（`eligibleRoles` 必填 + `allowInitiator`）。
-- `@gate` 必须静态声明 `outcomes`（`gate-outcome-unrouted` / `gate-outcome-unknown`）。
-- `@agent output:` 走服务端 `FlowOutput` 完成契约（`success` ≠ 业务成功，不让 LLM 自评）；
-  `@agent tools:` 收窄能力边界，上限 `COPILOT_WORKFLOW_AGENT_TOOLS`（默认 read,write,url，
-  **不含 mcp/shell** —— 那两条是绕开 `@action` 审批的路）。
+- ⚠️ **"更严"必要但不充分**：`ALL` 必须真的全员。`base ANY + strategy ALL + required 1`
+  方向合法但语义是谎言。唯一共享定义 `requiredVotes({strategy,requiredCount,roleCount})`
+  （`types.ts`）三处共用：`registerFlowReview` 启动即 throw、`reviewPolicyFor` 运行时 clamp、
+  validator 出 `review-all-required`。`reviewBasePolicy()` 的 `ALL` 缺省值 = 角色数（**不是 1**）
+  且**不 clamp**（clamp 掉就查不出矛盾）。比的是**生效后**的角色集。
+- `@gate` 必须静态声明 `outcomes`（`gate-outcome-unrouted` / `gate-outcome-unknown`）；
+  outcomes 非空/去重/归一化小写。**注册键一律小写**（`norm` + `requireName`）——
+  只在查找侧归一化的话，含大写的注册永远查不到。
+- `@agent output:` 走服务端 `FlowOutput` 完成契约（`success` ≠ 业务成功，不让 LLM 自评），
+  **默认必填**（`COPILOT_WORKFLOW_REQUIRE_AGENT_OUTPUT` 默认 true）。
+- 🔒 `@agent tools:` 里 **mcp/shell 是代码硬禁，不是配置默认**：
+  `WORKFLOW_AGENT_ALLOWED_KINDS = ['read','write','url']`（`types.ts`），
+  `parseAgentTools` 过滤 + `resolveAgentTools` 再取交集 + validator 无条件查
+  （`agent-tools-forbidden`，与"超部署上限"的 `agent-tools-widens` **分开两个 code**）。
+  `COPILOT_WORKFLOW_AGENT_TOOLS=mcp` **不再有任何效果**。
 - 推进顺序：**先落 `stepStatus = running`，再执行节点**；执行完落 `{current: next, pending}`。
-  中断恢复：`@agent`/`@gate` 可重放，`@action` 落 failed 交人工核对（`admitInterruptedStep`）。
+  中断恢复：`@agent`/`@gate` 可重放；`@action`/`@review` 落 failed 交人工核对
+  （`admitInterruptedStep`）。`@review` 不重放的理由：其产物是人工任务，
+  崩在 `waitingTaskId` 落库前时该产物在持久化状态里不可见。
+- 🔑 **等待态落库顺序**（`@review`/`@action` 通用）：
+  `create HumanTask → CAS 写 workflow=waiting + waitingTaskId → transition execution=waiting_for_approval`。
+  **不能反过来** —— 反过来中间崩会得到 `execution=waiting_for_approval` + `workflow=running`
+  的**不可判定**态。按新顺序崩在任何一步都可判定：`stepStatus==='waiting'` 但无
+  `waitingTaskId` → failed；有 → `run()` 开头 `reconcileWaiting()` 补 transition
+  （`workflow.waiting.reconciled`）。代价是可能留**孤儿任务**（靠过期+四重绑定自愈，
+  不写清理器）；CAS 冲突时记 `workflow.orphan_task`（**别复用** `workflow.write.conflict`）。
+- 契约：`runtime.runAction()` **只建任务，绝不碰 execution 状态**（单写者）。
+  `ExecutionService.proposeAction()` 的 `workflow.deferWaitingTransition` 置位时
+  只建任务+发事件就 return，不 transition、不发 `waitingForApproval`。
+- 能力边界 `AgentCapability` 带 `executionId`；`tool-policy` Layer-0 先比
+  `ctx.activeExecution()` 与 `capability.executionId`，**不匹配或 undefined 一律 deny**。
+  ⚠️ **故意不**"忽略能力退回 session 策略" —— 退回等于把 mcp/shell 还给 agent。
+- `loadSkill()` **每个候选只读一次**（匹配+frontmatter+hash 同一份字节），
+  `definition-provider` 只用它，**不在执行期重新解析**（第二套解析路径 = 校验期与执行期可能不一致）。
 - 单写者：`agent_execution.workflow_version` + `compareAndSwapWorkflowState()`。
   ⚠️ 该列**不在** `sql-repository.ts` 的 `COLUMNS` 里（否则整行 upsert 会写回旧值）。
   冲突 → `workflow.write.conflict` + 停止推进，**绝不落 failed**。

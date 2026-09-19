@@ -439,7 +439,22 @@ export class ExecutionService {
        *
        * `restrictRoles` = SKILL.md 里写的 `@action role:`，只收窄不放宽（见 ActionService.classify）。
        */
-      workflow?: { nodeId: string; restrictRoles?: string[] };
+      workflow?: {
+        nodeId: string;
+        restrictRoles?: string[];
+        /**
+         * 只建审批任务，**不**把 execution 推到 waiting_for_approval。
+         *
+         * 调用方（WorkflowRunner）拿到 taskId 之后要先把 `workflow.stepStatus = waiting`
+         * 落库（带 waitingTaskId），再自己 transition —— 顺序反过来会留下一个不可判定的
+         * 崩溃窗口：`execution = waiting_for_approval` + `workflow.stepStatus = running`，
+         * 恢复时"在等人工"和"要重放这一步"两个判断同时成立。
+         *
+         * 普通动作审批（`@action` 之外的路径）不要用这个开关：那时 execution 的生命周期
+         * 就归 ExecutionService 管，没有第二个写者。
+         */
+        deferWaitingTransition?: boolean;
+      };
     } = {},
   ): Promise<{ decision: 'auto_approve' | 'needs_approval' | 'denied'; taskId?: string; reason?: string; result?: unknown }> {
     const rec = await this.deps.repository.get(executionId);
@@ -504,11 +519,6 @@ export class ExecutionService {
       policy: verdict.policy,
       initiatedBy: rec.initiatedByUserId ?? rec.userId,
     });
-    await this.transition(executionId, 'waiting_for_approval', {
-      currentHumanTaskId: task.taskId,
-      waitReason: 'approval',
-      actionHash,
-    });
     await this.eventLog.append({
       executionId,
       type: EVT.approvalRequired,
@@ -520,6 +530,18 @@ export class ExecutionService {
       type: EVT.humanTaskCreated,
       actorType: 'system',
       payload: { taskId: task.taskId, type: task.type },
+    });
+    if (opts.workflow?.deferWaitingTransition) {
+      // 状态迁移交给调用方：它要先落 workflow.stepStatus = waiting，再 transition。
+      // 这里**不**写 waiting_for_approval 事件 —— 那条事件的含义是"execution 已经进入等待"，
+      // 而此刻它还没有。等调用方真正迁移时由它自己补上。
+      opts.onTaskCreated?.(task);
+      return { decision: 'needs_approval', taskId: task.taskId };
+    }
+    await this.transition(executionId, 'waiting_for_approval', {
+      currentHumanTaskId: task.taskId,
+      waitReason: 'approval',
+      actionHash,
     });
     await this.eventLog.append({
       executionId,

@@ -16,7 +16,6 @@ import { assertSafeOutboundUrl } from '../mcp/registry.js';
 import { recordHookEvent } from '../hooks/events.js';
 import type { AgentCapability } from '../workflow/capability.js';
 import type { FlowPermissionKind } from '../workflow/types.js';
-
 /**
  * 工具授权 Policy（取代 approveAll）。
  *
@@ -43,6 +42,17 @@ export interface ToolPolicyContext {
    * 返回 undefined = 当前没有 workflow 节点在跑 → 不加这层限制（原有行为不变）。
    */
   capability?: () => AgentCapability | undefined;
+  /**
+   * 当前 session 正在跑的 executionId（`executionContext.current`）。
+   *
+   * 为什么需要它：边界是**会话级**存放、**execution 级**生效。只按 sessionId 取一份
+   * 就意味着 A 那条 execution 的边界会作用到 B 上 —— 而 B 的节点可能只声明了 `read`，
+   * 却因为 A 的节点允许 `write` 而拿到 `write`。一次**跨 execution 的能力放宽**。
+   *
+   * 不提供这个回调时跳过对账（单测 / 无 execution 上下文的场景），
+   * 提供时**必须**与 capability.executionId 一致，否则拒绝（fail-closed）。
+   */
+  activeExecution?: () => string | undefined;
 }
 
 /**
@@ -99,6 +109,8 @@ function hostAllowed(url: URL): boolean {
  *
  * **第 0 层（Skill Flow 能力边界）**：跑 `@agent` 节点时先按该节点的能力集合过一道。
  * 它只**收窄**，不替代下面的检查 —— 过了这一层还要继续走 workspace / SSRF 等原有判定。
+ * 它先和"当前正在跑的 execution"对一次账，边界不属于当前 execution 就直接拒绝：
+ * 边界是会话级存放、execution 级生效的，不比对账就会串台（见 ToolPolicyContext）。
  *
  * - read：放行（只读无副作用；workspace 外的库/系统文件读取是刚需）
  * - write：只允许落在 session workspace
@@ -118,14 +130,41 @@ export function createPermissionHandler(ctx: ToolPolicyContext): PermissionHandl
     // 放在最前面，是为了让拒绝理由说清"这是流程节点的能力限制"，
     // 而不是让它落进下面某个 kind 分支、报一个看起来无关的错。
     const capability = ctx.capability?.();
-    if (capability && !capability.kinds.has(request.kind as FlowPermissionKind)) {
-      const detail = `workflow node ${capability.nodeId} 不允许 ${request.kind}（允许：${[...capability.kinds].join(',') || '(无)'}）`;
-      audit('deny', detail);
-      return deny(
-        `流程节点 @agent ${capability.nodeId} 没有 ${request.kind} 权限：` +
-          `它只能使用 ${[...capability.kinds].join(' / ') || '(无工具)'}。` +
-          '业务动作必须通过流程里声明的 @action 节点走审批，不能由 agent 直接执行。',
-      );
+    if (capability) {
+      // 先对账：这份边界真的是**当前这条 execution** 的吗？
+      //
+      // 边界按 sessionId 存一份，而一条会话可以先后（甚至排队）承载多条 execution。
+      // 只按 sessionId 取，A 的边界就会作用到 B 上：A 的节点允许 write、B 的节点
+      // 只声明了 read，B 却拿到了 write —— 一次跨 execution 的能力放宽，而且
+      // 审计链上只会看到"B 用了 write 工具"，看不出是边界串了台。
+      //
+      // 对不上就拒绝，而不是"忽略这份边界、退回会话策略"：退回等于把 mcp / shell
+      // 重新交回 agent 手上（会话策略本来就允许它们），那正是这一层要挡的东西。
+      // 拒绝会让问题立刻可见 —— 包括"未来的某个 runtime 忘了设 execution 上下文"
+      // 这种会让边界静默失效的改法。
+      if (ctx.activeExecution) {
+        const activeExecution = ctx.activeExecution();
+        if (activeExecution !== capability.executionId) {
+          const detail =
+            `workflow capability 与当前 execution 不一致：` +
+            `capability=${capability.executionId}/${capability.nodeId}，当前=${activeExecution ?? '(无)'}`;
+          audit('deny', detail);
+          console.warn(`[tool-policy] session ${ctx.sessionId} ${detail}`);
+          return deny(
+            `流程节点的能力边界不属于当前执行（边界属于 execution ${capability.executionId} 的节点 ${capability.nodeId}）：` +
+              '为避免把另一条执行的权限用在这里，本次调用被拒绝',
+          );
+        }
+      }
+      if (!capability.kinds.has(request.kind as FlowPermissionKind)) {
+        const detail = `workflow node ${capability.nodeId} 不允许 ${request.kind}（允许：${[...capability.kinds].join(',') || '(无)'}）`;
+        audit('deny', detail);
+        return deny(
+          `流程节点 @agent ${capability.nodeId} 没有 ${request.kind} 权限：` +
+            `它只能使用 ${[...capability.kinds].join(' / ') || '(无工具)'}。` +
+            '业务动作必须通过流程里声明的 @action 节点走审批，不能由 agent 直接执行。',
+        );
+      }
     }
 
     switch (request.kind) {
