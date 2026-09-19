@@ -645,7 +645,23 @@ export class ExecutionService {
    */
   async executeApprovedCommand(
     executionId: string,
-    opts: { completeOnSuccess?: boolean; actor?: string } = {},
+    opts: {
+      completeOnSuccess?: boolean;
+      actor?: string;
+      /**
+       * `@command role:` 的流程角色限制（只收窄不放宽，见 CommandService.classify）。
+       *
+       * **必须由调用方每次都显式传** —— 它不持久化在 execution 上，只对这一次调用生效。
+       * 之所以要一路带着，是因为 hash/version 失配会触发**重新审批**（reapprove），
+       * 而重新审批必须用**同一份**限制去 classify：否则新任务会按基策略放行，
+       * 流程里写的 `role:` 只生效一次就被静默丢掉 —— 那是授权面被悄悄放宽，
+       * 不报错、审计链上也看不出来。
+       *
+       * 恢复场景不需要额外存储：WorkflowRunner 每次从 SKILL.md 定义里重新读
+       * `node.attrs.role`（见 runner.ts 的 resumeCommand），所以重启后依然带着同一个限制。
+       */
+      restrictRoles?: string[];
+    } = {},
   ): Promise<ApprovedCommandResult> {
     const rec = await this.deps.repository.get(executionId);
     if (!rec) return { status: 'idle' };
@@ -671,10 +687,11 @@ export class ExecutionService {
     };
     if (r && r.ok === false) {
       const error = String(r.error ?? '执行失败');
-      // hash/版本失配 = 命令实质变了 → 重新审批（保持 waiting_for_approval，另开任务）
+      // hash/版本失配 = 命令实质变了 → 重新审批（保持 waiting_for_approval，另开任务）。
+      // `restrictRoles` 必须继续传：重新审批用的是同一份授权要求，不是重开一次授权。
       if (r.verified && (!r.verified.hash || !r.verified.resourceVersion)) {
         await this.transition(executionId, 'waiting_for_approval', { error });
-        await this.reapprove(executionId, intent, error);
+        await this.reapprove(executionId, intent, error, opts.restrictRoles);
         return { status: 'reapproval_required', reason: error };
       }
       await this.fail(executionId, new Error(error));
@@ -683,11 +700,25 @@ export class ExecutionService {
     return { status: 'executed', ok: true, ...(r?.output !== undefined ? { output: r.output } : {}) };
   }
 
-  /** hash 或版本失配：命令实质变了 → 重新发起审批，而不是拿旧批准继续执行 */
-  private async reapprove(executionId: string, intent: CommandIntent, reason: string): Promise<void> {
+  /**
+   * hash 或版本失配：命令实质变了 → 重新发起审批，而不是拿旧批准继续执行。
+   *
+   * `restrictRoles` 必须与**第一次**审批用的是同一份：重新审批不是"重开一次授权"，
+   * 而是同一份授权要求下重走一遍。丢掉它 = 流程里 `@command role:` 只生效一次，
+   * 第二次审批按基策略放行，授权面被悄悄放宽。
+   */
+  private async reapprove(
+    executionId: string,
+    intent: CommandIntent,
+    reason: string,
+    restrictRoles?: string[],
+  ): Promise<void> {
     const commands = this.deps.commands;
     if (!commands) return;
-    const verdict = commands.classify(intent);
+    const verdict = commands.classify(
+      intent,
+      restrictRoles?.length ? { restrictRoles } : {},
+    );
     if (verdict.decision !== 'needs_approval') return;
     const rec = await this.deps.repository.get(executionId);
     if (!rec) return;

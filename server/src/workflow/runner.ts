@@ -1056,10 +1056,13 @@ export class WorkflowRunner {
       await this.settleUnresumable(rec.executionId, node, resolution);
       return;
     }
-    // 与普通命令审批**同一条**执行路径：同幂等键、同 hash/版本复核
+    // 与普通命令审批**同一条**执行路径：同幂等键、同 hash/版本复核。
+    // `restrictRoles` 每次都要带上：失配会触发重新审批，那一次同样要受 `@command role:` 约束
+    // （限制不在 execution 上持久化，只在这里从 SKILL.md 定义现读现传 —— 所以重启后也一致）。
     const result = await this.deps.executions.executeApprovedCommand(rec.executionId, {
       completeOnSuccess: false,
       actor: decisions?.[decisions.length - 1]?.approverId ?? 'approver',
+      restrictRoles: node.attrs.role ? [node.attrs.role] : undefined,
     });
     if (result.status === 'reapproval_required') {
       // 命令内容或数据版本变了：已另开审批任务并回到 waiting_for_approval，继续等

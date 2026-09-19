@@ -38,9 +38,39 @@ export interface CommandExecutionResult {
 
 export interface CommandExecutor {
   commandType: string;
+  /**
+   * 执行一次受控的业务状态变更。
+   *
+   * **契约：必须按 `ctx.idempotencyKey` 保证幂等** —— 同一个 key 不得产生第二次外部副作用，
+   * 重试时要返回**第一次**执行的结果，而不是再执行一次。
+   *
+   * 为什么把这条写在接口上：调用方**会**重试。真实的触发来源是
+   *
+   *   外部副作用已生效 → 进程在落 execution 终态之前崩 → 恢复后重跑这一步
+   *
+   * （见 `execution-service.ts` 的 `runCommand`）。幂等键绑的是
+   * `execution + 命令内容 hash`，所以那次重跑拿到的是**同一个** key —— 这就是它能去重的前提。
+   *
+   * 实现必须自己做下游去重，形态是：
+   *
+   *   idempotencyKey
+   *        ↓
+   *   下游去重表 / 透传成下游请求头
+   *        ├ 已执行 → 返回历史结果
+   *        └ 未执行 → 执行并记录
+   *
+   * ⚠️ `command-registry.ts` 里内置的几个示例 executor **只把 key 回显进 output**，
+   * 没有真实下游、也就不需要去重。它们是 **demo**，不能直接当生产 executor 用 ——
+   * 接真实系统时，去重是接入方必须实现的第一件事，不是可选项。
+   */
   execute(intent: CommandIntent, ctx: CommandExecutionContext): Promise<CommandExecutionResult>;
 }
 
+/**
+ * ⚠️ 以下三个都是 **demo executor**：只校验入参、把 `ctx.idempotencyKey` 回显进 output，
+ * **不做下游去重**（没有真实下游）。接真实系统时按 `CommandExecutor.execute` 的契约实现：
+ * 同一个 idempotencyKey 不得产生第二次外部副作用，重试返回第一次的结果。
+ */
 /** 内置示例：代理投票提交（真实实现替换为券商/托管行接口调用） */
 const submitProxyVote: CommandExecutor = {
   commandType: 'submit_proxy_vote',
