@@ -801,11 +801,17 @@ export class ExecutionService {
         },
       });
     }
+    // 审计语义：`command.executed` = 业务 mutation 真正发生了。
+    // 验证失配（根本没调 executor）或 executor 返回失败时记 `command.execution_failed`。
     await this.eventLog.append({
       executionId,
-      type: EVT.commandExecuted,
+      type: result.ok ? EVT.commandExecuted : EVT.commandExecutionFailed,
       actorType: 'system',
-      payload: { commandType: intent.commandType, ok: result.ok },
+      payload: {
+        commandType: intent.commandType,
+        ok: result.ok,
+        ...(!result.ok && result.error ? { error: preview(result.error, config.evidenceMaxChars) } : {}),
+      },
     });
     if (result.ok) {
       // 等待态 → resuming → running → completed（终态不允许直接跳）

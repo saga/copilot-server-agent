@@ -271,9 +271,37 @@ test('HITL：审批后动作内容被改 → 拒绝执行并要求重新审批',
   assert.equal((after.commandIntent as CommandIntent).parameters.shares, 100000);
   const events = await execution.events(exec.executionId, 200);
   assert.ok(events.map((e) => e.type).includes('command.hash_mismatch'));
+  // 验证没过 = 根本没调 executor：审计只能记 execution_failed，不能记 executed
+  // （executed 回答"什么真正发生了"，尝试过不算发生）
+  assert.ok(events.map((e) => e.type).includes('command.execution_failed'));
+  assert.ok(
+    !events.map((e) => e.type).includes('command.executed'),
+    'hash 失配时不能出现 command.executed',
+  );
   // 重新审批会开新任务
   const tasks = await humanTasks.repository.list({ executionId: exec.executionId });
   assert.equal(tasks.length, 2);
+});
+
+test('HITL：executor 执行失败（hash 已验证）→ 记 execution_failed，不记 executed', async () => {
+  const { execution } = wire();
+  process.env.COPILOT_AUTO_APPROVE_ACTIONS = 'submit_proxy_vote';
+  try {
+    const exec = await execution.create({ sessionId: 's-fail', owner: OWNER, kind: 'job' });
+    await execution.start(exec.executionId);
+    // shares 非法 → executor 返回 ok:false（hash 验证本身通过，业务执行失败）
+    const verdict = await execution.proposeCommand(
+      exec.executionId,
+      voteIntent({ parameters: { resolution: 'FOR', shares: -1 } }),
+    );
+    assert.equal(verdict.decision, 'auto_approve');
+    const types = (await execution.events(exec.executionId, 100)).map((e) => e.type);
+    assert.ok(types.includes('command.hash_verified'));
+    assert.ok(types.includes('command.execution_failed'));
+    assert.ok(!types.includes('command.executed'), 'executor 失败时不能出现 command.executed');
+  } finally {
+    delete process.env.COPILOT_AUTO_APPROVE_ACTIONS;
+  }
 });
 
 test('HITL：否决 / 过期 → execution 落到 rejected / expired', async () => {

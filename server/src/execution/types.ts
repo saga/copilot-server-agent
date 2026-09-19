@@ -232,7 +232,14 @@ export const EXECUTION_EVENT_TYPES = {
   commandHashMismatch: 'command.hash_mismatch',
   resourceVersionMismatch: 'command.resource_version_mismatch',
   authorizationChecked: 'command.authorization.checked',
+  /**
+   * 命令**真正执行成功**才记（`result.ok === true`）。
+   * 验证没过（hash / resourceVersion 失配）或 executor 返回失败时记
+   * `command.execution_failed` —— 审计要回答"什么真正发生了"，而不是"尝试过什么"。
+   */
   commandExecuted: 'command.executed',
+  /** 命令没有产生业务副作用：验证失配（未执行）或 executor 执行失败 */
+  commandExecutionFailed: 'command.execution_failed',
   completed: 'execution.completed',
   failed: 'execution.failed',
   cancelled: 'execution.cancelled',

@@ -58,6 +58,39 @@ test('执行审计相关数值配置可覆盖', () => {
   assert.equal(cfg.maxToolCallsPerExecution, 5);
 });
 
+test('数值配置非法（abc / -1 / 1.5）启动即失败，不静默回默认值', () => {
+  const names = [
+    'COPILOT_EVIDENCE_MAX_CHARS',
+    'COPILOT_MAX_TRACKED_EXECUTIONS',
+    'COPILOT_MAX_TOOL_CALLS',
+    'COPILOT_MAX_CONCURRENT_EXECUTIONS',
+    'COPILOT_HUMAN_TASK_TTL',
+    'COPILOT_HUMAN_TASK_SWEEP',
+    'COPILOT_SESSION_IDLE_TIMEOUT',
+  ];
+  for (const name of names) {
+    for (const bad of ['abc', '-1', '1.5', '10x']) {
+      const r = loadConfig({ [name]: bad });
+      assert.notEqual(r.code, 0, `"${name}=${bad}" 应当启动失败`);
+      assert.match(r.stderr, new RegExp(`${name} 非法`));
+    }
+  }
+});
+
+test('数值配置 0 与合法值按语义生效', () => {
+  // 0=不限/关闭：保持原有语义（maxConcurrent 0=不限，idleTimeout 0=关闭→undefined）
+  const r = loadConfig({
+    COPILOT_MAX_CONCURRENT_EXECUTIONS: '0',
+    COPILOT_SESSION_IDLE_TIMEOUT: '0',
+    COPILOT_HUMAN_TASK_TTL: '0',
+  });
+  assert.equal(r.code, 0, r.stderr);
+  const cfg = JSON.parse(r.stdout.trim().split('\n').at(-1)!);
+  assert.equal(cfg.maxConcurrentExecutions, 0);
+  assert.equal(cfg.sessionIdleTimeoutSeconds, undefined);
+  assert.equal(cfg.humanTaskTtlSeconds, 0);
+});
+
 test('DATABASE_URL 留空 = 默认走 SQLite', () => {
   const r = loadConfig({ DATABASE_URL: '' });
   assert.equal(r.code, 0, r.stderr);

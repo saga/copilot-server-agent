@@ -17,6 +17,23 @@ function parseLogLevel(raw: string): LogLevel | undefined {
   throw new Error(`COPILOT_LOG_LEVEL 非法："${raw}"，可选：${LOG_LEVELS.join(' | ')}（留空=SDK 默认）`);
 }
 
+/**
+ * 非负整数配置：非法值启动即失败，不静默回默认值。
+ * 空=未配置（用 fallback）；`abc` / `-1` / `1.5` 全部抛错。
+ */
+function parseNonNegativeInt(raw: string, name: string, fallback: number): number {
+  const v = raw.trim();
+  if (!v) return fallback;
+  if (!/^\d+$/.test(v)) {
+    throw new Error(`${name} 非法："${raw}"，必须是非负整数（留空=${fallback}）`);
+  }
+  const n = Number(v);
+  if (!Number.isSafeInteger(n)) {
+    throw new Error(`${name} 非法："${raw}"，数值超出安全整数范围`);
+  }
+  return n;
+}
+
 /** 逗号分隔列表（空=未配置） */
 function parseList(raw: string): string[] {
   return raw
@@ -75,7 +92,10 @@ export const config = {
   deepseekModel: env('DEEPSEEK_MODEL', 'deepseek-v4-flash'),
   deepseekBaseUrl: env('DEEPSEEK_BASE_URL', 'https://api.deepseek.com/v1'),
   // --- 会话持久化：服务端 idle 超时（秒，0=关闭，无活动超时后 runtime 自动回收） ---
-  sessionIdleTimeoutSeconds: Number(env('COPILOT_SESSION_IDLE_TIMEOUT', '0')) || undefined,
+  // 0=关闭 → 转成 undefined；非法值启动即失败
+  sessionIdleTimeoutSeconds:
+    parseNonNegativeInt(env('COPILOT_SESSION_IDLE_TIMEOUT', ''), 'COPILOT_SESSION_IDLE_TIMEOUT', 0) ||
+    undefined,
   // --- Runtime 连接：留空=SDK 自己拉起本地 runtime；K8s sidecar/远端填 http://127.0.0.1:4321 ---
   runtimeUrl: env('COPILOT_RUNTIME_URL', '') || undefined,
   /** 启动时后台预热 runtime（首屏徽章与首个会话不用等 CLI 拉起；设 false 则纯懒加载） */
@@ -96,11 +116,15 @@ export const config = {
   skillRoots: parseList(env('COPILOT_SKILL_ROOTS', '')),
   // --- 执行审计：execution / tool evidence 的字段预览上限与内存保留量 ---
   /** 单条 tool 参数/结果预览的最大字符数（超出只记长度，不保内容） */
-  evidenceMaxChars: Number(env('COPILOT_EVIDENCE_MAX_CHARS', '2000')) || 2000,
+  evidenceMaxChars: parseNonNegativeInt(env('COPILOT_EVIDENCE_MAX_CHARS', ''), 'COPILOT_EVIDENCE_MAX_CHARS', 2000),
   /** 内存保留的 execution 条数（超出按插入顺序淘汰最旧的） */
-  maxTrackedExecutions: Number(env('COPILOT_MAX_TRACKED_EXECUTIONS', '200')) || 200,
+  maxTrackedExecutions: parseNonNegativeInt(
+    env('COPILOT_MAX_TRACKED_EXECUTIONS', ''),
+    'COPILOT_MAX_TRACKED_EXECUTIONS',
+    200,
+  ),
   /** 单个 execution 最多记多少条 tool call（超出只累加计数） */
-  maxToolCallsPerExecution: Number(env('COPILOT_MAX_TOOL_CALLS', '100')) || 100,
+  maxToolCallsPerExecution: parseNonNegativeInt(env('COPILOT_MAX_TOOL_CALLS', ''), 'COPILOT_MAX_TOOL_CALLS', 100),
   // --- 管理接口令牌（留空=不设防本地开发；生产设置后 /api/debug、/api/hooks 需带 x-admin-token） ---
   adminToken: env('COPILOT_ADMIN_TOKEN', '') || undefined,
   // --- Durable state：execution / human task / approval / event / session ownership 的持久真相源 ---
@@ -111,11 +135,15 @@ export const config = {
   sqliteExtensions: parseList(env('COPILOT_SQLITE_EXTENSIONS', '')),
   databaseUrl: parseDatabaseUrl(env('DATABASE_URL', '')),
   /** 全进程同时运行的 agent turn 上限（0=不限；防止 N 个用户同时烧满 runtime CPU） */
-  maxConcurrentExecutions: Number(env('COPILOT_MAX_CONCURRENT_EXECUTIONS', '0')) || 0,
+  maxConcurrentExecutions: parseNonNegativeInt(
+    env('COPILOT_MAX_CONCURRENT_EXECUTIONS', ''),
+    'COPILOT_MAX_CONCURRENT_EXECUTIONS',
+    0,
+  ),
   /** Human Task 默认 TTL（秒；0=不过期）。到期 OPEN → EXPIRED，execution 随之 EXPIRED */
-  humanTaskTtlSeconds: Number(env('COPILOT_HUMAN_TASK_TTL', '86400')) || 0,
+  humanTaskTtlSeconds: parseNonNegativeInt(env('COPILOT_HUMAN_TASK_TTL', ''), 'COPILOT_HUMAN_TASK_TTL', 86400),
   /** 过期扫描间隔（秒） */
-  humanTaskSweepSeconds: Number(env('COPILOT_HUMAN_TASK_SWEEP', '60')) || 60,
+  humanTaskSweepSeconds: parseNonNegativeInt(env('COPILOT_HUMAN_TASK_SWEEP', ''), 'COPILOT_HUMAN_TASK_SWEEP', 60),
   /** 是否允许发起人审批自己发起的 action（Separation of Duties；默认否） */
   allowInitiatorApproval: env('COPILOT_ALLOW_INITIATOR_APPROVAL', 'false') === 'true',
   /**

@@ -444,7 +444,7 @@ agent 侧入口（可选）：`scripts/governance-mcp.mjs` 是 stdio MCP server�
 ## 版本锁定与自检
 
 ```bash
-npm run check:versions     # SDK / runtime / K8s 镜像 tag 四处版本必须一致
+npm run check:versions     # SDK / runtime / K8s runtime 镜像 tag 一致 + api 镜像 tag = server 版本（不用 latest）
 npm run verify:agent-tools # custom agent 工具是否真能调用（只认 tool.execution_start）
 npm run test               # execution 审计（脱敏/usage/tool 证据）+ 配置 smoke（非法值必须启动失败）
                            # + 两份 DDL 逐列比对 + SQLite 端到端（含老库补列）+ 协作模型（访问矩阵/幂等/队列串行/事件游标）
@@ -497,5 +497,5 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 
 ## 前提
 
-- Node.js ^20.19 或 >=22.12（Copilot SDK 要求），本机 `node -v` 需满足
+- Node.js >=22.13（根与 `server/package.json` 的 `engines` 要求，`node:sqlite` 需要），本机 `node -v` 需满足
 - Copilot 认证二选一：本机 `copilot` CLI 已登录，或 `server/.env` 里填 `GITHUB_TOKEN`

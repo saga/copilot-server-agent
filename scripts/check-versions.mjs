@@ -11,6 +11,9 @@
  *   3. Dockerfile.copilot-runtime 的 ARG COPILOT_VERSION
  *   4. k8s/deployment.yaml 的 runtime 镜像 tag
  *
+ * 另校验：k8s 的 api 镜像 tag 必须等于 server/package.json 的 version
+ * （不用 latest，否则回滚时不知道线上跑的是哪个构建）。
+ *
  * 用法：node scripts/check-versions.mjs
  */
 import { readFileSync } from 'node:fs';
@@ -51,6 +54,11 @@ function runtimeImageTag() {
   return { raw: m?.[1] ?? null, from: 'k8s/deployment.yaml' };
 }
 
+function serverImageTag() {
+  const m = read('k8s/deployment.yaml').match(/copilot-server-agent:([\w.+-]+)/);
+  return { raw: m?.[1] ?? null, from: 'k8s/deployment.yaml (api image)' };
+}
+
 const entries = [sdkDeclared(), sdkInstalled(), runtimeDockerfile(), runtimeImageTag()];
 const problems = [];
 
@@ -68,9 +76,22 @@ if (versions.size > 1) {
   problems.push(`✗ 版本不一致：${[...versions].join(' vs ')}`);
 }
 
+const serverPkg = JSON.parse(read('server/package.json'));
+const apiTag = serverImageTag();
+console.log(`  ${apiTag.from.padEnd(28)} ${apiTag.raw ?? '(none)'}`);
+if (!apiTag.raw) {
+  problems.push('✗ k8s/deployment.yaml 的 api 镜像未取到版本 tag');
+} else if (apiTag.raw === 'latest') {
+  problems.push('✗ k8s 的 api 镜像不允许用 latest（回滚时无法复现）');
+} else if (apiTag.raw !== serverPkg.version) {
+  problems.push(
+    `✗ k8s 的 api 镜像 tag (${apiTag.raw}) 与 server/package.json 的 version (${serverPkg.version}) 不一致`,
+  );
+}
+
 if (problems.length) {
   console.error('\n版本检查失败：');
   for (const p of problems) console.error(`  ${p}`);
   process.exit(1);
 }
-console.log(`\n✓ SDK/runtime 版本一致：${declared}`);
+console.log(`\n✓ SDK/runtime 版本一致：${declared}；api 镜像 tag：${apiTag.raw}`);

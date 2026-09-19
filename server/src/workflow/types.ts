@@ -110,7 +110,13 @@ export interface WorkflowState {
   waitingTaskId?: string;
   /** 最近一个节点的出口名，便于审计与排障 */
   lastOutcome?: string;
-  /** 最近一个 @task 的输出（截断），供后续 gate/command 判断依据 */
+  /**
+   * 最近一个 @task 的 Agent 输出**预览**（截断），供下一节点做上下文参考。
+   *
+   * 它是 untrusted、non-authoritative 的中间上下文，不是业务事实：
+   * gate / command 的判定依据只能是服务端注册的实现与外部权威数据，
+   * 绝不能把这段文本当成"workflow 的结果"去做授权或业务断言。
+   */
   lastOutput?: string;
 }
 
@@ -129,7 +135,7 @@ export interface FlowContext {
   nodeId: string;
   /** execution 建立时带的 input（如 { securityId } ） */
   input?: unknown;
-  /** 上一个 @task 的输出（截断后） */
+  /** 上一个 @task 的 Agent 输出预览（截断、不可信、非权威，见 WorkflowState.lastOutput） */
   lastOutput?: string;
 }
 

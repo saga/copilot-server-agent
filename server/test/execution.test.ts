@@ -5,6 +5,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { preview, redactSecrets, truncate } from '../src/execution/redact.js';
+import {
+  boundEventPayload,
+  MAX_EVENT_PAYLOAD_CHARS,
+  MAX_EVENT_STRING_CHARS,
+} from '../src/execution/events.js';
 import { LlmUsageAccumulator } from '../src/execution/usage.js';
 import { ExecutionService } from '../src/execution/execution-service.js';
 import {
@@ -49,6 +54,30 @@ test('preview + truncate：截断只报长度', () => {
   const out = preview({ blob: long }, 50);
   assert.ok(out.length < 120, `预览应被截断，实际 ${out.length}`);
   assert.match(out, /\+\d+ chars/);
+});
+
+test('审计 payload 轻边界：小 payload 原样过，密钥脱敏', () => {
+  const out = boundEventPayload({ taskId: 't1', type: 'approval', apiKey: 'sk-abcdef123456' });
+  assert.equal(out['taskId'], 't1');
+  assert.equal(out['type'], 'approval');
+  assert.equal(out['apiKey'], '<redacted>');
+  assert.ok(!('truncated' in out));
+});
+
+test('审计 payload 轻边界：整段 LLM 输出塞进来只留截断，不进 durable 表', () => {
+  const fullResponse = 'x'.repeat(MAX_EVENT_STRING_CHARS + 500);
+  const out = boundEventPayload({ output: fullResponse, taskId: 't1' });
+  assert.equal(out['taskId'], 't1', '结构保留');
+  assert.match(String(out['output']), /\+\d+ chars/, '长字段被截断');
+  assert.ok(String(out['output']).length < fullResponse.length);
+
+  // 极端：几十个大字段，总量仍超限 → 只留预览，调用链不断
+  const huge: Record<string, unknown> = {};
+  for (let i = 0; i < 50; i++) huge[`blob${i}`] = 'y'.repeat(MAX_EVENT_STRING_CHARS);
+  const collapsed = boundEventPayload(huge);
+  assert.equal(collapsed['truncated'], true);
+  assert.ok(Number(collapsed['originalChars']) > MAX_EVENT_PAYLOAD_CHARS);
+  assert.ok(String(collapsed['preview']).length <= MAX_EVENT_PAYLOAD_CHARS + 64);
 });
 
 test('usage 累加器：多次调用求和，模型去重，上下文窗口单独记', () => {

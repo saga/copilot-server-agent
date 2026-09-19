@@ -26,7 +26,9 @@ spec:
         fsGroupChangePolicy: OnRootMismatch
       containers:
         - name: api
-          image: your-registry/copilot-server-agent:latest
+          # 与 server/package.json 的 version 同步（见 scripts/check-versions.mjs）：不用 latest，
+          # 否则回滚/复现时不知道线上跑的是哪个构建
+          image: your-registry/copilot-server-agent:0.1.0
           ports:
             - containerPort: 3001
           env:
@@ -50,6 +52,11 @@ spec:
             # bash 授权：命令涉及路径必须在 session workspace 内
             - name: COPILOT_BASH_POLICY
               value: "workspace"
+            # Agent 可访问的 URL 域名 allowlist（逗号分隔）。
+            # 代码默认值是空=任意公网（服务本地开发），但生产部署必须显式收窄：
+            # 只放行内部研究数据 API / vendor API / 内部文档系统，不要留空。
+            - name: COPILOT_URL_ALLOWLIST
+              value: "internal-data.example.com,vendor-api.example.com,docs.internal.example.com"
             # 生产安全默认值
             - name: COPILOT_MCP_FILESYSTEM
               value: "false"
