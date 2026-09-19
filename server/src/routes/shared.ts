@@ -13,8 +13,22 @@ import { sessionAccessService } from '../wiring.js';
  * 拆分成 sessions/executions/human-tasks/meta 之后各路由共用这里，避免各写一份。
  */
 
+/**
+ * 管理接口（全量视图 / 诊断 / hooks 事件）的准入。
+ *
+ * 三态：
+ *   没配 adminToken + 非可信身份  本地单租户 → 放行（本地开发不受影响）
+ *   没配 adminToken + 可信身份    多租户部署却没配令牌 → **一律 401**。此前这里直接放行，
+ *                                 等于「开了可信身份头就等于拿到管理权限」
+ *   配了 adminToken               必须带对令牌
+ */
 export function requireAdmin(req: Request, res: Response, next: NextFunction): unknown {
-  if (!config.adminToken) return next();
+  if (!config.adminToken) {
+    if (!config.trustIdentityHeaders) return next();
+    return res.status(401).json({
+      error: 'unauthorized（管理接口必须配置 x-admin-token）',
+    });
+  }
   if (req.header('x-admin-token') === config.adminToken) return next();
   return res.status(401).json({ error: 'unauthorized（管理接口需 x-admin-token）' });
 }

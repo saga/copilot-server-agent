@@ -1,8 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
 import { executionService, humanTaskService } from '../wiring.js';
-import { config } from '../config.js';
-import { assertSessionVisible, principalOf, requireAdmin, sendServiceError } from './shared.js';
+import { isAssignee } from '../human-tasks/assignment.js';
+import {
+  assertSessionVisible,
+  principalOf,
+  READ_ACCESS_DENIED,
+  readAccess,
+  requireAdmin,
+  sendServiceError,
+} from './shared.js';
 
 export const humanTaskRouter = Router();
 
@@ -55,20 +62,39 @@ humanTaskRouter.get('/all', requireAdmin, async (req, res, next) => {
 /**
  * GET /api/human-tasks/:id — 单个任务 + 决策记录。
  *
- * 读路径额外要求「能访问任务所属的会话」：任务挂在 execution 上，execution 挂在 session 上，
- * 不校验就靠猜 taskId 就能读到别的会话的审批内容。
- * 审批/输入/委派/取消不做这一层 —— 那些由 ApprovalPolicy 的资格判定把关：
- * 审批人不一定在共享会话里（风险/合规岗常常不在），把成员资格当审批资格会误伤。
+ * 三类人可以读（admin / 任务处理人 / 会话参与人），其余 403：
+ *
+ *   admin                     管理令牌 → 全量
+ *   task assignee             风险 / 合规审批人**不一定在共享会话里**（他们常常不在），
+ *                             所以不能只按会话成员资格判定，否则审批人读不到自己负责的任务
+ *   session participant       协作 UI 要看得到本会话挂起的任务
+ *
+ * tenant 检查放在 session visibility 之前：跨租户时既不该命中后两类的任何一支，
+ * 也不该通过响应差异泄漏"这个 taskId 存在与否"。
  */
 humanTaskRouter.get('/:id', async (req, res, next) => {
   try {
+    const access = readAccess(req);
+    if (access === 'denied') return res.status(401).json(READ_ACCESS_DENIED);
+
     const id = String(req.params.id);
+    const principal = principalOf(req);
     const task = await humanTaskService.get(id);
     if (!task) return res.status(404).json({ error: `human task 不存在："${id}"` });
-    if (config.trustIdentityHeaders) {
-      const execution = await executionService.get(task.executionId);
-      if (execution) await assertSessionVisible(execution.sessionId, principalOf(req));
+
+    if (access !== 'all') {
+      if (task.tenantId !== principal.tenantId) {
+        return res.status(403).json({ error: `无权访问 human task："${id}"` });
+      }
+      if (!isAssignee(task, principal)) {
+        const execution = await executionService.get(task.executionId);
+        if (!execution) {
+          return res.status(404).json({ error: `execution 不存在："${task.executionId}"` });
+        }
+        await assertSessionVisible(execution.sessionId, principal);
+      }
     }
+
     const decisions = await humanTaskService.repository.listDecisions(task.taskId);
     return res.json({ task, decisions });
   } catch (err) {

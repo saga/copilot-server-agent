@@ -41,6 +41,18 @@ export const BUILTIN_POLICIES: ApprovalPolicy[] = [
     allowInitiator: false,
     timeoutSeconds: 86400,
   },
+  {
+    // Skill Flow 的 `@action publish` 用的动作类型。
+    // 即使流程里上一步已经有人工 @review，这里仍要走完整的动作审批 —— 两层授权不能互相替代：
+    // @review 批的是"这个流程节点可以过"，这里批的是"这一笔具体 mutation 可以执行"，
+    // 后者绑定 actionHash 与 resourceVersion，前者没有。
+    policyId: 'research-publish',
+    actionType: 'publish_research',
+    strategy: 'ANY',
+    eligibleRoles: ['investment-reviewer'],
+    allowInitiator: false,
+    timeoutSeconds: 43200,
+  },
 ];
 
 /**

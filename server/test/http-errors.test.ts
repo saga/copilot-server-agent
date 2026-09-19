@@ -31,8 +31,8 @@ const PERMISSION_DENIED = [
   '无权发消息到 session："s1"（当前会话角色 observer）',
   '无权管理成员 session："s1"（当前会话角色 member）',
   '无权删除 session："s1"（当前会话角色 observer）',
-  '无权委派该任务（不在 eligible 范围内）',
-  '无权取消该任务',
+  '无权访问 human task："t1"',
+  '无权操作 human task："t1"（不在 eligible 范围内）',
   '无权审批：需要角色 approver，当前 member',
 ];
 
@@ -77,6 +77,7 @@ const CLIENT_ERROR = [
   'human task 已过期',
   '该任务不是审批任务',
   '该任务不是输入任务',
+  '可信身份模式下，input human task 必须指定 eligibleRoles 或 eligibleUsers',
   // 配置写错
   '未知 MCP 预设：foo，可选：github',
   'COPILOT_MCP_SERVERS 解析失败：must be a JSON object',

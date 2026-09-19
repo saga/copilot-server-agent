@@ -5,8 +5,11 @@ import {
   humanTaskService,
   sessionAccessService,
   sessionCoordinator,
+  workflowRunner,
 } from '../wiring.js';
 import type { ActionIntent } from '../execution/types.js';
+import type { WorkflowState } from '../workflow/types.js';
+import { FlowValidationError } from '../workflow/runner.js';
 import {
   actionSchema,
   assertSessionSendable,
@@ -25,9 +28,13 @@ const createSchema = z.object({
   kind: z.enum(['interactive', 'job', 'workflow']).optional().default('job'),
   input: z.unknown().optional(),
   prompt: z.string().optional(),
+  /** kind = 'workflow'：SKILL.md 所在的技能名 + 该技能里的 @flow id */
+  skill: z.string().min(1).optional(),
+  flow: z.string().min(1).optional(),
 });
 
-const runSchema = z.object({ prompt: z.string().min(1, 'prompt 不能为空') });
+/** workflow 的推进说明在 SKILL.md 里，不需要 prompt；其余 kind 仍然必须给 */
+const runSchema = z.object({ prompt: z.string().min(1).optional() });
 
 /**
  * execution 的可见性跟着它所属的 session 走。
@@ -61,11 +68,48 @@ executionRouter.get('/', async (req, res, next) => {
   }
 });
 
-/** POST /api/executions — 建后台执行单元（202，HTTP 不等 agent） */
+/**
+ * POST /api/executions — 建后台执行单元（202，HTTP 不等 agent）。
+ *
+ * kind = "workflow" 时额外给 skill + flow：**建之前先把 SKILL.md 校验完**
+ * （技能存在、恰好一个 @flow、路由目标存在、出口写全、gate/review/action 已注册）。
+ * 校验不过直接 400 —— 不要跑到一半才发现路由指向不存在的节点，
+ * 那时 execution 可能已经停在 waiting 或者已经把业务动作提出去了。
+ */
 executionRouter.post('/', async (req, res, next) => {
   try {
     const body = createSchema.parse(req.body ?? {});
     const principal = principalOf(req);
+    const isWorkflow = body.kind === 'workflow';
+    if (!isWorkflow && (body.skill || body.flow)) {
+      return res.status(400).json({ error: 'skill / flow 只在 kind = "workflow" 时有效' });
+    }
+
+    let workflow: WorkflowState | undefined;
+    if (isWorkflow) {
+      if (!body.skill || !body.flow) {
+        return res.status(400).json({ error: 'kind = "workflow" 必须同时给 skill 与 flow' });
+      }
+      try {
+        const prepared = workflowRunner.prepare({ skill: body.skill, flow: body.flow });
+        workflow = {
+          skill: prepared.skill.meta.name,
+          flow: prepared.definition.id,
+          sourceHash: prepared.skill.sourceHash,
+          current: prepared.definition.start,
+          steps: 0,
+        };
+      } catch (err) {
+        if (err instanceof FlowValidationError) {
+          return res.status(400).json({
+            error: 'Skill Flow 校验失败',
+            issues: err.issues.map((i) => ({ ...i, file: `SKILL.md:${i.line}` })),
+          });
+        }
+        throw err;
+      }
+    }
+
     // 建 execution = 往这个会话里送工作：先过会话访问判定，再归属到会话 owner
     const access = await assertSessionSendable(body.sessionId, principal);
     const execution = await executionService.create({
@@ -75,8 +119,13 @@ executionRouter.post('/', async (req, res, next) => {
       kind: body.kind,
       ...(body.input !== undefined ? { input: body.input } : {}),
       ...(body.prompt ? { prompt: body.prompt } : {}),
+      ...(workflow ? { workflow } : {}),
     });
-    res.status(202).json({ executionId: execution.executionId, status: execution.status });
+    res.status(202).json({
+      executionId: execution.executionId,
+      status: execution.status,
+      ...(workflow ? { workflow } : {}),
+    });
   } catch (err) {
     return sendServiceError(res, err, next);
   }
@@ -129,8 +178,12 @@ executionRouter.get('/:id/tasks', async (req, res, next) => {
 });
 
 /**
- * POST /api/executions/:id/run — 后台跑一次 agent turn（202，不等结果）。
+ * POST /api/executions/:id/run — 后台跑起来（202，不等结果）。
  * HITL 场景（审批可能几小时）不能靠 SSE 长连接，客户端用 events 端点轮询/SSE。
+ *
+ * kind 决定谁来推进，API 层不新增 /workflow/* 端点：
+ *   interactive / job → SessionCoordinator（需要 prompt）
+ *   workflow          → WorkflowRunner（不需要 prompt：流程定义在 SKILL.md 里）
  *
  * 权限与 cancel / actions 同一档：`assertCanCommandExecution`（owner 任意 / member 只能
  * 跑自己发起的 / observer 不可）。**不能只判 `send`** —— 那等于"能在这个会话发言就能让
@@ -144,6 +197,20 @@ executionRouter.post('/:id/run', async (req, res, next) => {
     const record = await executionService.get(id);
     if (!record) return res.status(404).json({ error: `execution 不存在："${id}"` });
     await sessionAccessService.assertCanCommandExecution(record.sessionId, principalOf(req), record);
+
+    if (record.kind === 'workflow') {
+      if (body.prompt) {
+        return res.status(400).json({ error: 'workflow execution 不接受 prompt（步骤说明在 SKILL.md 里）' });
+      }
+      if (!record.workflow) {
+        return res.status(409).json({ error: `execution "${id}" 是 workflow 但没有 workflow_state` });
+      }
+      await executionService.start(id);
+      workflowRunner.runDetached(record);
+      return res.status(202).json({ executionId: id, status: 'running', workflow: record.workflow });
+    }
+
+    if (!body.prompt) return res.status(400).json({ error: 'prompt 不能为空' });
     await executionService.start(id);
     // 取 session → turn 槽 → 收尾 统一由调度器做，不阻塞 HTTP
     sessionCoordinator.runDetached(record, body.prompt);

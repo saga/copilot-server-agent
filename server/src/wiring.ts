@@ -31,6 +31,7 @@ import type { HumanTaskRepository } from './human-tasks/repository.js';
 import { SessionAccessService } from './services/session-access.js';
 import { sessionRegistry } from './services/session-registry.js';
 import { sessionService } from './services/session-service.js';
+import { WorkflowRunner } from './workflow/runner.js';
 
 /**
  * 依赖装配（唯一一处决定用哪个后端、哪套实现的地方）。
@@ -75,11 +76,38 @@ bindExecutionSink(executionService);
 export const humanTaskService = new HumanTaskService({
   repository: humanTaskRepository,
   approval: approvalService,
-  onResolved: (task, resolution, decisions) =>
-    executionService.onHumanTaskResolved(task, resolution, decisions),
+  /**
+   * 人工任务收敛后的分派。
+   *
+   * Skill Flow 的 `@review` / `@action` 任务带 `payload.workflow` 标记 —— 它们收敛后
+   * 不是"某个动作批完了，execution 可以收尾"，而是"流程可以往前走一步了"，必须交回编排器。
+   * 其余任务（普通业务动作审批、人工补数据）继续走 ExecutionService，行为完全不变。
+   */
+  onResolved: (task, resolution, decisions) => {
+    if (isWorkflowTask(task)) {
+      return workflowRunner.onHumanTaskResolved(task, resolution, decisions);
+    }
+    return executionService.onHumanTaskResolved(task, resolution, decisions);
+  },
 });
 
 executionService.bindHumanTasks(humanTaskService);
+
+// ---- Skill Flow 编排层：SKILL.md 的 @flow 由它推进（复用上面同一套 Execution/HumanTask/Action） ----
+
+/** 带 workflow 标记 = 该任务属于某条 Skill Flow，而不是某笔业务动作的审批 */
+export function isWorkflowTask(task: { payload?: Record<string, unknown> }): boolean {
+  const marker = task.payload?.workflow;
+  return Boolean(marker && typeof marker === 'object' && (marker as { nodeId?: unknown }).nodeId);
+}
+
+export const workflowRunner = new WorkflowRunner({
+  executions: executionService,
+  humanTasks: humanTaskService,
+  runTurn: runExecutionTurn,
+  // 等人工期间释放 SDK session（审批可能几小时，不该占着 runtime）
+  disconnectIdle: (sessionId) => sessionService.disconnectIdleSession(sessionId),
+});
 
 // ---- 协作层：参与人 / 消息 / 会话事件流 / 队列调度 ----
 

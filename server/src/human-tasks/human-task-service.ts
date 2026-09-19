@@ -80,12 +80,53 @@ export class HumanTaskService {
     return this.deps.repository.get(taskId);
   }
 
+  /**
+   * 我的任务（审批 + 待补输入）。
+   *
+   * `tenantId` / `assignee` 一律由服务端按 principal 填，**caller 传了也不采纳**：
+   * 这个 API 的语义是"我可以处理的任务"，一旦允许覆盖，调用方就能把可见范围
+   * 扩到整个 tenant（或把自己的 userId 换成别人）。其余过滤条件（executionId /
+   * status / type / limit）照常透传。
+   */
   async list(principal: Principal, filter: HumanTaskFilter = {}): Promise<HumanTask[]> {
-    const tasks = await this.deps.repository.list({
-      ...filter,
-      tenantId: filter.tenantId ?? principal.tenantId,
+    const {
+      tenantId: _ignoredTenantId,
+      assignee: _ignoredAssignee,
+      ...rest
+    } = filter;
+    return this.deps.repository.list({
+      ...rest,
+      tenantId: principal.tenantId,
+      assignee: { userId: principal.userId, roles: principal.roles },
     });
-    return tasks.filter((t) => isAssignee(t, principal) || !filter.assignee);
+  }
+
+  /**
+   * 取任务并校验「本租户 + 有资格」——所有写操作（审批/输入/委派/取消）的统一入口。
+   *
+   * tenant 先于 assignee 判断：跨租户的 taskId 枚举既不该命中"有资格"分支，
+   * 也不该从错误文案里泄漏任务是否存在。
+   */
+  private async getTaskForActor(taskId: string, principal: Principal): Promise<HumanTask> {
+    const task = await this.deps.repository.get(taskId);
+    if (!task) throw new Error(`human task 不存在："${taskId}"`);
+    if (task.tenantId !== principal.tenantId) {
+      throw new Error(`无权访问 human task："${taskId}"`);
+    }
+    if (!isAssignee(task, principal)) {
+      throw new Error(`无权操作 human task："${taskId}"（不在 eligible 范围内）`);
+    }
+    return task;
+  }
+
+  /** 在 `getTaskForActor` 之上再要求仍可操作（未关闭、未过期） */
+  private async getOpenTaskForActor(taskId: string, principal: Principal): Promise<HumanTask> {
+    const task = await this.getTaskForActor(taskId, principal);
+    if (task.status !== 'open') throw new Error(`human task 已关闭（${task.status}）`);
+    if (task.expiresAt && task.expiresAt <= new Date().toISOString()) {
+      throw new Error('human task 已过期');
+    }
+    return task;
   }
 
   async createApprovalTask(input: {
@@ -132,16 +173,13 @@ export class HumanTaskService {
     timeoutSeconds?: number;
   }): Promise<HumanTask> {
     const now = new Date().toISOString();
-    const eligibleRoles = input.eligibleRoles?.length ? input.eligibleRoles : DEFAULT_INPUT_ROLES;
-    // 没显式指定 assignee 就退到默认角色 —— 本地单租户够用，但信任身份头的部署里
-    // 角色来自网关，多半没人叫 `approver`，任务会变成"谁都不能提交"。
-    // submitInput 现在按 isAssignee 判定，不接受这种默认，所以这里把隐患喊出来。
-    if (!input.eligibleRoles?.length && !input.eligibleUsers?.length && config.trustIdentityHeaders) {
-      console.warn(
-        `[human-task] input 任务 "${input.title}" 未指定 eligibleRoles/eligibleUsers：` +
-          `只有默认角色 ${DEFAULT_INPUT_ROLES.join('/')} 能提交，而该部署的角色来自网关`,
-      );
+    // 没显式指定 assignee 时退到默认角色 —— 本地单租户够用，但可信身份的部署里角色来自
+    // 网关，多半没人叫 `approver`，任务会变成"谁都不能提交"（submitInput 按 isAssignee 判定，
+    // 不接受这种默认）。与其建一个没人能处理的任务，不如在创建时就拒绝。
+    if (config.trustIdentityHeaders && !input.eligibleRoles?.length && !input.eligibleUsers?.length) {
+      throw new Error('可信身份模式下，input human task 必须指定 eligibleRoles 或 eligibleUsers');
     }
+    const eligibleRoles = input.eligibleRoles?.length ? input.eligibleRoles : DEFAULT_INPUT_ROLES;
     const task: HumanTask = {
       taskId: `task_${randomUUID()}`,
       executionId: input.executionId,
@@ -195,7 +233,7 @@ export class HumanTaskService {
     taskId: string,
     input: { principal: Principal; comment?: string; decision: 'approve' | 'reject' },
   ): Promise<{ task: HumanTask; evaluation: ReturnType<ApprovalService['evaluate']> }> {
-    const task = await this.mustGetOpen(taskId);
+    const task = await this.getOpenTaskForActor(taskId, input.principal);
     if (task.type !== 'approval') throw new Error('该任务不是审批任务');
     const policy = task.policyId
       ? (this.deps.approval.policyFor(
@@ -250,14 +288,11 @@ export class HumanTaskService {
     taskId: string,
     input: { principal: Principal; values: Record<string, unknown> },
   ): Promise<HumanTask> {
-    const task = await this.mustGetOpen(taskId);
+    // 与 approve / reject / delegate / cancel 同一条判定：租户 + 资格 + 未关闭。
+    // 只凭 task id 就能写值，等于把"谁能补这个字段"交给调用方自己声明 —— 补进去的值
+    // 会直接进 execution 并把它推到 resuming。
+    const task = await this.getOpenTaskForActor(taskId, input.principal);
     if (task.type !== 'input') throw new Error('该任务不是输入任务');
-    // 与 approve / reject / delegate / cancel 对齐：不在 eligible 范围内的人不能提交输入。
-    // 只凭 task id 就能写值，等于把"谁能补这个字段"交给调用方自己声明 —— 金融场景下
-    // 这既绕开了 assignment，也让 execution 能被无关的人推到 resuming。
-    if (!isAssignee(task, input.principal)) {
-      throw new Error('无权提交该人工输入（不在 eligible 范围内）');
-    }
     const values = this.validateInput(task, input.values);
     const closed = await this.deps.repository.close(taskId, {
       status: 'approved',
@@ -278,10 +313,7 @@ export class HumanTaskService {
     taskId: string,
     input: { principal: Principal; toUserId: string; reason?: string },
   ): Promise<HumanTask> {
-    const task = await this.mustGetOpen(taskId);
-    if (!isAssignee(task, input.principal)) {
-      throw new Error('无权委派该任务（不在 eligible 范围内）');
-    }
+    await this.getOpenTaskForActor(taskId, input.principal);
     if (!input.toUserId?.trim()) throw new Error('toUserId 不能为空');
     return (await this.deps.repository.update(taskId, {
       delegatedFrom: input.principal.userId,
@@ -293,10 +325,10 @@ export class HumanTaskService {
   }
 
   async cancel(taskId: string, input: { principal: Principal }): Promise<HumanTask> {
-    const task = await this.deps.repository.get(taskId);
-    if (!task) throw new Error(`human task 不存在："${taskId}"`);
+    // 资格判定必须在「已关闭就直接返回」之前：否则知道一个已关闭 taskId 的人
+    // 即使完全无权，也能把任务内容读回去。
+    const task = await this.getTaskForActor(taskId, input.principal);
     if (task.status !== 'open') return task;
-    if (!isAssignee(task, input.principal)) throw new Error('无权取消该任务');
     const closed = await this.deps.repository.close(taskId, {
       status: 'cancelled',
       completedAt: new Date().toISOString(),
@@ -322,16 +354,6 @@ export class HumanTaskService {
       await this.deps.onResolved?.(closed, 'expired', []);
     }
     return out;
-  }
-
-  private async mustGetOpen(taskId: string): Promise<HumanTask> {
-    const task = await this.deps.repository.get(taskId);
-    if (!task) throw new Error(`human task 不存在："${taskId}"`);
-    if (task.status !== 'open') throw new Error(`human task 已关闭（${task.status}）`);
-    if (task.expiresAt && task.expiresAt <= new Date().toISOString()) {
-      throw new Error('human task 已过期');
-    }
-    return task;
   }
 
   /** 无注册策略时按任务自带策略字段重建（保证 evaluate 可用） */

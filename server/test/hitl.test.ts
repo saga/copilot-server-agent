@@ -5,6 +5,7 @@ import { ApprovalService } from '../src/approval/approval-service.js';
 import { BUILTIN_POLICIES, evaluateApproval, resolvePolicy } from '../src/approval/approval-policy.js';
 import type { ApprovalPolicy, HumanTaskDecision } from '../src/approval/types.js';
 import { ActionService } from '../src/actions/action-service.js';
+import { config } from '../src/config.js';
 import { canonicalJson, hashAction, verifyActionHash } from '../src/execution/hash.js';
 import { ExecutionService } from '../src/execution/execution-service.js';
 import {
@@ -195,8 +196,12 @@ test('HITL 全链路：propose → 建审批 → 顺序审批通过 → hash 复
 
   const done = (await execution.get(exec.executionId))!;
   assert.equal(done.status, 'completed');
-  const out = done.result as { receipt?: string };
+  const out = done.result as { receipt?: string; idempotencyKey?: string };
   assert.match(String(out?.receipt ?? ''), /^vote_ex_/);
+  // 幂等键 = action:{executionId}:{actionHash}，随执行上下文一路透传到 executor。
+  // 刻意不含 taskId：重新审批会换任务，但下游要认的是同一次业务动作。
+  assert.equal(out?.idempotencyKey, `action:${exec.executionId}:${hashAction(intent)}`);
+  assert.ok(!String(out?.idempotencyKey).includes(verdict.taskId!), '幂等键不能绑 taskId');
 
   const events = await execution.events(exec.executionId, 100);
   const types = events.map((e) => e.type);
@@ -372,7 +377,7 @@ test('人工输入：只有 eligible 的人能提交（角色 / 显式指派 / �
   const forbidden = await makeTask({ eligibleRoles: ['risk'] });
   await assert.rejects(
     () => humanTasks.submitInput(forbidden.taskId, { principal: OPS, values: { vote: 'FOR' } }),
-    /无权提交该人工输入/,
+    /无权操作 human task/,
   );
   const after = (await humanTasks.get(forbidden.taskId))!;
   assert.equal(after.status, 'open', '越权提交不能把任务推下去');
@@ -429,4 +434,151 @@ test('并发审批：条件关闭 + 同一 task 串行，onResolved 只触发一
   ]);
   assert.equal((await humanTasks.get(any.taskId))!.status, 'approved');
   assert.equal(resolved, 2, 'ANY 只应再触发一次（累计 2）');
+});
+
+test('HumanTask：跨 tenant 不能审批 / 输入 / 取消 / 委派', async () => {
+  const { execution, humanTasks } = wire();
+  const exec = await execution.create({
+    sessionId: 'tenant-a-session',
+    owner: { tenantId: 't1', userId: 'pm-1' },
+    kind: 'job',
+  });
+  await execution.start(exec.executionId);
+  const vote = await execution.proposeAction(exec.executionId, voteIntent());
+  assert.equal(vote.decision, 'needs_approval');
+  const taskId = vote.taskId!;
+
+  const inputTask = await humanTasks.createInputTask({
+    executionId: exec.executionId,
+    tenantId: 't1',
+    title: '补数据',
+    inputSchema: { fields: [{ name: 'vote', type: 'string', required: true }] },
+    eligibleRoles: ['risk'],
+  });
+
+  // 同角色、跨租户：先撞 tenant 检查（不会走到"有资格"分支）
+  const attacker = { tenantId: 't2', userId: 'risk-2', roles: ['risk'] };
+  await assert.rejects(
+    () => humanTasks.approve(taskId, { principal: attacker }),
+    /无权访问 human task/,
+  );
+  await assert.rejects(
+    () => humanTasks.reject(taskId, { principal: attacker }),
+    /无权访问 human task/,
+  );
+  await assert.rejects(
+    () => humanTasks.delegate(taskId, { principal: attacker, toUserId: 'someone' }),
+    /无权访问 human task/,
+  );
+  await assert.rejects(
+    () => humanTasks.cancel(taskId, { principal: attacker }),
+    /无权访问 human task/,
+  );
+  await assert.rejects(
+    () => humanTasks.submitInput(inputTask.taskId, { principal: attacker, values: { vote: 'FOR' } }),
+    /无权访问 human task/,
+  );
+
+  // 跨租户的尝试不能改变任何状态
+  assert.equal((await humanTasks.get(taskId))!.status, 'open');
+  assert.equal((await humanTasks.get(inputTask.taskId))!.status, 'open');
+  assert.equal((await humanTasks.repository.listDecisions(taskId)).length, 0, '不能留下决策');
+});
+
+test('HumanTask list：只返回当前用户有资格处理的任务', async () => {
+  const repository = new MemoryHumanTaskRepository();
+  const approval = new ApprovalService({ allowInitiatorApproval: false });
+  const humanTasks = new HumanTaskService({ repository, approval });
+
+  const base = {
+    executionId: 'ex-list',
+    tenantId: 't1',
+    payload: { actionType: 'custom_test_action' },
+  };
+  const policy: ApprovalPolicy = {
+    policyId: 'p-list',
+    actionType: 'custom_test_action',
+    strategy: 'ANY',
+    eligibleRoles: ['risk'],
+    allowInitiator: false,
+  };
+
+  await humanTasks.createApprovalTask({ ...base, title: 'risk task', policy });
+  await humanTasks.createApprovalTask({
+    ...base,
+    title: 'compliance task',
+    policy: { ...policy, eligibleRoles: ['compliance'] },
+  });
+  await humanTasks.createApprovalTask({ ...base, title: 'other tenant', tenantId: 't2', policy });
+
+  const riskUser = { tenantId: 't1', userId: 'risk-1', roles: ['risk'] };
+  const tasks = await humanTasks.list(riskUser);
+  assert.equal(tasks.length, 1, '同 tenant 别人的任务 / 别 tenant 的任务都不能出现');
+  assert.equal(tasks[0]!.title, 'risk task');
+
+  // caller 传 tenantId / assignee 不生效：语义是"我的任务"，可见范围服务端说了算
+  const spoofed = await humanTasks.list(riskUser, {
+    tenantId: 't2',
+    assignee: { userId: 'risk-1', roles: ['compliance', 'risk'] },
+  });
+  assert.equal(spoofed.length, 1);
+  assert.equal(spoofed[0]!.title, 'risk task', '覆盖不了 tenant，也扩不了 assignee');
+});
+
+test('HumanTask list：同名角色跨 tenant 也不能看到任务', async () => {
+  const repository = new MemoryHumanTaskRepository();
+  const approval = new ApprovalService({ allowInitiatorApproval: false });
+  const humanTasks = new HumanTaskService({ repository, approval });
+
+  await humanTasks.createApprovalTask({
+    executionId: 'ex-1',
+    tenantId: 't1',
+    title: 'tenant-a',
+    payload: { actionType: 'custom_test_action' },
+    policy: {
+      policyId: 'p-1',
+      actionType: 'custom_test_action',
+      strategy: 'ANY',
+      eligibleRoles: ['risk'],
+      allowInitiator: false,
+    },
+  });
+
+  assert.deepEqual(await humanTasks.list({ tenantId: 't2', userId: 'risk-1', roles: ['risk'] }), []);
+});
+
+test('createInputTask：可信身份模式下必须显式指定 eligible（否则建一个没人能处理的任务）', async () => {
+  const repository = new MemoryHumanTaskRepository();
+  const approval = new ApprovalService({ allowInitiatorApproval: false });
+  const humanTasks = new HumanTaskService({ repository, approval });
+  const saved = config.trustIdentityHeaders;
+
+  const make = () =>
+    humanTasks.createInputTask({
+      executionId: 'ex-in',
+      tenantId: 't1',
+      title: '补数据',
+      inputSchema: { fields: [{ name: 'vote', type: 'string', required: true }] },
+    });
+
+  try {
+    // 本地单租户：默认角色就是 approver，创建照常
+    (config as { trustIdentityHeaders: boolean }).trustIdentityHeaders = false;
+    assert.equal((await make()).status, 'open');
+
+    // 可信身份（角色来自网关）：没给 eligible 就直接拒绝，而不是留一个谁都提交不了的任务
+    (config as { trustIdentityHeaders: boolean }).trustIdentityHeaders = true;
+    await assert.rejects(make, /必须指定 eligibleRoles 或 eligibleUsers/);
+    // 显式给了就放行
+    const ok = await humanTasks.createInputTask({
+      executionId: 'ex-in',
+      tenantId: 't1',
+      title: '补数据',
+      inputSchema: { fields: [{ name: 'vote', type: 'string', required: true }] },
+      eligibleRoles: ['risk'],
+    });
+    assert.equal(ok.status, 'open');
+  } finally {
+    (config as { trustIdentityHeaders: boolean }).trustIdentityHeaders = saved;
+  }
 });

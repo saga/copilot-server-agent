@@ -233,6 +233,12 @@ execution 上只留脱敏预览，不能当输入用。同一会话并发恒为 
   结果未知、需要人看一眼"，重跑必须由人显式发起。
 - `created`（排队项）→ 按 `queue_sequence` 重新入队 drain。
 
+**恢复失败 = 不接流量**。`recoverPending()` 抛错时进程置退出码 1 直接返回：不 `listen`、
+不置 ready，交给编排层重拉。恢复成功是这套服务能安全对外服务的前提 —— 没恢复完就放流量，
+既会让新请求刚置成 `running` 的 execution 被恢复顺手改成 `interrupted`，又会让队列里的
+`created` 永远没人 drain。逐条补写 `interrupted` 审计事件时按条 try/catch：某条写入失败
+（例如 execution 指向已被删除的会话）只记一条 warn，不让一条坏记录把整轮恢复带走。
+
 **就绪信号**：`index.ts` 维护一个生命周期状态（`starting → ready → draining`，见 `lifecycle.ts`），
 `GET /api/health/ready` 只在 `ready` 时返回 200 —— 恢复没跑完时是 `503 starting`，
 编排层据此"先别放流量"。关闭时先置 `draining`（同样是 503）再 `server.close()`；但 `close()`
@@ -370,8 +376,27 @@ approval 不需要这个 runner：批准后由 server 侧执行器直接执行�
 **提交输入要过 assignee 判定**：`submitInput` 与 `approve` / `reject` / `delegate` / `cancel`
 一样按 `isAssignee`（角色命中 / 显式指派 / 被委派，三者之一）放行。只凭 task id 就能写值，
 等于把"谁能补这个字段"交给调用方自己声明 —— 补进去的值会直接进 execution 并把它推到 `resuming`。
-没显式指定 assignee 的输入任务退到默认角色 `approver`（`COPILOT_DEFAULT_ROLES`）：
-本地单租户够用，但信任身份头的部署里角色来自网关，创建方必须显式给出 eligible 集合。
+没显式指定 assignee 的输入任务退到默认角色 `approver`（`COPILOT_DEFAULT_ROLES`）—— 本地单租户够用。
+可信身份的部署里角色来自网关，多半没人叫 `approver`，建出来的任务谁都提交不了；所以那种部署下
+**创建时直接拒绝**（必须显式给出 `eligibleRoles` 或 `eligibleUsers`），而不是留一个没人能处理的死任务。
+
+### 5.4 任务的可访问面
+
+**写操作（approve / reject / input / delegate / cancel）走同一条判定**：
+`getTaskForActor` = 本租户 + `isAssignee`（角色命中 / 显式指派 / 被委派），要动状态再加
+"仍 `open` 且未过期"（`getOpenTaskForActor`）。两个顺序上的讲究：
+
+- **tenant 先于 assignee**：跨租户的 taskId 枚举不该命中"有资格"分支，也不该从错误文案里
+  泄漏任务是否存在。
+- **资格先于"已关闭就直接返回"**：否则知道一个已关闭 taskId 的人，即使完全无权，也能把
+  任务内容读回去（`cancel` 曾经如此）。先判资格，再判状态。
+
+**读操作（`GET /api/human-tasks/:id`）认三类人**：admin（管理令牌看全量）、**task 的 assignee**、
+**会话参与人**。assignee 这一类必须单列 —— 风险/合规审批人常常不在业务会话里，
+只按会话成员资格判定会让审批人读不到自己负责的任务。三类之外一律 403，同样先判 tenant。
+
+**"我的任务"列表（`GET /api/human-tasks`）不接受调用方指定范围**：`tenantId` 与 `assignee`
+由服务端按认证身份填，请求里传了也不采纳；否则调用方把 `assignee` 一改就能看到整个 tenant 的任务。
 
 ### 5.3 任务收敛恰好一次
 
@@ -419,6 +444,10 @@ approval 分支由此把**同一个业务动作执行两遍**（`runAction` 在�
                                             ▼
                              Server-controlled executor（真正的 mutation）
 ```
+
+executor 拿到的上下文里带一个**幂等键**：`action:{executionId}:{actionHash}`。真实下游（券商网关、
+合规模块、邮件网关）必须把它透传过去，用来挡"外部副作用已生效 → 进程在落 `completed` 前崩 → 重试"
+造成的重复提交。刻意不绑 `taskId`：重新审批会产出新的 HumanTask，但那仍是同一次业务动作。
 
 工具调用那一侧是另一条正交的链，决定 agent 能用哪些工具、能写到哪：
 
@@ -505,6 +534,7 @@ Business Action Policy（与上面那条链的第三层是同一个）
 ```bash
 psql "$DATABASE_URL" -f server/src/db/migrations/001_agent_execution.sql
 psql "$DATABASE_URL" -f server/src/db/migrations/002_collaboration.sql
+psql "$DATABASE_URL" -f server/src/db/migrations/003_workflow.sql
 ```
 
 两份 DDL 的表名与列名**必须完全一致**（共用同一份仓储实现），`test/schema.test.ts` 逐列比对。
@@ -520,7 +550,7 @@ psql "$DATABASE_URL" -f server/src/db/migrations/002_collaboration.sql
 | `session_participant` | session_id, tenant_id, user_id, role(owner/member/observer), status(active/left/removed), joined_at, left_at, `primary key(session_id, user_id)` |
 | `agent_message` | message_id, session_id, sequence, actor_type(user/agent), actor_id, **client_message_id**（幂等键）, content, execution_id, `unique(session_id, sequence)`、`unique(session_id, client_message_id)` |
 | `session_event` | event_id, session_id, sequence, type, actor_type, actor_id, execution_id, message_id, payload, `unique(session_id, sequence)` |
-| `agent_execution` | execution_id, session_id, tenant/user（= 会话 owner）, **initiated_by_user_id**（发起人）, **source_message_id**, **queue_sequence**（队列定序键，镜像来源消息序号）, **event_sequence**（执行事件序号分配器）, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars |
+| `agent_execution` | execution_id, session_id, tenant/user（= 会话 owner）, **initiated_by_user_id**（发起人）, **source_message_id**, **queue_sequence**（队列定序键，镜像来源消息序号）, **event_sequence**（执行事件序号分配器）, kind, status, action_intent, **action_hash**, resource_version, approved_resource_version, current_human_task_id, usage, tool_calls, content_chars, **workflow_state**（Skill Flow 的 durable 状态，见第 11 节） |
 | `human_task` | task_id, execution_id, type, status, payload, **input_values**（人工输入回填）, input_schema, policy_id, strategy, required_count, eligible_roles/users, initiated_by, expires_at, delegated_* |
 | `human_task_decision` | decision_id, task_id, approver_id, approver_role, decision, comment, `unique(task_id, approver_id)` |
 | `execution_event` | execution_id, sequence, type, actor_type, actor_id, payload, `unique(execution_id, sequence)` |
@@ -589,6 +619,14 @@ exec 里，老库文件就会在建出 `queue_sequence` 之前引用它 → `no 
 共享会话的参与者读不到同会话的执行时间线（而 `GET /sessions/:id` 却读得到），协作读路径被截断。
 `/api/human-tasks/all` 与 `/api/debug`、`/api/hooks` 仍是纯管理视图，继续用 `requireAdmin`。
 
+`requireAdmin` 是三态，而不是"没配令牌就放行"：没配 `COPILOT_ADMIN_TOKEN` 且未开可信身份头
+→ 单租户本地开发，放行；**没配令牌但开了可信身份头 → 一律 401**（否则"能伪造/注入身份头"
+就等于拿到管理权限）；配了令牌 → 必须带对。第三态是第一版漏掉的：它让
+`trustIdentityHeaders=true` 但忘配令牌的部署把 `/all`、`/debug` 敞开了。
+
+`GET /api/human-tasks/:id` 不走 `readAccess` 的"会话可见性收窄"，而是认**三类人**：
+admin / task 的 assignee / 会话参与人（见 5.4）。审批人不等于会话成员，只按会话判定会误伤。
+
 **等待审批不靠 SSE 长连接** —— 用 `GET /executions/:id/events` 轮询或订阅。
 
 ### 错误 → 状态码（单一真相源）
@@ -610,7 +648,81 @@ service 层抛的是 `Error`，路由按**消息前缀族**映射状态码，规
 `写入通道尚未装配` 是服务端装配故障，必须留 500 —— 否则"服务端炸了"会被伪装成
 "用户传错了"。文案清单由 `test/http-errors.test.ts` 逐条覆盖，**新增抛错文案必须补进那张表**。
 
-## 11. 目录
+## 11. Skill Flow：SKILL.md 上的编排层
+
+一次业务流程（研究 → 合规门禁 → 合规审核 → 投资审核 → 发布）不是一次 agent turn 能做完的：中间要等人，要做确定性判断，要做受控的业务动作。**编排本身不新造 runtime。**
+
+不引入 BPMN，不引入 XState，不做第二套 YAML DSL。流程定义写在**已有的 SKILL.md 里**，用 Markdown AST 解析：
+
+```text
+SKILL.md（Markdown）
+    ↓ remark-parse（## @xxx 块 + `- outcome -> 目标` 路由）
+FlowDefinition（6 种节点）
+    ↓
+WorkflowRunner ── 复用现有 Execution / HumanTask / Action 三层
+```
+
+理由很直接：编排要的是"下一步去哪"，而这件事的全部信息已经在技能文件里。再引一套 DSL 就会有两份流程定义、两套权限语义、两套审计口径 —— 而 authority 已经在服务端了（见第 6 节），DSL 不会让它更安全，只会让它更难对齐。
+
+### 11.1 七种块
+
+块必须是 `##`（depth 2）标题，`@` 开头；路由是块正文里的 `- <出口> -> <目标节点 id>` 列表项：
+
+| 块 | 作用 | 复用 | 出口 |
+|----|------|------|------|
+| `@flow <id>` | 流程入口，正文第一行是 `start -> <节点 id>` | — | — |
+| `@subagent <技能名>` | 跑一次技能：节点正文就是给 LLM 的 prompt | `runExecutionTurn`（同一个 session / model / tool policy / 工具证据） | `success` / `fail` |
+| `@gate <注册名>` | 确定性判断，结果只来自服务端注册的实现 | registry 里的 gate 函数 | gate 自己返回的 outcome |
+| `@review <注册名>` | 人工审核 | HumanTask + ApprovalPolicy | `approve` / `reject` |
+| `@action <注册名>` | 业务动作 | `proposeAction`（策略 → 审批 → hash/版本复核 → executor） | `success` / `fail` |
+| `@stop <id>` | 失败/拒绝终态 → execution 落 `failed` | — | 无 |
+| `@end <id>` | 成功终态 → execution 落 `completed` | — | 无 |
+
+这三类节点各自看着像"新能力"，实际全部是复用，差别只在收尾方式：
+
+- `@review` 建出来的是**普通 HumanTask**（`payload.workflow = { nodeId, kind }` 做标记），My Tasks、委派、SoD、租户隔离、审计全都不改一行；wiring 的 dispatcher 按这个标记把收敛事件分给 `WorkflowRunner`，没有标记的仍走 `ExecutionService`。
+- `@action` **不直接调 executor**，走完整的 `proposeAction` 链路，所以"上一步人工审核过了，这一步为什么还要批"是特性不是冗余 —— 审核的是"研究结论能不能发布"，批的是"这个 mutation 能不能发出去"，两者不可互相替代。唯一区别是 `completeOnSuccess: false`：动作执行完**不**收尾 execution，因为后面还有节点。
+- `@gate` 的判定权在服务端注册的实现里，agent 的自我评价不算数 —— 合规边界不由 LLM 定义。
+
+**权限、角色、审批策略不写在 SKILL.md 里。** 节点只声明"这里需要 compliance-review"，谁有资格批、要几个人批、多久超时，由服务端 registry 决定（`workflow/registry.ts`）。SKILL.md 是会被 LLM 读到、也会被人随手改的文件，不能成为 security boundary。
+
+### 11.2 校验先于执行
+
+`POST /api/executions` 在**建 execution 之前**就把整份流程校验完，不过就 400 并带上行号：
+
+`flow-missing` / `flow-duplicate`、`flow-missing-start`、`node-duplicate`、`route-target-missing`、`node-missing-outcome`、`node-missing-route`（非终态必须至少一条出口）、`terminal-has-route`（`@stop` / `@end` 不能有出口）、`node-unreachable`、`skill-missing`（`@subagent` 指向的技能不存在）。
+
+顺序有讲究：跑到一半才发现某个 `- approve -> xxx` 指向不存在的节点，那时 execution 可能已经停在等待态，或者已经把业务动作提出去了。`@gate` 的出口名无法静态校验（由服务端实现决定），所以这类节点不参与 `node-missing-outcome` 检查，但运行时找不到匹配出口会立刻失败，不做"只有一个出口就兜底"的猜测。
+
+环是**允许**的（`- reject -> investment-research` 是研究流程的常态），所以有硬闸门 `MAX_FLOW_STEPS = 100`：超了就 failed。它刻意不在 DSL 里 —— 这是运行时保护，不是流程语义。
+
+### 11.3 durable state 与 sourceHash
+
+每次推进都先把 `current` 写进 `agent_execution.workflow_state`，**再**执行那个节点。反过来写的话，进程在"跑完但状态没落库"之间退出，重启会把同一步再跑一遍，而 `@action` 那一步可能已经把钱打出去了。状态里含 `current` / `steps` / `waitingTaskId` / `lastOutcome` / `lastOutput`（`@subagent` 输出截断 4000 字符，只作下一步判断依据，不是证据仓库 —— 证据在 tool_calls 里）。
+
+`sourceHash` 是 SKILL.md 的 SHA-256，每次推进前重算比对。它只是一个字段，挡的是金融流程最不该发生的事：已经开始的执行悄悄切到另一个版本的流程定义上继续跑。不一致 → failed + 人工确认，不静默迁移。
+
+### 11.4 API 上没有新增端点
+
+沿用 `/api/executions`，只在 payload 上多两个字段：
+
+```http
+POST /api/executions
+{ "sessionId": "...", "kind": "workflow", "skill": "investment-research", "flow": "investment-review" }
+→ 202 { executionId, status, workflow: { skill, flow, current, steps } }
+
+POST /api/executions/:id/run     # workflow 不需要 prompt（步骤说明在 SKILL.md 里，传了 400）
+```
+
+`/run` 按 `record.kind` 分派：`interactive` / `job` → SessionCoordinator，`workflow` → WorkflowRunner。**不新增 `/workflow/*` 端点** —— 否则同一个 execution 会有两条读取路径、两种清理语义、两套权限矩阵。 `/run` 的权限与 `cancel` / `actions` 同一档（`assertCanCommandExecution`）。
+
+恢复路径：重启后等待态的 workflow execution 靠 `workflow_state.waitingTaskId` 接上 —— 人工任务收敛时 dispatcher 从 task 反查 execution，读 `workflow_state`，重新 `loadChecked` 后续跑。
+
+### 11.5 明确不做
+
+并行分支（fork/join）、定时器与 escalation、子流程调用、表达式与变量、动态生成流程、以及"审批超时自动通过"。这些要么在 Business Action Policy 那一层已经覆盖，要么属于真正的 workflow engine（第 13 节已排除）。当前这套只解决一件事：**把"研究→审核→发布"这类固定步骤串起来，并且串的时候不绕开现有的权限与审计。**
+
+## 12. 目录
 
 ```text
 server/src/
@@ -627,9 +739,13 @@ server/src/
 ├── human-tasks/ types repository sql-repository(+memory) human-task-service assignment
 ├── approval/    types approval-policy approval-service
 ├── actions/     action-registry（server-controlled executor） action-service
+├── workflow/    types registry（gate/review/action 的服务端注册） runner（编排器）
+├── skills/      index（加载 / sourceHash） flow-parser（remark AST → FlowDefinition）
+│                flow-validator（行号级校验）
 ├── db/          connection.ts（后端选择） dialect.ts（方言钩子）
 │                sqlite.ts + sqlite-schema.ts（默认后端：建表 / 补列 / 建索引 三步）
-│                postgres.ts（可选） migrations/001_agent_execution.sql 002_collaboration.sql
+│                postgres.ts（可选）
+│                migrations/001_agent_execution.sql 002_collaboration.sql 003_workflow.sql
 ├── middleware/  error-status.ts（错误→状态码的单一真相源） errorHandler.ts（兜底）
 ├── providers/ agents/ skills/ mcp/ hooks/
 ├── wiring.ts    依赖装配（SQLite / PostgreSQL / Memory）
@@ -637,7 +753,7 @@ server/src/
 └── index.ts     启动：recoverPending()（崩溃恢复）→ 起 sweeper → listen → markReady()
 ```
 
-## 12. 明确不做
+## 13. 明确不做
 
 Temporal / BPMN / Camunda / Kafka / Redis / 通用 workflow DSL / A2A EventBus。
 

@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { Request } from 'express';
+import type { NextFunction, Request, Response } from 'express';
 
 import { config } from '../src/config.js';
-import { readAccess } from '../src/routes/shared.js';
+import { readAccess, requireAdmin } from '../src/routes/shared.js';
 import { sessionMetaFrom } from '../src/services/session-service.js';
 import type { RegistryRecord } from '../src/services/session-registry.js';
 
@@ -66,6 +66,49 @@ test('readAccess：令牌生效需要部署真的配了令牌（空串不等于�
     // 部署没配令牌时，客户端自带 x-admin-token 不具备任何意义
     assert.equal(readAccess(req({ 'x-admin-token': '' })), 'scoped');
     assert.equal(readAccess(req({ 'x-admin-token': 'secret' })), 'scoped');
+  });
+});
+
+/** 走一遍 requireAdmin，返回 {status, body} 或 'next' */
+function runRequireAdmin(
+  headers: Record<string, string> = {},
+): { status?: number; body?: unknown; passed: boolean } {
+  let status: number | undefined;
+  let body: unknown;
+  let passed = false;
+  const res = {
+    status(code: number) {
+      status = code;
+      return res;
+    },
+    json(payload: unknown) {
+      body = payload;
+      return res;
+    },
+  } as unknown as Response;
+  const next = (() => {
+    passed = true;
+  }) as unknown as NextFunction;
+  requireAdmin(req(headers), res, next);
+  return { status, body, passed };
+}
+
+test('requireAdmin：可信身份模式没配令牌时必须 401，不能"没令牌就放行"', () => {
+  // 本地单租户：继续免令牌（本地开发不受影响）
+  withConfig({ adminToken: undefined, trustIdentityHeaders: false }, () => {
+    assert.equal(runRequireAdmin().passed, true);
+  });
+  // 可信身份却在部署上漏配了管理令牌：管理接口全部 401 —— 这是本轮修的关键点
+  withConfig({ adminToken: undefined, trustIdentityHeaders: true }, () => {
+    const r = runRequireAdmin({ 'x-admin-token': 'secret' });
+    assert.equal(r.passed, false, '客户端自带令牌在部署没配令牌时不该放行');
+    assert.equal(r.status, 401);
+  });
+  // 配了令牌：必须带对
+  withConfig({ adminToken: 'secret', trustIdentityHeaders: true }, () => {
+    assert.equal(runRequireAdmin({ 'x-admin-token': 'secret' }).passed, true);
+    assert.equal(runRequireAdmin({ 'x-admin-token': 'nope' }).status, 401);
+    assert.equal(runRequireAdmin().status, 401);
   });
 });
 

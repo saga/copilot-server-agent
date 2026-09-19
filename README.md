@@ -37,8 +37,8 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | GET | `/api/agents` | agent 预设 + 技能目录 + 可发现技能（建会话表单用） |
 | GET | `/api/mcp` | MCP 预设与内联开关（只含元信息，密钥不返回） |
 | POST | `/api/mcp/test` `{ name? , server? }`（二选一） | MCP 连通性自检（不建会话、不执行命令；local 查可执行文件，http 发 8s 超时 GET） |
-| GET | `/api/debug` | 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime） |
-| GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计；带 `executionId`） |
+| GET | `/api/debug` | 诊断包（版本/平台/脱敏配置/runtime 状态/会话计数；按需启动 runtime）。管理接口：见下方 `requireAdmin` 三态 |
+| GET | `/api/hooks` | hook 预设 + 最近 hook 事件（审计；带 `executionId`）。管理接口：同 `requireAdmin` 三态 |
 | GET | `/api/executions` `?sessionId=&status=&limit=` | execution 记录（usage + tool 证据）与统计。带 `x-admin-token` 看全量，否则按**可见会话**收窄（自己拥有的 + 自己参与的）；两者都没有且配了令牌 → `401` |
 | GET | `/api/executions/:id` | 单条 execution（含 `toolCalls` / `usage` / `actionIntent` / 终态）；需能访问所属会话 |
 | GET | `/api/executions/:id/events` | **审计时间线**：谁批准、何时、依据什么 hash、后来为什么执行；同样跟着会话可见性 |
@@ -47,7 +47,9 @@ npm run dev          # 同时启动 server(:3001) + client(:5173)
 | POST | `/api/executions/:id/run` `{ prompt }` | 后台跑一次 agent turn → `202`；指挥权同 `cancel`/`actions`（owner 或该 execution 发起人；observer `403`）。等待审批时用 events 端点跟踪 |
 | POST | `/api/executions/:id/cancel` | 取消（running / waiting 都可）。owner 可取消任意，member 只能取消自己发起的，observer `403` |
 | POST | `/api/executions/:id/actions` | **agent 提议业务动作**：服务端策略裁决 → 自动放行 / 建审批（202 + `taskId`）/ 拒绝（403）。执行权在 server；指挥权同 `cancel` |
-| GET | `/api/human-tasks` `?status=&type=` | 我的任务（审批 + 待补输入；资格服务端算） |
+| GET | `/api/human-tasks` `?status=&type=` | **我的任务**（审批 + 待补输入）。`tenantId` / `assignee` 由服务端按认证身份固定，请求里传了也不采纳 —— 否则调用方能把可见范围扩到整个 tenant |
+| GET | `/api/human-tasks/:id` | 单任务 + 决策记录。三类人可读：`x-admin-token`（全量）/ **task 的 assignee**（风险、合规审批人常常不在业务会话里，不能只按会话成员资格判定）/ 会话参与人；其余 `403`，跨租户先于会话判定 |
+| GET | `/api/human-tasks/all` `?status=` | 全部任务（管理视图，需 `x-admin-token`） |
 | POST | `/api/human-tasks/:id/approve` `{ comment? }` | 批准（`approverId` 取认证身份，请求体传了也忽略） |
 | POST | `/api/human-tasks/:id/reject` `{ comment? }` | 否决 |
 | POST | `/api/human-tasks/:id/input` `{ values }` | 人工补数据（按 `inputSchema` 校验，不是自由文本） |
@@ -100,6 +102,71 @@ DEEPSEEK_MODEL=deepseek-v4-flash  # 或 deepseek-v4-pro
 - **Agents**（`server/src/agents/builtin.ts`）：内置 `researcher`（只读：grep/glob/view）+ `editor`（改代码：view/edit/bash）两个预设。建会话时 `agents: ["researcher"]` 按名引用（缺省全挂，`[]` 为不挂），`customAgents` 可传完整内联定义，`agent: "researcher"` 预选首个激活 agent（对不上会 400）。运行时按 intent 自动委派 sub-agent，`subagent.*` 生命周期事件经 SSE `subagent` 帧透传，前端有 activity 时间线。
 - **Skills**（`server/skills/*`）：内置 `code-review`、`commit-helper` 两个示例技能（`SKILL.md` + frontmatter）。建会话默认加载，`noBuiltinSkills: true` 可关，`skillDirs` 可追加自有目录（不存在直接 400），`disabledSkills` 按名禁用。agent 级 `skills` 预加载按文档是 opt-in：内联 `customAgents` 里写 `skills: [...]` 即从会话 `skillDirectories` 解析。
 
+## Skill Flow：SKILL.md 里的编排
+
+一次「研究 → 合规门禁 → 合规审核 → 投资审核 → 发布」不是一次 agent turn 能做完的。流程定义写在
+**已有的 SKILL.md** 里，用 Markdown AST 解析 —— 不引入 BPMN / XState / 第二套 YAML DSL：
+
+```markdown
+## @flow investment-review
+start -> investment-research
+
+## @subagent investment-research
+（节点正文就是给 LLM 的 prompt：收集证据并输出带证据的研究结论）
+- success -> compliance
+- fail -> research-failed
+
+## @gate compliance
+- pass -> investment-review
+- fail -> compliance-rejected
+
+## @review investment-review
+- approve -> publish
+- reject -> investment-research      # 打回重做 = 把 route 指回上一步
+
+## @action publish
+- success -> completed
+- fail -> publish-failed
+```
+
+（`@stop research-failed` / `@stop compliance-rejected` / `@stop publish-failed` /
+`@end completed` 四个终止节点略。）
+
+`@flow @subagent @gate @review @action @stop @end` 七种块，必须 `##` 标题、`@` 开头，路由是
+`- <出口> -> <目标节点>`。编排器本身不新造 runtime，三层全部复用：
+
+- `@subagent` → `runExecutionTurn`（同一个 Copilot session / model / tool policy / 工具证据）
+- `@review` → HumanTask（My Tasks、委派、SoD、租户隔离、审计全都不改一行）
+- `@action` → `proposeAction`（策略 → 审批 → hash/版本复核 → executor），只是不自动收尾 execution
+
+**权限、角色、审批策略不写在 SKILL.md 里** —— 节点只声明「这里需要 compliance-review」，谁有资格
+批由服务端 `workflow/registry.ts` 决定。SKILL.md 会被 LLM 读到、也会被人改，不能是 security boundary。
+
+```bash
+curl -X POST localhost:3001/api/executions -H 'content-type: application/json' \
+  -d '{"sessionId":"user-pm-task-42","kind":"workflow",
+       "skill":"investment-research","flow":"investment-review"}'
+curl -X POST localhost:3001/api/executions/<id>/run        # workflow 不需要 prompt
+# 停在 @review → GET /api/human-tasks 里能看到任务 → approve 后自动续跑下一步
+```
+
+要点：
+
+- **校验先于执行**：建 execution 之前就把 `flow-missing` / `route-target-missing` /
+  `node-missing-outcome` / `node-unreachable` / `skill-missing` 等连同**行号**报出来（400）。
+  跑到一半才发现路由指向不存在的节点时，execution 可能已经停在等待态了。
+- **状态是 durable 的**：`agent_execution.workflow_state` 存 `current` / `steps` /
+  `waitingTaskId`，并且**先写 current 再执行节点** —— 反过来写，进程在「跑完但没落库」之间退出，
+  重启会把同一步再跑一遍，而那一步可能是已经把 mutation 发出去的 `@action`。
+- **`sourceHash` 挡住中途换版本**：SKILL.md 的 SHA-256 每次推进前重算比对，不一致就 failed
+  等人工确认 —— 不让已经开始的执行悄悄切到另一版流程上继续跑。
+- **允许环，所以有硬闸门** `MAX_FLOW_STEPS = 100`（review 一直打回不会跑成死循环）。
+- **API 没有新增端点**：`/api/executions` 多 `skill` / `flow` 两个字段，`/run` 按 `kind` 分派，
+  不另开 `/workflow/*` —— 否则同一个 execution 会有两条读取路径、两套权限矩阵。
+
+完整语义见 [`docs/architecture.md`](docs/architecture.md) 第 11 节。示例技能在
+`server/skills/investment-research/SKILL.md`。
+
 ## 会话持久化与 MCP
 
 参考官方 session-persistence / mcp 两篇文档：
@@ -151,7 +218,11 @@ curl -X POST localhost:3001/api/sessions/user-pm-task-42/chat \
 - **崩溃恢复**：启动时 `running`/`resuming` 的 execution 落终态 `interrupted`（**不自动重试** ——
   那次 turn 可能已经把业务动作做出去了），仍排队的按序重新 drain。恢复**在开始接流量之前**跑完：
   启动顺序是建 app → `recoverPending()` → 起 sweeper → `listen`，`/api/health/ready` 在恢复
-  完成前返回 `503 starting`。
+  完成前返回 `503 starting`。**恢复失败就不接流量**：置退出码 1 直接返回，不 `listen`、不 ready ——
+  否则会出现「DB 恢复失败 → 服务 ready → 照收业务请求」，而队列里的 `created` 永远没人 drain。
+  交给编排层重拉进程。
+- **单条坏记录不连坐**：恢复逐条补写 `interrupted` 审计事件，某条写入失败（例如 execution 指向
+  已被删除的会话）只记一条 warn 就继续。状态照落终态、队列照重排，不让一条坏记录把整轮恢复带走。
 - **人工补数据的续跑还没闭合**：`POST /api/human-tasks/:id/input` 把 execution 置到 `resuming`
   就停了 —— 没有组件把 `inputValues` 拼回 prompt、继续 agent turn，`resuming` 是个没有出边的
   悬挂态（要靠 `interrupted` 在重启时兜底）。审批（approval）不同：批准后由服务端执行器直接执行
@@ -160,6 +231,13 @@ curl -X POST localhost:3001/api/sessions/user-pm-task-42/chat \
 - **序号不靠 `max()+1`**：消息、会话事件、执行事件各有自己的分配器列，`update ... returning`
   原子自增。`max()+1` 在并发下会重号，再用 `on conflict do nothing` 兜住就变成静默丢事件。
 - **幂等**：`clientMessageId` 命中的重试沿用已有消息与 execution，不会跑两次 agent turn。
+- **业务动作的幂等键**：执行外部 mutation 时把 `action:{executionId}:{actionHash}` 传给 executor
+  （`ActionExecutionContext.idempotencyKey`），真实网关据此去重。挡的是「外部副作用已生效 →
+  进程在落 `completed` 前崩 → 重试」这一序列。刻意不绑 `taskId`：重新审批会产出新的 HumanTask，
+  但那仍是同一次业务动作。
+- **管理接口三态**（`requireAdmin`，作用于 `/api/debug`、`/api/hooks`、`/api/human-tasks/all`）：
+  没配 `COPILOT_ADMIN_TOKEN` 且非可信身份 → 本地单租户放行；没配令牌**但**开了可信身份 →
+  一律 `401`（否则「开了身份头 = 拿到管理权限」）；配了令牌 → 必须带对。
 - **发起人 ≠ owner**：`agent_execution.user_id` 记会话 owner（resume 归属校验用），
   `initiated_by_user_id` 记发起人（审计与「发起人不能自批」）。
 - **可见性跟着会话走**：shared 会话里参与者能看到同会话中别人发起的 execution 与待办任务。
@@ -339,6 +417,7 @@ npm run check:versions     # SDK / runtime / K8s 镜像 tag 四处版本必须�
 npm run verify:agent-tools # custom agent 工具是否真能调用（只认 tool.execution_start）
 npm run test               # execution 审计（脱敏/usage/tool 证据）+ 配置 smoke（非法值必须启动失败）
                            # + 两份 DDL 逐列比对 + SQLite 端到端（含老库补列）+ 协作模型（访问矩阵/幂等/队列串行/事件游标）
+                           # + Skill Flow（AST 解析/行号校验/编排推进/重启恢复/sourceHash 防中途改版）
 ```
 
 SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移会触发协议不兼容，且本服务依赖若干 SDK workaround。`verify:agent-tools` 对应 SDK issue #2356 —— 只看 `subagent.selected` 不够，必须看到 `tool.execution_start`。
@@ -374,7 +453,9 @@ SDK 与 runtime(CLI) 版本必须完全 pin（当前 `1.0.14`）：版本漂移�
 - `server/src/approval/` — `approval-policy.ts`（ANY/ALL/N_OF_M/SEQUENTIAL）、`approval-service.ts`（谁能批、几票、顺序）
 - `server/src/actions/` — `action-registry.ts`（server-controlled executor）、`action-service.ts`（业务动作策略裁决 + hash/版本复核）
 - `server/src/agent/` — `agent-runner.ts`（Copilot SDK 事件收口）、`agent-execution.ts`（一个 execution 跑一轮 turn）、`agent-context.ts`（turn 级 execution 上下文）
-- `server/src/db/` — `connection.ts`（后端选择）、`dialect.ts`（SQL 方言钩子）、`sqlite.ts` + `sqlite-schema.ts`（默认后端，schema 内嵌自动应用；建表 → 补列 → 建索引三步）、`postgres.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql` + `002_collaboration.sql`（PG 版 DDL）
+- `server/src/workflow/` — `types.ts`（FlowDefinition / WorkflowState / MAX_FLOW_STEPS）、`registry.ts`（gate / review / action 的服务端注册，含审批资格）、`runner.ts`（编排器：解析校验 → 逐步推进 → 人工收敛后续跑）
+- `server/src/skills/` — 技能加载与 sourceHash；`flow-parser.ts`（remark AST → 节点与路由）、`flow-validator.ts`（带行号的校验）
+- `server/src/db/` — `connection.ts`（后端选择）、`dialect.ts`（SQL 方言钩子）、`sqlite.ts` + `sqlite-schema.ts`（默认后端，schema 内嵌自动应用；建表 → 补列 → 建索引三步）、`postgres.ts`（可选依赖 `pg`）、`migrations/001_agent_execution.sql` + `002_collaboration.sql` + `003_workflow.sql`（PG 版 DDL）
 - `server/src/middleware/` — `error-status.ts`（错误文案 → 状态码的单一真相源，路由与兜底共用）、`errorHandler.ts`（兜底 500）
 - `server/src/wiring.ts` — 依赖装配（唯一决定 SQLite / PostgreSQL / 内存的地方）
 - `server/src/services/workspace-service.ts` — session workspace（路径是 sessionId 的确定性哈希）

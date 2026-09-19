@@ -14,6 +14,17 @@ import type { ActionIntent } from '../execution/types.js';
 export interface ActionExecutionContext {
   executionId: string;
   sessionId?: string;
+  /**
+   * 外部 mutation 的幂等键：`action:${executionId}:${actionHash}`。
+   *
+   * 真实 executor 调内部交易/投票/邮件网关时必须把它透传给下游。要挡的是这个序列：
+   *
+   *   外部副作用已生效 → 进程在落 execution.completed 之前崩 → 重试
+   *
+   * 重试时 executionId 与 actionHash 都不变，下游据此识别为同一次业务动作。
+   * 刻意不用 taskId：重新审批会生成新的 HumanTask，但那仍是同一个业务动作。
+   */
+  idempotencyKey: string;
   /** 触发执行的主题（审批人 or system auto-approve） */
   actor: string;
 }
@@ -50,6 +61,9 @@ const submitProxyVote: ActionExecutor = {
         securityId: intent.target.id,
         resolution,
         shares,
+        // 真实实现把 ctx.idempotencyKey 作为下游请求头/字段传给券商网关。
+        // 这里回显出来，让"幂等键确实被透传到了 executor"在审计里可见。
+        idempotencyKey: ctx.idempotencyKey,
         submittedAt: new Date().toISOString(),
       },
     };
@@ -68,7 +82,34 @@ const sendExternalMessage: ActionExecutor = {
     return {
       ok: true,
       actionType: intent.actionType,
-      output: { to, chars: body.length, sentAt: new Date().toISOString() },
+      // 真实实现把 ctx.idempotencyKey 传给邮件/IM 网关，避免重试把同一封信发两遍。
+      output: {
+        to,
+        chars: body.length,
+        idempotencyKey: ctx.idempotencyKey,
+        sentAt: new Date().toISOString(),
+      },
+    };
+  },
+};
+
+/** 内置示例：发布研究结论（Skill Flow 的 `@action publish`；真实实现替换为研报系统接口） */
+const publishResearch: ActionExecutor = {
+  actionType: 'publish_research',
+  async execute(intent, ctx) {
+    const reportId = String(intent.target.id ?? '');
+    if (!reportId) {
+      return { ok: false, actionType: intent.actionType, error: 'target.id（reportId）不能为空' };
+    }
+    return {
+      ok: true,
+      actionType: intent.actionType,
+      output: {
+        receipt: `publish_${ctx.executionId}`,
+        reportId,
+        idempotencyKey: ctx.idempotencyKey,
+        publishedAt: new Date().toISOString(),
+      },
     };
   },
 };
@@ -76,6 +117,7 @@ const sendExternalMessage: ActionExecutor = {
 export const ACTION_EXECUTORS: Record<string, ActionExecutor> = {
   [submitProxyVote.actionType]: submitProxyVote,
   [sendExternalMessage.actionType]: sendExternalMessage,
+  [publishResearch.actionType]: publishResearch,
 };
 
 export function getExecutor(actionType: string): ActionExecutor | undefined {

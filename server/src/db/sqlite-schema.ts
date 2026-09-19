@@ -71,6 +71,9 @@ create table if not exists agent_execution (
   approved_resource_version text,
   current_human_task_id text,
   wait_reason text,
+  -- Skill Flow 的编排状态（kind = 'workflow'）：当前节点 / 步数 / 等着哪个任务 / SKILL.md 哈希。
+  -- 必须 durable：@review 可能等几个小时，重启后只有它能回答"停在哪个节点"。
+  workflow_state text,
   -- execution 级事件序号分配器：execution_event.sequence 由它原子自增
   event_sequence integer not null default 0,
   model text,
@@ -215,8 +218,8 @@ create index if not exists idx_session_event on session_event(session_id, sequen
  * SQLite 没有 `add column if not exists`，所以由执行器先查 `pragma_table_info` 再决定是否 alter
  * （见 `db/sqlite.ts` 的 `applyColumnUpgrades`），重复启动安全。
  *
- * 与 `migrations/002_collaboration.sql` 的 `add column if not exists` 一一对应：
- * 新增列时两处都要加，否则两个后端会在运行期漂移。
+ * 与 `migrations/` 下的增量迁移（002 协作模型、003 workflow state）的 `add column if not exists`
+ * 一一对应：新增列时两处都要加，否则两个后端会在运行期漂移。
  * 这里只允许出现「CREATE TABLE 里已经声明过的列」——`test/schema.test.ts` 会校验。
  */
 export const SQLITE_COLUMN_UPGRADES: readonly string[] = [
@@ -227,4 +230,5 @@ export const SQLITE_COLUMN_UPGRADES: readonly string[] = [
   'alter table agent_execution add column source_message_id text',
   'alter table agent_execution add column queue_sequence integer',
   'alter table agent_execution add column event_sequence integer not null default 0',
+  'alter table agent_execution add column workflow_state text',
 ];

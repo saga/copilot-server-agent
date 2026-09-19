@@ -21,6 +21,7 @@ import {
   type ToolCallRecord,
 } from './types.js';
 import { LlmUsageAccumulator, type LlmUsageSample } from './usage.js';
+import type { WorkflowState } from '../workflow/types.js';
 
 export interface ExecutionServiceDeps {
   repository: ExecutionRepository;
@@ -31,6 +32,20 @@ export interface ExecutionServiceDeps {
   /** 取当前数据版本（resourceVersion 复核用；不配则不校验版本） */
   resolveResourceVersion?: (intent: ActionIntent) => Promise<string | undefined>;
 }
+
+/**
+ * 审批通过后执行动作的结果。
+ *
+ * 分成三态是因为调用方要决定"接下来干什么"：
+ * - `executed`：动作有结论（ok / !ok），编排层据此选下一个 route
+ * - `reapproval_required`：动作内容或数据版本变了，已另开审批任务 —— 必须**继续等待**，
+ *   不能当成失败继续往下走
+ * - `idle`：execution 不存在或没什么可做的
+ */
+export type ApprovedActionResult =
+  | { status: 'executed'; ok: boolean; output?: unknown; error?: string }
+  | { status: 'reapproval_required'; reason: string }
+  | { status: 'idle' };
 
 export interface CreateExecutionInput {
   sessionId: string;
@@ -55,6 +70,8 @@ export interface CreateExecutionInput {
    * 并发提交时 agent 的处理顺序会与 transcript 顺序不一致。
    */
   queueSequence?: number;
+  /** Skill Flow 的初始编排状态（kind = 'workflow' 时必填） */
+  workflow?: WorkflowState;
 }
 
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
@@ -166,6 +183,7 @@ export class ExecutionService {
       ...(input.queueSequence !== undefined ? { queueSequence: input.queueSequence } : {}),
       kind: input.kind ?? 'interactive',
       status: 'created',
+      ...(input.workflow ? { workflow: input.workflow } : {}),
       createdAt: now,
       updatedAt: now,
       streaming: input.streaming ?? false,
@@ -186,6 +204,17 @@ export class ExecutionService {
       payload: { sessionId: input.sessionId, kind: stored.kind },
     });
     return stored;
+  }
+
+  /**
+   * 落一次编排状态（每步之后都必须调，且要在推进之前）。
+   *
+   * 顺序要求：先把 `current` 推进到下一个节点写库，再去执行它。
+   * 反过来的话，进程在"执行完了但状态还没落库"之间退出，重启后会把同一步再跑一遍
+   * （子流程可能已经把动作做出去了）。
+   */
+  async updateWorkflowState(executionId: string, workflow: WorkflowState): Promise<void> {
+    await this.deps.repository.update(executionId, { workflow });
   }
 
   async start(executionId: string): Promise<ExecutionRecord> {
@@ -366,7 +395,15 @@ export class ExecutionService {
   async proposeAction(
     executionId: string,
     intent: ActionIntent,
-    opts: { resourceVersion?: string; onTaskCreated?: (task: HumanTask) => void } = {},
+    opts: {
+      resourceVersion?: string;
+      onTaskCreated?: (task: HumanTask) => void;
+      /**
+       * Skill Flow 的 `@action` 节点：审批任务上打 workflow 标记。
+       * 收敛时的 dispatcher（wiring）据此把任务交回 WorkflowRunner 而不是当成终态动作。
+       */
+      workflow?: { nodeId: string };
+    } = {},
   ): Promise<{ decision: 'auto_approve' | 'needs_approval' | 'denied'; taskId?: string; reason?: string; result?: unknown }> {
     const rec = await this.deps.repository.get(executionId);
     if (!rec) throw new Error(`execution 不存在："${executionId}"`);
@@ -402,6 +439,8 @@ export class ExecutionService {
         approvedHash: actionHash,
         approvedResourceVersion: opts.resourceVersion,
         actor: 'system:auto',
+        // workflow 的动作执行完不能收尾：后面还有节点要跑
+        completeOnSuccess: !opts.workflow,
       });
       return { decision: 'auto_approve', result };
     }
@@ -418,6 +457,9 @@ export class ExecutionService {
         parameters: intent.parameters,
         actionHash,
         ...(opts.resourceVersion ? { resourceVersion: opts.resourceVersion } : {}),
+        ...(opts.workflow
+          ? { workflow: { executionId, nodeId: opts.workflow.nodeId, kind: 'action' } }
+          : {}),
       },
       policy: verdict.policy,
       initiatedBy: rec.initiatedByUserId ?? rec.userId,
@@ -527,29 +569,56 @@ export class ExecutionService {
     }
 
     // approved：不直接执行 —— 复核 hash + resourceVersion 后再执行
+    await this.executeApprovedAction(task.executionId, {
+      actor: decisions?.[decisions.length - 1]?.approverId ?? 'approver',
+    });
+  }
+
+  /**
+   * 审批通过之后的执行：复核 actionHash / resourceVersion → executor → 决定终态。
+   *
+   * 抽成公开方法而不是留在 onHumanTaskResolved 里，是因为 Skill Flow 的 `@action` 节点
+   * 也要走**同一条**路径（同样的幂等键、同样的失配重新审批），但它成功之后不能收尾
+   * —— 流程后面还有节点。两条调用路径共用这一份实现，"动作怎么执行"只有一处定义。
+   */
+  async executeApprovedAction(
+    executionId: string,
+    opts: { completeOnSuccess?: boolean; actor?: string } = {},
+  ): Promise<ApprovedActionResult> {
+    const rec = await this.deps.repository.get(executionId);
+    if (!rec) return { status: 'idle' };
     const intent = rec.actionIntent;
     if (!intent) {
-      await this.fail(task.executionId, new Error('审批通过但 execution 上没有 actionIntent'));
-      return;
+      const reason = '审批通过但 execution 上没有 actionIntent';
+      await this.fail(executionId, new Error(reason));
+      return { status: 'executed', ok: false, error: reason };
     }
     const currentResourceVersion = await this.deps.resolveResourceVersion?.(intent);
-    const result = await this.runAction(task.executionId, intent, {
+    const result = await this.runAction(executionId, intent, {
       approvedHash: rec.actionHash,
       approvedResourceVersion: rec.resourceVersion,
       ...(currentResourceVersion !== undefined ? { currentResourceVersion } : {}),
-      actor: decisions?.[decisions.length - 1]?.approverId ?? 'approver',
+      actor: opts.actor ?? 'approver',
+      completeOnSuccess: opts.completeOnSuccess ?? true,
     });
-    if (result && typeof result === 'object' && (result as { ok?: boolean }).ok === false) {
-      const error = String((result as { error?: string }).error ?? '执行失败');
-      const verified = (result as { verified?: { hash: boolean; resourceVersion: boolean } }).verified;
-      // hash/版本失配 = 需要重新审批（保持 waiting_for_approval，另开任务）
-      if (verified && (!verified.hash || !verified.resourceVersion)) {
-        await this.transition(task.executionId, 'waiting_for_approval', { error });
-        await this.reapprove(task.executionId, intent, error);
-        return;
+    const r = result as {
+      ok?: boolean;
+      output?: unknown;
+      error?: string;
+      verified?: { hash: boolean; resourceVersion: boolean };
+    };
+    if (r && r.ok === false) {
+      const error = String(r.error ?? '执行失败');
+      // hash/版本失配 = 动作实质变了 → 重新审批（保持 waiting_for_approval，另开任务）
+      if (r.verified && (!r.verified.hash || !r.verified.resourceVersion)) {
+        await this.transition(executionId, 'waiting_for_approval', { error });
+        await this.reapprove(executionId, intent, error);
+        return { status: 'reapproval_required', reason: error };
       }
-      await this.fail(task.executionId, new Error(error));
+      await this.fail(executionId, new Error(error));
+      return { status: 'executed', ok: false, error };
     }
+    return { status: 'executed', ok: true, ...(r?.output !== undefined ? { output: r.output } : {}) };
   }
 
   /** hash 或版本失配：动作实质变了 → 重新发起审批，而不是拿旧批准继续执行 */
@@ -591,6 +660,11 @@ export class ExecutionService {
       approvedResourceVersion?: string;
       currentResourceVersion?: string;
       actor: string;
+      /**
+       * 动作成功后是否把 execution 收成 completed（默认 true）。
+       * Skill Flow 的 `@action` 传 false：动作只是流程中的一步，后面还有节点。
+       */
+      completeOnSuccess?: boolean;
     },
   ): Promise<unknown> {
     const actions = this.deps.actions!;
@@ -600,9 +674,15 @@ export class ExecutionService {
       actorType: 'system',
       payload: { actionType: intent.actionType, actor: ctx.actor },
     });
+    // 幂等键绑定「execution + 动作内容 hash」，而不是 taskId：
+    // 重新审批会产出新的 HumanTask，但下游要认的是同一次业务动作。
+    // 重试（外部副作用已成、进程在落终态前崩）时这两个值都不变，下游据此去重。
+    const actionHash = ctx.approvedHash ?? hashAction(intent);
+    const idempotencyKey = `action:${executionId}:${actionHash}`;
     const result = await actions.execute(intent, {
       executionId,
       actor: ctx.actor,
+      idempotencyKey,
       approvedHash: ctx.approvedHash,
       approvedResourceVersion: ctx.approvedResourceVersion,
       currentResourceVersion: ctx.currentResourceVersion,
@@ -638,7 +718,9 @@ export class ExecutionService {
         await this.eventLog.append({ executionId, type: EVT.resuming, actorType: 'system' });
         await this.transition(executionId, 'running');
       }
-      await this.complete(executionId, { result: result.output });
+      if (ctx.completeOnSuccess !== false) {
+        await this.complete(executionId, { result: result.output });
+      }
     }
     return result;
   }

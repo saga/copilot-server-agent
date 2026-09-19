@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +8,14 @@ export interface SkillMeta {
   name: string;
   description?: string;
   directory: string;
+}
+
+/** 已加载的技能：正文 + 内容哈希（Skill Flow 用它做中途换版本的审计） */
+export interface LoadedSkill {
+  meta: SkillMeta;
+  markdown: string;
+  /** SKILL.md 内容的 SHA-256（hex） */
+  sourceHash: string;
 }
 
 /**
@@ -92,4 +101,49 @@ export function resolveSkillDirectories(opts: {
     dirs.push(abs);
   }
   return [...new Set(dirs)];
+}
+
+/**
+ * 技能搜索目录：内置 + `COPILOT_SKILL_ROOTS`。
+ *
+ * 与 `resolveSkillDirectories` 同一套来源：Flow 里 `@subagent <name>` 要能解析到
+ * 会话实际能看到的技能，否则"声明了却不生效"。
+ */
+export function skillSearchDirs(extra: string[] = []): string[] {
+  const dirs: string[] = [];
+  if (existsSync(BUILTIN_SKILL_DIR)) dirs.push(BUILTIN_SKILL_DIR);
+  for (const root of [...config.skillRoots, ...extra]) {
+    if (existsSync(root) && statSync(root).isDirectory()) dirs.push(path.resolve(root));
+  }
+  return [...new Set(dirs)];
+}
+
+/**
+ * 按名找技能。目录名与 frontmatter 的 `name` 都算命中（大小写不敏感）。
+ * 找不到返回 undefined —— 调用方（Flow 校验）据此报错，而不是让 LLM 自己猜一个技能。
+ */
+export function findSkill(name: string, dirs: string[] = skillSearchDirs()): SkillMeta | undefined {
+  const want = name.trim().toLowerCase();
+  if (!want) return undefined;
+  for (const dir of dirs) {
+    for (const meta of discoverSkills(dir)) {
+      if (meta.name.toLowerCase() === want || path.basename(meta.directory).toLowerCase() === want) {
+        return meta;
+      }
+    }
+  }
+  return undefined;
+}
+
+/** 读取技能正文并算内容哈希 */
+export function loadSkill(name: string, dirs: string[] = skillSearchDirs()): LoadedSkill | undefined {
+  const meta = findSkill(name, dirs);
+  if (!meta) return undefined;
+  const markdown = readFileSync(path.join(meta.directory, 'SKILL.md'), 'utf-8');
+  return { meta, markdown, sourceHash: sha256(markdown) };
+}
+
+/** 与 execution 上保存的 sourceHash 比对用 */
+export function sha256(text: string): string {
+  return createHash('sha256').update(text, 'utf-8').digest('hex');
 }

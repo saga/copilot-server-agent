@@ -1,4 +1,5 @@
 import type { UsageRecord } from './usage.js';
+import type { WorkflowState } from '../workflow/types.js';
 
 /**
  * execution = 一次 agent 执行单元（一次 chat turn / 一个 job / 一次 workflow run）。
@@ -135,6 +136,14 @@ export interface ExecutionRecord {
   kind: ExecutionKind;
   status: ExecutionStatus;
 
+  /**
+   * Skill Flow 的编排状态（仅 kind = 'workflow'）。
+   *
+   * 必须 durable：`@review` 可能等几个小时，Pod 重启后 execution 仍是 waiting_for_approval，
+   * 只有这个字段能回答"停在哪个节点、等的是哪个任务"。没有它就无法安全恢复。
+   */
+  workflow?: WorkflowState;
+
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -218,4 +227,16 @@ export const EXECUTION_EVENT_TYPES = {
   expired: 'execution.expired',
   /** 进程中途退出（启动恢复时写入），终态且不自动重试 */
   interrupted: 'execution.interrupted',
+
+  // --- Skill Flow（kind = 'workflow'）：节点级时间线 ---
+  // 审计链会变成：workflow.step.started → agent.started → agent.tool_call.completed
+  //   → workflow.step.completed(outcome) → workflow.waiting → human_task.created
+  //   → approval.submitted → workflow.resumed → action.executed → workflow.completed
+  workflowStarted: 'workflow.started',
+  workflowStepStarted: 'workflow.step.started',
+  workflowStepCompleted: 'workflow.step.completed',
+  workflowWaiting: 'workflow.waiting',
+  workflowResumed: 'workflow.resumed',
+  workflowCompleted: 'workflow.completed',
+  workflowFailed: 'workflow.failed',
 } as const;

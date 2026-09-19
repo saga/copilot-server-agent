@@ -68,6 +68,8 @@ function toRecord(r: ExecutionRow): ExecutionRecord {
       ? { currentHumanTaskId: r.current_human_task_id }
       : {}),
     ...(typeof r.wait_reason === 'string' ? { waitReason: r.wait_reason as 'input' | 'approval' } : {}),
+    // Skill Flow 的编排状态：读回来，重启后的续跑才知道"停在哪个节点"
+    ...(r.workflow_state ? { workflow: dialect.json<ExecutionRecord['workflow']>(r.workflow_state) } : {}),
     ...(r.result !== null && r.result !== undefined ? { result: dialect.json(r.result) } : {}),
     ...(typeof r.content_chars === 'number' ? { contentChars: r.content_chars } : {}),
     ...(typeof r.error === 'string' ? { error: r.error } : {}),
@@ -96,6 +98,7 @@ const COLUMNS = [
   'approved_resource_version',
   'current_human_task_id',
   'wait_reason',
+  'workflow_state',
   'model',
   'streaming',
   'prompt_preview',
@@ -132,6 +135,7 @@ function toValues(rec: ExecutionRecord): unknown[] {
     rec.approvedResourceVersion ?? null,
     rec.currentHumanTaskId ?? null,
     rec.waitReason ?? null,
+    jsonParam(rec.workflow),
     rec.model ?? null,
     rec.streaming,
     rec.promptPreview ?? null,

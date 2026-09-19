@@ -18,9 +18,14 @@ import { SQLITE_COLUMN_UPGRADES, SQLITE_SCHEMA_SQL } from '../src/db/sqlite-sche
 
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** PostgreSQL 侧是增量迁移：001 建表，002 加协作模型 */
-const PG_MIGRATION_001 = 'src/db/migrations/001_agent_execution.sql';
-const PG_MIGRATION_002 = 'src/db/migrations/002_collaboration.sql';
+/** PostgreSQL 侧是增量迁移：001 建表，之后每个文件加一批列 */
+const PG_MIGRATION_FILES = [
+  'src/db/migrations/001_agent_execution.sql',
+  'src/db/migrations/002_collaboration.sql',
+  'src/db/migrations/003_workflow.sql',
+];
+/** 001 是建表那一版，它自己的补列已写进 SQLite 的 CREATE TABLE；增量补列从 002 起比对 */
+const PG_INCREMENTAL_FILES = PG_MIGRATION_FILES.slice(1);
 
 /** SQL 仓储实现：这些文件里的行属性读取必须能在**两份** DDL 里都找到 */
 const SQL_IMPLEMENTATIONS = [
@@ -75,9 +80,9 @@ function applyColumnChanges(tables: Map<string, Set<string>>, sql: string): void
   }
 }
 
-const sql001 = fs.readFileSync(path.join(serverRoot, PG_MIGRATION_001), 'utf-8');
-const sql002 = fs.readFileSync(path.join(serverRoot, PG_MIGRATION_002), 'utf-8');
-const pgSql = `${sql001}\n${sql002}`;
+const read = (rel: string): string => fs.readFileSync(path.join(serverRoot, rel), 'utf-8');
+const pgSql = PG_MIGRATION_FILES.map(read).join('\n');
+const pgIncrementalSql = PG_INCREMENTAL_FILES.map(read).join('\n');
 const pgTables = parseTables(pgSql);
 applyColumnChanges(pgTables, pgSql);
 const sqliteTables = parseTables(SQLITE_SCHEMA_SQL);
@@ -111,15 +116,15 @@ test('补列语句只补 CREATE TABLE 已声明的列', () => {
   }
   assert.deepEqual(stray, [], `补列语句与 DDL 漂移：\n${stray.join('\n')}`);
 
-  // PostgreSQL 侧走同一个升级路径：002 的补列集合必须与 SQLite 的补列集合一致。
+  // PostgreSQL 侧走同一个升级路径：增量迁移（002 起）的补列集合必须与 SQLite 的补列集合一致。
   // （001 里也有补列语句，那是它自己那版的升级路径，对应列已写进 SQLite 的 CREATE TABLE。）
-  const pgUpgrades = [...sql002.matchAll(addColumnRe)].map((m) => `${m[1]}.${m[2]}`).sort();
+  const pgUpgrades = [...pgIncrementalSql.matchAll(addColumnRe)].map((m) => `${m[1]}.${m[2]}`).sort();
   const liteUpgrades = SQLITE_COLUMN_UPGRADES.map((s) => {
     const m = addColumnRe.exec(s)!;
     addColumnRe.lastIndex = 0;
     return `${m[1]}.${m[2]}`;
   }).sort();
-  assert.deepEqual(liteUpgrades, pgUpgrades, 'SQLite 补列与 PG 002 迁移的补列集合不一致');
+  assert.deepEqual(liteUpgrades, pgUpgrades, 'SQLite 补列与 PG 增量迁移的补列集合不一致');
 });
 
 test('SQL 仓储引用的列在两份 DDL 里都存在', () => {
