@@ -7,6 +7,17 @@
 07  Financial Workflow DSL 与 Deterministic Runtime
 08  AI Agent Architecture Review Checklist
 
+搜索web，结合业界研究和大厂经验，写这个文档
+
+为什么金融 Agent 不能让 LLM 成为 Workflow Engine
+金融业务中的 Agent Control Plane 与 Agent Runtime 分离设计
+从 Chatbot 到 Business Case：企业 Agent 应用的业务对象设计
+为什么 Business State 不应该存在 Agent Memory 中
+
+Human-in-the-loop 不只是 Approval Button
+Maker-Checker 与 AI Agent：如何保持职责分离
+
+
 
 一、架构总论
 金融服务领域 AI Agent Workflow 架构设计
