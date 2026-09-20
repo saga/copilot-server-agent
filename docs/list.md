@@ -1,3 +1,4 @@
+金融服务领域，AI Agent平台的搭建使用，包括Agent本身的设计变得越来越普遍。架构设计的review不可能做的事无巨细，设计一个checklist检查列表（比如80个问题），能最大程度涵盖或者发现比较严重的问题，减少风险。除了问题，还应该给出建议或者参考方向，否则到底想说明什么不清楚，给我一个完整的markdown文档让我下载，里面的问题和建议包括检查要点都说清楚。
 
 
 一、架构总论
@@ -42,13 +43,6 @@ MCP Tool 为什么不能天然等同于 Agent Capability
 金融 Agent 中的 Least Privilege 应该落在哪里
 
 
-搜索 Web，结合业界研究、大厂实践和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接。
-写完后先内部 review：检查主要论点是否有充分依据、是否混淆事实与推论、是否把结论说得过头；发现问题先修改文章。
-最终只输出修改后的完整文章和参考资料，不要输出 review、分析过程、修改建议或生成过程。
-主题：“Agent Behavior Drift：没有改代码，为什么行为也会变”
-
-
-
 五、Command / Side Effect / Transaction
 AI Agent 的 Read 与 Write 为什么应该完全区别对待
 Command Pattern 如何解决 Agent 的业务副作用问题
@@ -59,6 +53,7 @@ At-least-once Workflow + Idempotent Command Executor
 Command Hash、Resource Version 与 TOCTOU 防护
 外部系统执行失败时，Agent Workflow 应该如何恢复
 金融 Agent 的 Retry / Timeout / Compensation 设计
+
 六、Audit / Governance
 AI Observability ≠ Regulatory Audit Evidence
 金融 Agent 应该记录什么才能回答“Who / What / Why / How”
@@ -70,19 +65,29 @@ Agent Decision Provenance：AI 结论如何追溯到 Evidence
 Model Version、Skill Version 与 Business Decision 的关联
 如何设计可 Replay 的金融 Agent Workflow
 如何证明一次 AI 驱动业务操作到底为什么被允许
+
+
 七、Workflow DSL / 技术实现
-从 Markdown 到 Workflow AST：为什么 Agent Workflow 可以用 DSL 表达
-Financial Workflow DSL 的 Parser / Validator / Analyzer 三层设计
-为什么 Workflow DSL 应该先 Parse，再 Validate，再 Analyze
-Workflow Static Analysis：如何在运行前发现不可达节点和死流程
-Agent Workflow DSL 的错误模型设计
+从 Markdown 到 Workflow AST：为什么 Agent Workflow 可以用 DSL 表达 *
+Financial Workflow DSL 的 Parser / Validator / Analyzer 三层设计 *
+为什么 Workflow DSL 应该先 Parse，再 Validate，再 Analyze *
+Workflow Static Analysis：如何在运行前发现不可达节点和死流程 *
+Agent Workflow DSL 的错误模型设计 *
 Workflow Definition 的 Source Hash 与运行时一致性
-Workflow Runner 如何实现单写者与 CAS
-等待人工审批时，Workflow Runtime 应该如何持久化
+Workflow Runner 如何实现单写者与 CAS *
+等待人工审批时，Workflow Runtime 应该如何持久化 *
 Workflow Resume / Restart / Recovery 的正确设计
 为什么 Workflow Runtime 不应该绑定 Copilot SDK
-Agent Runtime Adapter：Copilot SDK / DeepAgents / LangGraph 如何替换
-如何设计一个与 Agent Framework 无关的 Workflow Engine
+Agent Runtime Adapter：Copilot SDK / DeepAgents / LangGraph 如何替换 *
+如何设计一个与 Agent Framework 无关的 Workflow Engine *
+
+
+搜索 Web，结合业界研究、大厂实践和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接，如果有真实案例佐证最好。
+写完后先内部 review：检查主要论点是否有充分依据、是否混淆事实与推论、是否把结论说得过头；发现问题先修改文章。
+最终只输出修改后的完整文章和参考资料，不要输出 review、分析过程、修改建议或生成过程。
+主题：“为什么 Workflow DSL 应该先 Parse，再 Validate，再 Analyze”
+
+
 八、Agent Runtime / Skills / Tooling
 Skill、Tool、Capability、Command 四者到底有什么区别
 为什么 Skill 不是 Tool 的集合
@@ -92,6 +97,7 @@ Deterministic Check + LLM Reasoning：企业 Agent Skill 的组合模式
 为什么企业 Agent 应该尽量把确定性判断移到代码
 AI Agent 的工具调用为什么需要第二层 Policy
 Server-side Agent Runtime 与 IDE Agent Runtime 的架构差异
+
 九、工程可靠性
 Agent Execution 的状态机应该如何设计
 Agent Session 与 Business Execution 为什么应该分离

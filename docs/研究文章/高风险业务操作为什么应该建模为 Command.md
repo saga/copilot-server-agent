@@ -2136,3 +2136,3558 @@ LLM 可以提出 Command
 AI RMF
 PLAYBOOK
 PLAYBOOK"
+
+
+---------
+
+
+# 高风险业务操作为什么应该建模为 Command，以及如何建模
+
+在 AI Agent 进入金融服务生产环境以后，一个非常容易被低估的架构问题是：
+
+> Agent 最终要“做一件事情”时，到底应该直接调用一个 Tool，还是先把这件事情建模成一个独立的业务 Command？
+
+例如：
+
+```text
+Agent
+  ↓
+submitOrder(...)
+```
+
+看起来非常自然。
+
+但一旦进入真实金融业务，这个 `submitOrder()` 背后实际上包含了大量问题：
+
+```text
+谁发起？
+替谁发起？
+为什么发起？
+针对哪个客户？
+针对哪个账户？
+针对哪个资产？
+数量是多少？
+当前状态是否允许？
+当前权限是否允许？
+风险限额是否允许？
+是否需要审批？
+审批时看到的参数与现在是否一致？
+重复执行怎么办？
+下游已经成功但上游超时怎么办？
+最终业务状态是什么？
+事后如何证明是谁批准、谁执行、执行了什么？
+```
+
+如果这些问题最终全部隐藏在一个 Tool Call 后面：
+
+```text
+tool = submitOrder
+arguments = {...}
+```
+
+那么 Agent 的“推理”与企业真正的“业务动作”之间几乎没有结构化边界。
+
+这在普通软件里已经是一个值得警惕的设计，在金融服务领域更危险。
+
+AWS 当前的 Agentic AI Lens 明确要求：Agent 的 Tool Invocation 应在执行前通过外部、确定性的授权策略检查；高风险的 mutating operation 应通过人类监督或其他明确控制；权限应限制在 Agent 完成工作所需的最小范围。
+
+这并不意味着 AWS 或任何监管机构要求企业必须采用名为“Command”的对象。更准确地说，**Command 是一种很适合把“Agent 提出的业务意图”和“企业最终允许发生的业务状态变化”分开的架构模式**。它建立在 CQRS、DDD、任务型业务建模和金融风险控制等已有思想之上。Microsoft 的 CQRS 指南明确建议 Command 表示具体的业务任务，而不是底层数据字段更新；例如使用“Book hotel room”，而不是“Set ReservationStatus = Reserved”。
+
+本文讨论的重点不是“Command 这个名字是否标准”，而是一个更重要的问题：
+
+> **为什么 Agent 的高风险业务操作不应该直接等同于 Tool Call，以及如何把它建模成一个可以授权、审批、校验、重试、审计和执行的业务对象。**
+
+---
+
+# 一、先给结论：Tool 是能力，Command 是业务动作
+
+最简单的区分是：
+
+```text
+Tool
+=
+Agent 可以调用什么能力
+
+Command
+=
+Agent 想让业务系统发生什么变化
+```
+
+例如：
+
+```text
+Tool:
+portfolio.read
+
+Command:
+CreateRebalanceProposal
+```
+
+或者：
+
+```text
+Tool:
+order.prepare
+
+Command:
+SubmitCustomerOrder
+```
+
+或者：
+
+```text
+Tool:
+proxyVote.submit
+
+Command:
+CastProxyVote
+```
+
+二者不是同一个层次。
+
+可以画成：
+
+```text
+                         Agent
+                           │
+                      proposes
+                           │
+                           ▼
+                   ┌───────────────┐
+                   │    Command    │
+                   │               │
+                   │ Business      │
+                   │ Intent        │
+                   └───────┬───────┘
+                           │
+                deterministic controls
+                           │
+             ┌─────────────┼─────────────┐
+             │             │             │
+             ▼             ▼             ▼
+       Authorization     Policy       Approval
+             │             │             │
+             └─────────────┼─────────────┘
+                           ▼
+                    Command Executor
+                           │
+                           ▼
+                    Business System
+                           │
+                           ▼
+                     New State
+```
+
+关键是：
+
+> **Agent 可以产生 Command，但 Agent 本身不应该因此拥有“让 Command 生效”的最终权力。**
+
+Command 是边界，不是授权。
+
+---
+
+# 二、为什么直接把高风险动作设计成 Tool 会有问题？
+
+假设一个 Agent 有：
+
+```text
+search_customer
+get_portfolio
+calculate_risk
+submit_order
+send_email
+```
+
+在普通 Agent Framework 中，最终可能只是：
+
+```text
+LLM
+ ↓
+Tool Call
+ ↓
+submit_order(...)
+ ↓
+Business API
+```
+
+这里至少混合了五种不同的责任：
+
+```text
+LLM Reasoning
+Authorization
+Business Intent
+Risk Control
+State Mutation
+```
+
+而这些本来应该由不同层负责。
+
+最危险的问题是：
+
+> **Tool Call 同时承担了“模型想这么做”和“系统真的这么做”。**
+
+这让一个随机、概率性的模型输出，直接成为确定性的业务状态变化。
+
+AWS 的 Agentic AI Lens 明确把“依赖 Agent 自己的 reasoning 来完成 authorization”视为反模式，并要求在 Tool 执行前使用外部授权机制；对于高风险 mutation，则应进一步设置 human checkpoint。
+
+---
+
+# 三、Command 的思想其实并不新，Agent 只是让它重新变得重要
+
+Command 并不是 Agent 时代才出现的概念。
+
+经典的 Command Query Separation 将操作分成两类：
+
+* Query：读取状态，不改变可观察状态；
+* Command：改变系统状态。
+
+Microsoft 的 CQRS 文档进一步强调：
+
+> Command 应该表示具体的业务任务，而不是低层次的数据更新。
+
+也就是说：
+
+```text
+不好：
+
+UpdateOrderStatus(status=SUBMITTED)
+```
+
+更好的：
+
+```text
+SubmitCustomerOrder(...)
+```
+
+前者描述数据库状态变化。
+
+后者描述业务意图。
+
+Microsoft 的 CQRS 文档还明确指出，Command-side 适合承载 validation 和 business logic，以保证写入后的业务一致性。
+
+因此，Agent 并不是创造了 Command Pattern。
+
+它只是让一个老问题变得更加尖锐：
+
+> **当“决定要做什么”的主体从确定性代码变成了概率性的 LLM 时，业务 Command 边界的重要性进一步上升。**
+
+---
+
+# 四、为什么金融业务尤其适合 Command 模型？
+
+金融系统长期以来就非常重视：
+
+```text
+Order
+Payment
+Transfer
+Instruction
+Approval
+Trade
+Vote
+Settlement
+```
+
+这些都不是简单的 CRUD。
+
+例如：
+
+```text
+Update Order Status = Submitted
+```
+
+并不能描述真正的业务语义。
+
+真正业务动作是：
+
+```text
+Submit Customer Order
+```
+
+因为这个动作背后可能隐含：
+
+```text
+客户是否有权交易
+交易品种是否允许
+订单数量是否合理
+市场是否开放
+账户是否有足够资金
+风控限额是否通过
+是否满足监管要求
+是否需要人工审批
+```
+
+SEC Rule 15c3-5 就是一个很具体的金融领域例子：具有市场准入的 broker-dealer 必须建立、记录和维护风险控制及监督程序，以防止超过预设信用/资本阈值或明显错误的订单进入市场，并限制市场访问系统只供授权人员使用；相关控制还必须定期审查其有效性。
+
+这并不意味着 SEC 要求使用 `Command` 类。
+
+真正值得借鉴的是：
+
+> **高风险业务动作不能只是一个“API 被调用了”，而应该是一个受业务规则、权限和风险控制约束的明确业务动作。**
+
+FINRA 2026 年的 Best Execution 指导同样强调对整个订单流进行监督、持续监控，并要求定期、严格地检查订单执行质量和相关分析。
+
+---
+
+# 五、Command 最核心的价值：把“建议”和“执行”彻底分开
+
+这是 Agent 架构里最重要的边界之一。
+
+传统方式：
+
+```text
+Agent
+ ↓
+Tool Call
+ ↓
+Mutation
+```
+
+Command 方式：
+
+```text
+Agent
+ ↓
+Command Proposal
+ ↓
+Validation
+ ↓
+Authorization
+ ↓
+Approval
+ ↓
+Execution
+```
+
+于是 Agent 的角色发生了变化。
+
+不是：
+
+> Agent 决定并执行。
+
+而是：
+
+> Agent 提出业务动作，系统判断这个动作是否允许执行。
+
+可以抽象成：
+
+```text
+LLM
+=
+Proposal Generator
+
+Policy
+=
+Decision Maker
+
+Command
+=
+Business Intent
+
+Executor
+=
+Side Effect Owner
+
+Business System
+=
+Source of Truth
+```
+
+AWS 当前建议的高风险 Agent 模式与这一思想是一致的：按风险和可逆性划分 Autonomous / Notify / Approve，并在高风险动作执行之前设置人工或其他外部控制。
+
+---
+
+# 六、什么样的操作应该建模为 Command？
+
+并不是所有写操作都需要 Command。
+
+简单 CRUD：
+
+```text
+update user preference
+```
+
+未必需要一个复杂 Command Framework。
+
+更值得建模为 Command 的通常具有以下一个或多个特征：
+
+### 1. 改变重要业务状态
+
+例如：
+
+```text
+SubmitOrder
+ApprovePayment
+CastProxyVote
+ChangeClientStatus
+CloseAccount
+```
+
+### 2. 具有明确业务意图
+
+不是：
+
+```text
+UPDATE table
+```
+
+而是：
+
+```text
+ApproveTrade
+```
+
+### 3. 需要权限判断
+
+```text
+谁有权做？
+```
+
+### 4. 需要业务规则
+
+```text
+什么情况下允许？
+```
+
+### 5. 需要审批
+
+```text
+什么时候必须 Human Approval？
+```
+
+### 6. 存在不可逆或高代价副作用
+
+```text
+付款
+交易
+投票
+外部通信
+数据删除
+```
+
+### 7. 需要审计
+
+```text
+谁发起
+谁批准
+何时执行
+执行什么
+为什么允许
+```
+
+### 8. 需要重试 / 恢复 / 幂等
+
+如果执行具有明显 side effect，Command 会成为非常合适的生命周期锚点。
+
+---
+
+# 七、不应该把所有 Write 都叫 Command
+
+这里很容易过度设计。
+
+例如：
+
+```text
+PATCH /user/preferences
+```
+
+如果只是普通低风险设置变更，而且：
+
+* 没有审批；
+* 没有复杂业务规则；
+* 没有跨系统副作用；
+* 不需要专门追踪业务意图；
+
+那么完全可以使用普通 Application Service。
+
+因此：
+
+> **Command 不是“任何写操作的高级名字”，而是对重要业务动作进行显式建模。**
+
+Microsoft 的 CQRS 文档也提醒，CQRS 本身并不适合所有系统；简单领域和简单 CRUD 场景可以继续使用普通 CRUD。
+
+---
+
+# 八、Command 应该是“业务意图”，而不是数据库变化
+
+这是 Command 建模最关键的原则。
+
+错误：
+
+```json
+{
+  "operation": "UPDATE",
+  "table": "orders",
+  "where": {
+    "id": "123"
+  },
+  "set": {
+    "status": "SUBMITTED"
+  }
+}
+```
+
+这实际上不是业务 Command。
+
+它只是数据库 mutation。
+
+更好的：
+
+```json
+{
+  "commandType": "SubmitCustomerOrder",
+  "orderId": "123",
+  "requestedBy": "user-456",
+  "reason": "Customer requested execution"
+}
+```
+
+因为 `SubmitCustomerOrder` 表达了真正的 domain intent。
+
+Microsoft 的 CQRS 指南明确建议 Command 表示具体业务任务，例如 `Book hotel room`，而不是直接修改底层实体状态。
+
+---
+
+# 九、推荐的 Command 最小数据模型
+
+一个企业 Agent 系统不需要一开始就设计几十个字段。
+
+建议一个基础 Command 至少包含：
+
+```json
+{
+  "commandId": "cmd_01J...",
+  "commandType": "SubmitCustomerOrder",
+
+  "target": {
+    "type": "Order",
+    "id": "order_123"
+  },
+
+  "parameters": {
+    "quantity": 1000,
+    "side": "BUY",
+    "instrument": "XYZ"
+  },
+
+  "requestedBy": {
+    "userId": "user_456",
+    "agentId": "research-agent"
+  },
+
+  "reason": "Customer instruction",
+
+  "createdAt": "2026-09-20T09:30:00Z",
+  "expiresAt": "2026-09-20T09:35:00Z",
+
+  "expectedVersion": 17
+}
+```
+
+这里最重要的是：
+
+```text
+commandType
+target
+parameters
+requestedBy
+reason
+createdAt
+expiresAt
+expectedVersion
+```
+
+其余字段根据业务需要增加。
+
+---
+
+# 十、Command 与 Agent Session、Workflow、Tool 不应该混淆
+
+这几个对象应该明确区分。
+
+| 对象        | 回答的问题                |
+| --------- | -------------------- |
+| Session   | 这是谁和 Agent 的一次交互上下文？ |
+| Execution | 这一次任务执行是什么？          |
+| Tool      | Agent 可以调用什么能力？      |
+| Workflow  | 业务流程走到哪一步？           |
+| Command   | 要让业务发生什么具体变化？        |
+| Approval  | 谁是否批准这个具体动作？         |
+| Event     | 这个动作/状态变化已经发生了什么？    |
+
+例如：
+
+```text
+Session
+  ↓
+Execution
+  ↓
+Agent
+  ↓
+Command
+  ↓
+Approval
+  ↓
+Execution
+  ↓
+Business State
+  ↓
+Event
+```
+
+不要让：
+
+```text
+lastOutput
+```
+
+等同于：
+
+```text
+Command
+```
+
+也不要让：
+
+```text
+Tool Call
+```
+
+直接等同于：
+
+```text
+Business Decision
+```
+
+---
+
+# 十一、Command 不是 Approval
+
+这是金融系统里非常重要的区分。
+
+例如：
+
+```text
+Command:
+SubmitCustomerOrder
+```
+
+表示：
+
+> 有一个具体的业务动作请求。
+
+而：
+
+```text
+Approval:
+Approved by Alice
+```
+
+表示：
+
+> 某个具有批准权的人或规则，对这个具体动作作出了允许决定。
+
+因此：
+
+```text
+Command
+≠
+Approval
+```
+
+更合理的关系是：
+
+```text
+Command
+   │
+   ├── Policy Decision
+   │
+   └── Approval Requirement
+            │
+            ▼
+         Approval
+```
+
+AWS 明确建议高风险 Agent 操作通过审批机制拦截，而且审批记录应保存 reviewer identity、timestamp 和 decision。
+
+---
+
+# 十二、Approval 应该绑定“具体 Command”，而不是绑定 Agent
+
+假设：
+
+```text
+Agent = TradingAgent
+```
+
+然后：
+
+```text
+Approval:
+TradingAgent approved
+```
+
+这是没有意义的。
+
+正确的是：
+
+```text
+Approval
+  commandId = cmd-123
+  commandHash = ...
+  decision = APPROVED
+  reviewer = Alice
+  timestamp = ...
+```
+
+因为审批必须回答：
+
+> **批准的到底是哪一个动作？**
+
+如果：
+
+```text
+Command A
+quantity = 100
+
+```
+
+被批准以后，Agent 把参数改成：
+
+```text
+quantity = 1,000,000
+```
+
+如果 Approval 没有绑定具体 Command，那么审批就失去了意义。
+
+AWS Agentic AI Lens 也特别强调，对于持久信任或审批，应把 grant 限定到特定 command、参数形状或资源；对未来所有同类操作进行 wildcard approval 会实质上取消应有的人类监督。
+
+---
+
+# 十三、Command 应该尽量是不可变的
+
+Command 一旦进入：
+
+```text
+Policy
+Approval
+```
+
+就不应该再被偷偷修改。
+
+推荐：
+
+```text
+Draft Command
+      ↓
+Validated Command
+      ↓
+Authorized Command
+      ↓
+Approved Command
+      ↓
+Executing Command
+      ↓
+Executed Command
+```
+
+而不是：
+
+```text
+Command
+ ↓
+随时修改 parameters
+ ↓
+继续执行
+```
+
+因此，一个非常实用的字段是：
+
+```text
+commandHash
+```
+
+例如：
+
+```text
+commandHash =
+SHA256(
+    canonical(commandType)
+    +
+    canonical(target)
+    +
+    canonical(parameters)
+    +
+    canonical(requestedBy)
+)
+```
+
+需要注意：
+
+> `commandHash` 本身并不提供授权，也不能证明业务动作一定安全。
+
+它主要用于检测：
+
+```text
+审批时的 Command
+```
+
+和：
+
+```text
+执行时的 Command
+```
+
+是否相同。
+
+真正的安全性仍然来自：
+
+```text
+Authorization
+Policy
+State Validation
+Domain Rules
+```
+
+---
+
+# 十四、为什么 Command 需要 `expectedVersion` / `resourceVersion`？
+
+因为金融业务最大的一个问题是：
+
+> **批准和执行之间可能有时间差。**
+
+例如：
+
+```text
+09:00
+Agent 提交订单
+```
+
+当前：
+
+```text
+Position Version = 17
+```
+
+Human 在：
+
+```text
+09:05
+```
+
+批准。
+
+但到了：
+
+```text
+09:06
+```
+
+业务状态已经：
+
+```text
+Position Version = 18
+```
+
+如果系统仍然执行原来的 Command：
+
+```text
+Command
+expectedVersion = 17
+```
+
+就可能基于旧状态执行。
+
+因此：
+
+```text
+Command
+    +
+expectedVersion
+```
+
+可以用于执行前条件检查：
+
+```text
+currentVersion == expectedVersion ?
+```
+
+不是：
+
+```text
+YES → execute
+```
+
+就是：
+
+```text
+NO → reject / revalidate / reapprove
+```
+
+这也是 CQRS/DDD 写模型非常重要的一个作用：Command-side 承担 validation、business rules 和 consistency enforcement。
+
+---
+
+# 十五、Command 应该有 Expiration
+
+并不是所有 Command 都应该永久有效。
+
+例如：
+
+```text
+SubmitOrder
+expiresAt = 09:35
+```
+
+过期之后：
+
+```text
+DENY
+```
+
+这对于：
+
+* 市场价格快速变化；
+* 风险状态快速变化；
+* 权限可能变化；
+* 审批等待较久；
+
+尤其重要。
+
+对于金融交易，这个原则甚至比普通 SaaS 更重要，因为一个小时前有效的执行条件，不一定现在仍然有效。
+
+---
+
+# 十六、Command 的完整生命周期
+
+推荐设计成：
+
+```text
+                    ┌──────────────┐
+                    │ Agent / User │
+                    └──────┬───────┘
+                           │
+                      proposes
+                           ▼
+                 ┌─────────────────┐
+                 │ Command Draft   │
+                 └────────┬────────┘
+                          │
+                    Schema Validate
+                          │
+                          ▼
+                 ┌─────────────────┐
+                 │ Validated       │
+                 │ Command         │
+                 └────────┬────────┘
+                          │
+                    Authorization
+                          │
+                  ┌───────┴────────┐
+                  │                │
+                DENY             ALLOW
+                  │                │
+                  ▼                ▼
+               Rejected       Risk Policy
+                                  │
+                       ┌──────────┴─────────┐
+                       │                    │
+                    Auto-Allow          Human Approval
+                       │                    │
+                       │              ┌─────┴─────┐
+                       │              │           │
+                       │           Approved     Rejected
+                       │              │           │
+                       └──────────────┼───────────┘
+                                      ▼
+                             Re-validation
+                                      │
+                               Idempotency
+                                      │
+                                      ▼
+                              Command Executor
+                                      │
+                                      ▼
+                               Business System
+                                      │
+                                      ▼
+                               Post-condition
+                                      │
+                                      ▼
+                                  Result/Event
+```
+
+这里每一步都有不同职责。
+
+---
+
+# 十七、不要让 Agent 自己决定 Risk Tier
+
+例如：
+
+```text
+Agent:
+I think this is a low-risk action.
+```
+
+然后：
+
+```text
+riskLevel = LOW
+```
+
+再继续执行。
+
+这是错误的设计。
+
+AWS 当前 Agentic AI Lens 明确指出，风险分类不应交给与不可信输入处于同一路径的 LLM 自己决定，否则模型可能被操纵为把高风险请求标成低风险。
+
+更合理的是：
+
+```text
+Command
+   ↓
+Deterministic Risk Classifier
+   ↓
+Risk Tier
+```
+
+例如根据：
+
+```text
+commandType
+targetType
+amount
+resourceClassification
+externalSideEffect
+reversibility
+frequency
+```
+
+确定：
+
+```text
+R0
+R1
+R2
+R3
+R4
+```
+
+---
+
+# 十八、Risk Tier 应该决定 Command 的执行路径
+
+例如：
+
+| Tier | 示例                | 执行路径                              |
+| ---- | ----------------- | --------------------------------- |
+| R0   | 查询、低风险内部更新        | 自动                                |
+| R1   | 低影响业务修改           | Policy + 自动                       |
+| R2   | 重要业务修改            | Policy + 二次校验                     |
+| R3   | 高风险状态修改           | Command + Approval                |
+| R4   | 交易、付款、投票等重大/不可逆操作 | Command + Policy + Approval + 强校验 |
+
+这是一种建议性的内部工程模型，不是监管统一分类。
+
+AWS 当前建议根据 impact 和 reversibility 建立分层监督：低风险可自治，中风险通知，高风险或不可逆动作需要明确批准。
+
+---
+
+# 十九、Command 与 Tool 的职责边界应该这样设计
+
+错误：
+
+```text
+submitOrder()
+```
+
+既：
+
+```text
+判断权限
+决定风险
+创建订单
+提交订单
+发消息
+写审计
+```
+
+最后变成一个“超级 Tool”。
+
+更合理：
+
+```text
+Tool:
+order.prepare
+
+        ↓
+
+Command:
+SubmitCustomerOrder
+
+        ↓
+
+Policy:
+CanSubmitOrder?
+
+        ↓
+
+Approval:
+Approved?
+
+        ↓
+
+Executor:
+OrderService.submit()
+
+        ↓
+
+Business System
+```
+
+也就是说：
+
+> **Tool 暴露能力；Command 表达业务动作；Executor 执行业务动作。**
+
+---
+
+# 二十、Command Executor 应该是 Server-side 的
+
+这是 Agent 架构非常值得强调的一点。
+
+不推荐：
+
+```text
+LLM
+ ↓
+Command
+ ↓
+LLM-generated JavaScript
+ ↓
+business API
+```
+
+也不推荐：
+
+```text
+LLM
+ ↓
+SQL
+ ↓
+UPDATE
+```
+
+更合理：
+
+```text
+Agent
+ ↓
+CommandIntent
+ ↓
+Server-side CommandService
+ ↓
+Registered CommandExecutor
+ ↓
+Domain Service
+ ↓
+Business System
+```
+
+也就是说：
+
+> **模型只产生“想做什么”的数据，真正决定如何执行的是服务端代码。**
+
+这样才能保证：
+
+```text
+LLM
+≠
+Business Logic
+```
+
+---
+
+# 二十一、Command Registry 是很有价值的
+
+建议不要：
+
+```text
+if commandType == ...
+```
+
+散落在各个 Agent 里。
+
+可以建立：
+
+```text
+Command Registry
+```
+
+例如：
+
+```text
+SubmitCustomerOrder
+ApproveWithdrawal
+CastProxyVote
+ChangeClientStatus
+CancelPayment
+```
+
+每个 Command 定义：
+
+```text
+commandType
+schema
+riskTier
+authorizationPolicy
+approvalPolicy
+executor
+idempotencyPolicy
+resourceVersionPolicy
+auditPolicy
+```
+
+例如：
+
+```yaml
+command:
+  type: SubmitCustomerOrder
+  version: v2
+
+risk:
+  tier: R4
+
+authorization:
+  policy: order.submit
+
+approval:
+  required: true
+  policy: maker-checker
+
+execution:
+  executor: OrderCommandExecutor
+
+concurrency:
+  requireResourceVersion: true
+
+idempotency:
+  required: true
+
+audit:
+  level: regulatory
+```
+
+这会让 Command 成为一个真正可治理的业务能力。
+
+---
+
+# 二十二、Command Schema 不应该和 Tool Schema 完全相同
+
+这是一个很容易偷懒的地方。
+
+例如 Tool：
+
+```json
+{
+  "customerId": "123",
+  "amount": 1000
+}
+```
+
+然后直接当 Command：
+
+```json
+{
+  "customerId": "123",
+  "amount": 1000
+}
+```
+
+这样做丢失了大量业务信息。
+
+Command 应该体现：
+
+```text
+Business intent
+Initiator
+Reason
+Target
+Conditions
+Version
+Expiration
+Risk
+```
+
+例如：
+
+```json
+{
+  "commandType": "ApproveWithdrawal",
+
+  "target": {
+    "accountId": "ACC-123"
+  },
+
+  "parameters": {
+    "amount": 10000,
+    "currency": "USD"
+  },
+
+  "requestedBy": {
+    "userId": "U-001",
+    "agentId": "operations-agent"
+  },
+
+  "reason": "Client withdrawal instruction",
+
+  "expectedVersion": 47,
+
+  "expiresAt": "2026-09-20T10:30:00Z"
+}
+```
+
+Tool Call 只是：
+
+```text
+“请执行这个 Tool。”
+```
+
+Command 是：
+
+```text
+“业务系统被请求执行这个明确的业务动作。”
+```
+
+---
+
+# 二十三、Command 的字段应该尽量表达“事实”，不要塞进“模型解释”
+
+例如可以包含：
+
+```text
+reason
+```
+
+但不建议把一大段：
+
+```text
+chain of thought
+```
+
+作为 Command 的业务依据。
+
+更适合：
+
+```text
+reason =
+"Customer requested a rebalance"
+```
+
+而不是：
+
+```text
+reason =
+"After thinking through 17 steps, I concluded..."
+```
+
+Command 是 business record，不应该变成 LLM internal reasoning dump。
+
+---
+
+# 二十四、Approval 需要看到足够的 Context
+
+另一方面，也不能让审批者只看到：
+
+```text
+Approve Command?
+YES / NO
+```
+
+AWS 当前 Human Oversight guidance 特别指出，如果 reviewer 没有足够上下文，审批很容易沦为形式主义。审阅者至少需要了解 action、相关政策检查、数据来源以及潜在后果等关键信息。
+
+对于金融 Command，审批界面至少建议看到：
+
+```text
+Action
+Target
+Parameters
+Requester
+Reason
+Risk Tier
+Policy Result
+Relevant Limits
+Relevant Data
+Current State
+Expected State
+Expiration
+Warnings
+```
+
+例如：
+
+```text
+Submit Order
+
+Client:
+ABC Fund
+
+Instrument:
+XYZ
+
+Side:
+BUY
+
+Quantity:
+10,000
+
+Estimated Value:
+$1.2M
+
+Risk Tier:
+R4
+
+Limit Check:
+PASS
+
+Client Entitlement:
+PASS
+
+Policy:
+PASS
+
+Requested By:
+Investment Agent / Alice
+
+Expires:
+10:35 UTC
+
+Approval:
+[Approve] [Reject]
+```
+
+这才是“真正的审批”。
+
+---
+
+# 二十五、Command 的执行前 Re-validation 是不可缺少的
+
+很多系统会做：
+
+```text
+Create Command
+↓
+Approve
+↓
+Execute
+```
+
+但忘了：
+
+```text
+Approve
+↓
+state may have changed
+```
+
+因此推荐：
+
+```text
+Approve
+  ↓
+Revalidate:
+  identity
+  authorization
+  policy
+  resource version
+  business limits
+  expiration
+  command hash
+  data freshness
+  approval validity
+```
+
+然后才执行。
+
+这其实是金融业务很熟悉的思想：
+
+> **审批不是让未来永远自动有效，而是允许一个明确动作在满足条件时执行。**
+
+---
+
+# 二十六、Idempotency 是 Command 的必要配套
+
+为什么？
+
+因为 Agent Workflow 很容易出现：
+
+```text
+Tool timeout
+↓
+Agent retries
+↓
+Command executes again
+```
+
+如果没有幂等：
+
+```text
+$10,000
+↓
+$10,000 again
+```
+
+Stripe 的 API 文档把这一问题说得非常清楚：对于可能重试的 mutation，请求可以带 Idempotency Key，使重复请求不会再次创建对象或重复执行更新；Stripe 还会检查相同 idempotency key 对应请求的参数一致性。
+
+对于 Agent Command，可以使用：
+
+```text
+idempotencyKey =
+commandId
+```
+
+或者：
+
+```text
+hash(command + execution context)
+```
+
+但实际定义需要考虑业务语义。
+
+例如：
+
+```text
+SubmitOrder
+```
+
+通常：
+
+```text
+commandId = unique
+```
+
+即可作为一次业务动作的唯一身份。
+
+---
+
+# 二十七、但是 Idempotency 不等于 Exactly Once
+
+这一点一定要说清楚。
+
+假设：
+
+```text
+Command Executor
+   ↓
+External Trading System
+   ↓
+Order accepted
+```
+
+随后：
+
+```text
+Executor
+   ↓
+network timeout
+```
+
+系统不知道交易系统是否真的成功。
+
+重新执行：
+
+```text
+Command
+```
+
+即使带 Idempotency Key：
+
+```text
+下游系统如果支持同一业务幂等键
+→ 可以避免重复
+```
+
+但如果下游完全不支持：
+
+```text
+系统仍然无法凭空保证 exactly-once
+```
+
+所以真实世界经常需要：
+
+```text
+Command
++
+Idempotency
++
+External reconciliation
++
+Post-condition verification
+```
+
+而不是一句：
+
+> “我们用了幂等键，所以安全了。”
+
+---
+
+# 二十八、Command 执行结束后，还应该有 Post-condition Verification
+
+执行成功并不一定意味着业务状态正确。
+
+例如：
+
+```text
+POST /orders
+→ HTTP 200
+```
+
+不等于：
+
+```text
+Order is actually ACTIVE
+```
+
+所以：
+
+```text
+Command
+  ↓
+Execute
+  ↓
+Read authoritative state
+  ↓
+Verify expected post-condition
+```
+
+例如：
+
+```text
+Expected:
+order.status = SUBMITTED
+
+Actual:
+order.status = REJECTED
+```
+
+那么：
+
+```text
+Command execution result
+=
+FAILED / BUSINESS_REJECTED
+```
+
+而不是：
+
+```text
+HTTP 200
+```
+
+这种设计非常适合金融系统，因为真正重要的是：
+
+> **Business State 最终是什么。**
+
+---
+
+# 二十九、Command 应该与 Business Transaction 对齐，但不一定等于数据库 Transaction
+
+这是另一个常见误区。
+
+例如：
+
+```text
+Command = SubmitTrade
+```
+
+背后可能发生：
+
+```text
+DB update
++
+Risk service
++
+Order management
++
+Audit
++
+External broker API
+```
+
+Command 是：
+
+```text
+business transaction boundary
+```
+
+但不一定是：
+
+```text
+single SQL transaction
+```
+
+当跨系统时，可以使用：
+
+```text
+Command
+↓
+Workflow / Saga
+↓
+multiple actions
+```
+
+但需要注意：
+
+> Command 本身表达一次业务意图，不等于整个长流程的状态机。
+
+例如：
+
+```text
+SubmitTradeCommand
+```
+
+可能触发：
+
+```text
+validate
+→ reserve
+→ route
+→ confirm
+```
+
+这属于 execution workflow。
+
+Command 仍然只是：
+
+```text
+“我要提交这笔交易”
+```
+
+---
+
+# 三十、Command 与 Event 也不能混淆
+
+这两个概念方向正好相反。
+
+### Command
+
+```text
+“请做这件事。”
+```
+
+### Event
+
+```text
+“这件事情已经发生了。”
+```
+
+例如：
+
+```text
+Command:
+SubmitOrder
+```
+
+之后：
+
+```text
+Event:
+OrderSubmitted
+```
+
+所以：
+
+```text
+Command
+=
+Intent / Request
+
+Event
+=
+Fact / Occurrence
+```
+
+这一区分对于审计很重要。
+
+如果系统记录：
+
+```text
+OrderSubmitted
+```
+
+不能自动证明：
+
+```text
+谁请求？
+谁批准？
+当时为什么允许？
+```
+
+因此高风险业务通常需要同时保存：
+
+```text
+Command record
++
+Approval record
++
+Execution result
++
+Business event
+```
+
+---
+
+# 三十一、为什么 Command 对审计特别有价值？
+
+因为它可以成为一个天然的业务审计锚点。
+
+例如：
+
+```text
+Command ID:
+CMD-7821
+
+Requested By:
+Agent A / User Alice
+
+Action:
+SubmitCustomerOrder
+
+Target:
+Client ABC
+
+Parameters:
+...
+
+Policy:
+PASS
+
+Approval:
+Alice-2 APPROVED
+
+Executed By:
+OrderService
+
+Execution Time:
+10:31:12
+
+Result:
+ORDER_ACCEPTED
+```
+
+这样事后调查时，不需要从一堆：
+
+```text
+LLM token
+Prompt
+Tool trace
+HTTP log
+```
+
+里“推理出”业务到底发生了什么。
+
+可以直接从：
+
+```text
+Command
+```
+
+开始查询。
+
+但这里必须避免另一个过度推论：
+
+> **Command Record 本身并不自动等于监管 Audit Evidence。**
+
+具体监管记录保存要求取决于业务、法人实体、司法辖区和具体规则。
+
+更准确的说法是：
+
+> Command 很适合成为构成业务审计证据的一项结构化记录，但完整的 Regulatory Evidence 仍应单独设计。
+
+FINRA 2026 年的 GenAI 观察明确强调了 documentation、monitoring、model version tracking 和 accountability；这说明金融机构不仅需要模型日志，也需要能够解释系统如何被使用、监督和控制。
+
+---
+
+# 三十二、Command Hash 是很好的审计辅助，但不是安全机制本身
+
+一个常见设计：
+
+```text
+commandHash
+```
+
+可以用来证明：
+
+```text
+审批时的 Command
+=
+执行时的 Command
+```
+
+这是很有价值的。
+
+但是不要把它理解成：
+
+```text
+commandHash
+=
+authorization
+```
+
+也不能证明：
+
+```text
+command 本身合法
+```
+
+正确的关系应该是：
+
+```text
+Hash
+→ integrity check
+
+Policy
+→ authorization
+
+Business Rule
+→ semantic validation
+
+Approval
+→ human/business decision
+```
+
+四者职责不同。
+
+---
+
+# 三十三、Command 最好由确定性代码创建最终版本
+
+Agent 可以产生：
+
+```json
+{
+  "intent": "submit order",
+  "client": "ABC",
+  "instrument": "XYZ",
+  "quantity": 10000
+}
+```
+
+但是建议由服务器把它规范化成：
+
+```text
+Canonical Command
+```
+
+包括：
+
+```text
+normalized IDs
+validated parameters
+current actor
+server timestamp
+risk classification
+resource version
+expiry
+```
+
+也就是说：
+
+```text
+LLM
+   ↓
+CommandIntent
+   ↓
+Server validation / normalization
+   ↓
+Canonical Command
+```
+
+而不是：
+
+```text
+LLM
+   ↓
+完全可信的 Command object
+```
+
+这也符合 AWS 对 Agent output 必须进行外部验证、不能把模型输出当作可信输入的整体设计思想。
+
+---
+
+# 三十四、CommandIntent 和 Command 最好区分
+
+这是一个很实用的设计。
+
+### CommandIntent
+
+Agent 产生：
+
+```json
+{
+  "type": "SubmitOrder",
+  "client": "ABC",
+  "quantity": 10000
+}
+```
+
+它仍然是不可信输入。
+
+### Canonical Command
+
+服务器确认：
+
+```json
+{
+  "commandId": "cmd-123",
+  "commandType": "SubmitCustomerOrder",
+  "target": {
+    "orderId": "order-789"
+  },
+  "parameters": {
+    "instrument": "XYZ",
+    "quantity": 10000
+  },
+  "requestedBy": {
+    "userId": "alice",
+    "agentId": "trade-agent"
+  },
+  "expectedVersion": 42,
+  "expiresAt": "..."
+}
+```
+
+这才进入：
+
+```text
+Authorization
+Approval
+Execution
+```
+
+因此：
+
+> **LLM 输出应该叫 Intent；经过确定性验证后形成的，才叫真正的 Command。**
+
+这是一个非常值得在 Agent 平台标准化的边界。
+
+---
+
+# 三十五、一个完整的 Command Service 应该负责什么？
+
+建议：
+
+```text
+CommandService
+```
+
+至少负责：
+
+```text
+1. validate schema
+2. normalize input
+3. classify risk
+4. resolve authorization
+5. evaluate policy
+6. create canonical command
+7. create approval request if needed
+8. freeze command
+9. verify approval
+10. revalidate before execute
+11. enforce idempotency
+12. call executor
+13. verify result/post-condition
+14. write audit
+```
+
+而 Agent Runtime 不应该负责这些事情。
+
+Agent Runtime 更应该负责：
+
+```text
+reasoning
+planning
+tool interaction
+conversation
+```
+
+这样：
+
+```text
+Agent Runtime
+≠
+Business Control Plane
+```
+
+这与很多成熟企业 Agent 架构的方向是一致的：运行时负责 Agent execution，独立控制面负责 identity、authorization、approval 和治理。AWS AgentCore Gateway/Policy 以及当前 Agentic AI Lens 就是非常典型的实现参考。
+
+---
+
+# 三十六、推荐的 CommandService 接口
+
+例如：
+
+```typescript
+interface CommandService {
+  createIntent(input: CommandIntent): Promise<Command>;
+
+  classify(
+    command: Command
+  ): Promise<CommandRiskClassification>;
+
+  authorize(
+    command: Command,
+    context: AuthorizationContext
+  ): Promise<AuthorizationDecision>;
+
+  requestApproval(
+    command: Command
+  ): Promise<ApprovalRequest>;
+
+  approve(
+    commandId: string,
+    decision: ApprovalDecision
+  ): Promise<void>;
+
+  execute(
+    commandId: string
+  ): Promise<CommandExecutionResult>;
+}
+```
+
+关键在于：
+
+```text
+Agent
+```
+
+不应该直接得到：
+
+```typescript
+execute(command)
+```
+
+而是：
+
+```text
+Agent
+  ↓
+createIntent
+```
+
+剩下的事情由服务端控制。
+
+---
+
+# 三十七、Command Executor 应该是 Registry-based
+
+例如：
+
+```typescript
+interface CommandExecutor<T extends Command> {
+  execute(
+    command: T,
+    context: ExecutionContext
+  ): Promise<ExecutionResult>;
+}
+```
+
+然后：
+
+```text
+Command Registry
+--------------------------------
+SubmitCustomerOrder
+  → TradeOrderExecutor
+
+CastProxyVote
+  → ProxyVoteExecutor
+
+ApproveWithdrawal
+  → WithdrawalExecutor
+```
+
+这样：
+
+```text
+Agent
+```
+
+不需要知道：
+
+```text
+怎样调用 Trade API
+```
+
+它只需要表达：
+
+```text
+SubmitCustomerOrder
+```
+
+这可以显著降低 LLM 与下游 API 的耦合。
+
+---
+
+# 三十八、Command Executor 不应该重新相信 Command
+
+即使：
+
+```text
+CommandService
+```
+
+已经验证过：
+
+```text
+authorization
+policy
+approval
+```
+
+Executor 在自己的业务边界上仍然应该做必要的 domain checks。
+
+例如：
+
+```text
+TradeOrderExecutor
+  ↓
+check order state
+check account state
+check position
+check limit
+check version
+```
+
+因为最终：
+
+> **Business Service 才是维护业务不变量的地方。**
+
+CQRS 的写模型之所以重要，就是因为 command-side 可以承载 validation 和 domain logic，而查询侧无需承担这些写约束。
+
+---
+
+# 三十九、Command 最容易犯的一个错误：把“Reason”当成 Authorization
+
+例如：
+
+```json
+{
+  "commandType": "SubmitOrder",
+  "reason": "Customer requested"
+}
+```
+
+不代表：
+
+```text
+authorized = true
+```
+
+Reason 是：
+
+```text
+business context
+```
+
+不是：
+
+```text
+authorization evidence
+```
+
+正确：
+
+```text
+reason
++
+identity
++
+entitlement
++
+policy
++
+approval
+```
+
+共同决定是否执行。
+
+---
+
+# 四十、另一个错误：把“Approval”当成“Business Rule”
+
+例如：
+
+```text
+Manager Approved
+```
+
+不代表：
+
+```text
+Limit Check Passed
+```
+
+Approval 不是替代业务规则。
+
+应该：
+
+```text
+Business Rules
+    +
+Authorization
+    +
+Approval
+```
+
+都通过之后才能执行。
+
+尤其对于交易、付款、投票等金融操作：
+
+```text
+Approved
+```
+
+也不应该意味着：
+
+```text
+state unchanged
+```
+
+所以必须在执行前重新检查。
+
+---
+
+# 四十一、Command 的状态机建议保持很小
+
+不要把 Command 做成一个新的 Workflow Engine。
+
+一个实用状态机通常足够：
+
+```text
+DRAFT
+  ↓
+VALIDATED
+  ↓
+AUTHORIZED
+  ↓
+PENDING_APPROVAL
+  ↓
+APPROVED
+  ↓
+EXECUTING
+  ↓
+SUCCEEDED
+
+or
+
+REJECTED
+EXPIRED
+CANCELLED
+FAILED
+```
+
+不要轻易增加：
+
+```text
+PRE_APPROVED
+PARTIALLY_APPROVED
+DEFERRED
+RESUMING
+RETRY_WAITING
+```
+
+这些更适合在：
+
+```text
+Approval
+Execution
+Workflow
+```
+
+里建模，而不是无限扩张 Command 本身。
+
+---
+
+# 四十二、Command 不应该成为 Workflow State Machine
+
+这也是一个非常重要的边界。
+
+例如：
+
+```text
+Workflow:
+Trade Review
+   ↓
+Risk Check
+   ↓
+Manager Approval
+   ↓
+Submit
+   ↓
+Settlement
+```
+
+这是 Workflow。
+
+其中：
+
+```text
+SubmitCustomerOrder
+```
+
+是 Command。
+
+所以：
+
+```text
+Workflow
+=
+整个过程
+
+Command
+=
+过程中的一个明确业务动作
+```
+
+一个 Workflow 可以产生多个 Command。
+
+一个 Command 也可以由非 Agent 的传统 UI 发起。
+
+这种解耦非常重要。
+
+---
+
+# 四十三、Command 不应该只服务 Agent
+
+成熟设计里，Command 最好同时支持：
+
+```text
+Human UI
+Agent
+Batch
+External Integration
+Workflow
+```
+
+例如：
+
+```text
+React UI
+  ↓
+SubmitCustomerOrder Command
+
+Agent
+  ↓
+SubmitCustomerOrder Command
+
+Batch Job
+  ↓
+SubmitCustomerOrder Command
+```
+
+所有入口最后进入：
+
+```text
+同一个 Command Service
+```
+
+这样业务规则不会因为：
+
+```text
+“这是 AI 调用”
+```
+
+而出现另一套实现。
+
+这也是金融架构非常值得采用的方式：
+
+> **AI 是新的调用者，不应该成为新的业务规则实现者。**
+
+---
+
+# 四十四、这会形成一个非常好的“AI as Another Caller”架构
+
+```text
+                 ┌────────────┐
+                 │ Human UI   │
+                 └──────┬─────┘
+                        │
+                 ┌──────▼─────┐
+                 │ API Client │
+                 └──────┬─────┘
+                        │
+             ┌──────────▼──────────┐
+             │   Command Service   │
+             └──────────┬──────────┘
+                        │
+        ┌───────────────┼────────────────┐
+        │               │                │
+        ▼               ▼                ▼
+ Authorization       Policy         Approval
+        │               │                │
+        └───────────────┼────────────────┘
+                        ▼
+                  Domain Service
+                        │
+                        ▼
+                  Business System
+```
+
+Agent 只是变成：
+
+```text
+┌─────────────┐
+│    Agent    │
+└──────┬──────┘
+       │
+       ▼
+Command Service
+```
+
+而不是：
+
+```text
+Agent
+ ↓
+一套新的业务逻辑
+```
+
+这是我认为 Command 对企业 Agent 最重要的架构价值之一。
+
+---
+
+# 四十五、金融领域为什么尤其应该做这层隔离？
+
+因为金融系统已经有成熟的控制模式：
+
+```text
+Maker
+Checker
+Approval
+Pre-trade Control
+Limit
+Entitlement
+Supervision
+Reconciliation
+Audit
+```
+
+Agent 不应该推翻这些控制，而应该成为这些控制体系中的一个新的“提案者/调用者”。
+
+例如：
+
+```text
+传统：
+
+Trader
+ ↓
+Order Entry
+ ↓
+Risk Check
+ ↓
+Approval
+ ↓
+Execution
+```
+
+Agent 化之后：
+
+```text
+Agent
+ ↓
+Order Proposal
+ ↓
+Command
+ ↓
+Risk Check
+ ↓
+Approval
+ ↓
+Execution
+```
+
+最大的变化是：
+
+```text
+Trader
+```
+
+可能被部分替换为：
+
+```text
+Agent
+```
+
+但：
+
+```text
+Risk Check
+Approval
+Execution
+Audit
+```
+
+不应该因为 Agent 出现而消失。
+
+SEC 对市场准入控制的要求就是一个很直观的例子：订单进入市场前仍需要适当的风险控制和监督，而不是因为订单由自动化系统生成就跳过这些控制。
+
+---
+
+# 四十六、Command 设计还解决了 Agent Behavior Drift 的问题
+
+之前讨论过：
+
+> Model、Prompt、Skill、Tool 改了，代码没变，Agent 行为也可能发生变化。
+
+如果：
+
+```text
+Agent
+ ↓
+Tool
+ ↓
+Direct Mutation
+```
+
+那么：
+
+```text
+Behavior Drift
+```
+
+可能直接变成：
+
+```text
+Business State Drift
+```
+
+而 Command 架构提供了一个缓冲层：
+
+```text
+Agent Behavior Drift
+        ↓
+New Command Proposal
+        ↓
+Policy
+        ↓
+Validation
+        ↓
+Approval
+        ↓
+Execution
+```
+
+因此：
+
+> **Command 不会消灭 Agent Drift，但可以阻止行为漂移自动等价于业务状态漂移。**
+
+这也是 AWS 当前强调“bounded autonomy”与外部 authorization / human oversight 的原因。
+
+---
+
+# 四十七、Command 是“业务控制边界”，不是“模型控制边界”
+
+这一点非常重要。
+
+不要设计：
+
+```text
+Command = LLM output object
+```
+
+应该：
+
+```text
+LLM output
+   ↓
+untrusted intent
+   ↓
+validation
+   ↓
+canonical command
+```
+
+所以：
+
+```text
+LLM
+=
+untrusted proposal
+```
+
+而：
+
+```text
+Command
+=
+trusted-but-not-yet-authorized business request
+```
+
+最后：
+
+```text
+Authorized Command
+=
+approved business request eligible for execution
+```
+
+这三个层次应该区分开。
+
+---
+
+# 四十八、推荐的 Command 数据模型
+
+一个比较平衡的生产模型可以是：
+
+```typescript
+type Command<TParameters> = {
+  commandId: string;
+
+  commandType: string;
+  commandVersion: string;
+
+  target: {
+    type: string;
+    id: string;
+  };
+
+  parameters: TParameters;
+
+  requestedBy: {
+    userId?: string;
+    agentId?: string;
+    source: "user" | "agent" | "system";
+  };
+
+  reason?: string;
+
+  riskTier: "R0" | "R1" | "R2" | "R3" | "R4";
+
+  createdAt: string;
+  expiresAt?: string;
+
+  expectedVersion?: string;
+
+  commandHash: string;
+};
+```
+
+但需要强调：
+
+```text
+riskTier
+```
+
+最好由服务端根据：
+
+```text
+commandType
+target
+parameters
+context
+```
+
+确定，而不是由 Agent 自己填写后直接信任。
+
+---
+
+# 四十九、Approval 数据也应独立
+
+例如：
+
+```typescript
+type Approval = {
+  approvalId: string;
+
+  commandId: string;
+  commandHash: string;
+
+  decision: "APPROVED" | "REJECTED";
+
+  approver: {
+    userId: string;
+    role: string;
+  };
+
+  reason?: string;
+
+  createdAt: string;
+  expiresAt?: string;
+};
+```
+
+这样可以非常清楚：
+
+```text
+Command
+=
+需要做什么
+
+Approval
+=
+谁允许了这件事
+```
+
+而不是把：
+
+```text
+approvedBy
+```
+
+简单塞进 Command 本身。
+
+---
+
+# 五十、Execution Record 也应该独立
+
+例如：
+
+```typescript
+type CommandExecution = {
+  executionId: string;
+
+  commandId: string;
+
+  executor: string;
+
+  startedAt: string;
+  completedAt?: string;
+
+  status:
+    | "RUNNING"
+    | "SUCCEEDED"
+    | "FAILED"
+    | "REJECTED";
+
+  idempotencyKey: string;
+
+  result?: unknown;
+
+  errorCode?: string;
+};
+```
+
+最终关系：
+
+```text
+Command
+   │
+   ├── Approval*
+   │
+   └── Execution*
+```
+
+这样：
+
+```text
+一个 Command
+```
+
+可以有：
+
+```text
+一次或多次 execution attempt
+```
+
+但必须通过：
+
+```text
+idempotency
+```
+
+保证业务不会被重复执行。
+
+---
+
+# 五十一、Command、Approval、Execution、Event 最好形成一个完整证据链
+
+例如：
+
+```text
+cmd-1001
+   │
+   ├── approval-2001
+   │      └── APPROVED
+   │
+   ├── execution-3001
+   │      └── FAILED / TIMEOUT
+   │
+   ├── execution-3002
+   │      └── SUCCEEDED
+   │
+   └── event-4001
+          └── OrderSubmitted
+```
+
+这比：
+
+```text
+Agent Trace
+```
+
+更接近业务审计。
+
+---
+
+# 五十二、如果 Command 执行跨系统怎么办？
+
+例如：
+
+```text
+SubmitTradeCommand
+```
+
+实际需要：
+
+```text
+Order System
+Risk System
+Broker API
+Settlement System
+Audit System
+```
+
+不要把 Command Executor 变成一个“大事务脚本”。
+
+可以：
+
+```text
+Command
+ ↓
+Workflow / Saga
+ ↓
+Step 1
+Step 2
+Step 3
+```
+
+但仍然保留：
+
+```text
+Command
+```
+
+作为业务意图起点。
+
+例如：
+
+```text
+SubmitTradeCommand
+       ↓
+Validate
+       ↓
+Reserve
+       ↓
+Route
+       ↓
+Confirm
+       ↓
+Settlement
+```
+
+这里 Command 不负责描述所有步骤。
+
+它只描述：
+
+> “我要提交这笔交易。”
+
+而：
+
+```text
+Workflow
+```
+
+负责：
+
+> “为了完成这个动作，需要经过哪些步骤。”
+
+这样边界非常清晰。
+
+---
+
+# 五十三、Command 也不等于 Event Sourcing
+
+很多团队看到：
+
+```text
+Command
+```
+
+就开始想到：
+
+```text
+Event Sourcing
+CQRS
+Kafka
+Saga
+Temporal
+```
+
+这些并不是 Command 的必需条件。
+
+最简单的实现完全可以是：
+
+```text
+POST /commands
+
+→ CommandService
+→ Domain Service
+→ PostgreSQL
+```
+
+甚至：
+
+```text
+Command Table
+Approval Table
+Execution Table
+```
+
+就足够。
+
+Microsoft 的 CQRS 指南也指出，CQRS 可以只有一个底层数据存储；是否进一步采用事件溯源、不同数据库或异步消息是独立的设计选择。
+
+因此：
+
+> **引入 Command ≠ 必须引入 CQRS 全家桶。**
+
+---
+
+# 五十四、最小可用 Command 架构
+
+对于一个已经有 Agent Runtime 的企业平台，我建议最小实现只有五个部分：
+
+```text
+1. CommandIntent
+2. CommandRegistry
+3. CommandService
+4. ApprovalService
+5. CommandExecutor
+```
+
+外加：
+
+```text
+Audit
+Idempotency
+ResourceVersion
+```
+
+执行路径：
+
+```text
+Agent
+ ↓
+CommandIntent
+ ↓
+CommandService
+ ├─ schema validation
+ ├─ normalization
+ ├─ risk classification
+ ├─ authorization
+ ├─ policy
+ ├─ approval
+ ├─ command freeze
+ ├─ revalidation
+ ├─ idempotency
+ └─ executor
+        ↓
+   Business Service
+```
+
+这已经足够解决 80% 的核心问题。
+
+---
+
+# 五十五、什么时候不应该做 Command？
+
+为了避免过度设计，可以明确几个反例。
+
+### 1. 纯查询
+
+```text
+GetPortfolio()
+```
+
+Query 即可。
+
+### 2. 无副作用的计算
+
+```text
+CalculateRisk()
+```
+
+如果只是返回计算结果，不改变状态，也未必需要 Command。
+
+### 3. Agent 内部临时状态
+
+```text
+updateScratchpad()
+```
+
+不应该进入业务 Command。
+
+### 4. 纯 UI 状态
+
+```text
+setPanelExpanded()
+```
+
+当然不需要。
+
+### 5. 普通低风险 CRUD
+
+如果没有复杂业务规则、审批、审计或重要副作用，普通 Application Service 可能更简单。
+
+所以：
+
+> **Command 应该服务于重要业务意图，而不是作为所有代码的统一包装层。**
+
+---
+
+# 五十六、什么时候 Command 特别值得做？
+
+可以用一个非常实用的判断表：
+
+| 特征                | 是否建议 Command |
+| ----------------- | ------------ |
+| 纯 Read            | 否            |
+| 无副作用计算            | 通常否          |
+| 普通低风险 CRUD        | 可选           |
+| 重要业务状态变化          | 是            |
+| 财务交易              | 强烈建议         |
+| 付款/转账             | 强烈建议         |
+| Proxy Vote Submit | 强烈建议         |
+| 权限变更              | 强烈建议         |
+| 对外正式通信            | 通常建议         |
+| 不可逆删除             | 强烈建议         |
+| 需要审批              | 几乎总是         |
+| 需要强审计             | 强烈建议         |
+| 需要幂等/重试/恢复        | 强烈建议         |
+
+---
+
+# 五十七、真正成熟的 Command 设计应该满足七个条件
+
+可以将最终标准浓缩成：
+
+### 1. Explicit
+
+业务动作是明确的。
+
+```text
+SubmitOrder
+```
+
+而不是：
+
+```text
+update()
+```
+
+### 2. Typed
+
+有明确 schema。
+
+### 3. Immutable after approval
+
+审批后不能偷偷修改。
+
+### 4. Authorized
+
+有独立 authorization。
+
+### 5. Validatable
+
+可以在执行前进行确定性检查。
+
+### 6. Idempotent
+
+重复 execution 不会产生重复业务副作用。
+
+### 7. Auditable
+
+能够知道：
+
+```text
+who
+what
+why
+when
+approved by whom
+executed by whom
+result
+```
+
+---
+
+# 五十八、一个完整的金融 Agent Command 示例
+
+以交易为例。
+
+Agent 生成：
+
+```json
+{
+  "intent": "submit_order",
+  "client": "ABC Fund",
+  "instrument": "XYZ",
+  "side": "BUY",
+  "quantity": 10000
+}
+```
+
+系统转换：
+
+```json
+{
+  "commandId": "cmd_789",
+
+  "commandType": "SubmitCustomerOrder",
+  "commandVersion": "v3",
+
+  "target": {
+    "type": "TradingAccount",
+    "id": "ACC-123"
+  },
+
+  "parameters": {
+    "instrument": "XYZ",
+    "side": "BUY",
+    "quantity": 10000
+  },
+
+  "requestedBy": {
+    "userId": "alice",
+    "agentId": "investment-agent",
+    "source": "agent"
+  },
+
+  "reason": "Customer instruction",
+
+  "riskTier": "R4",
+
+  "expectedVersion": "order-state-41",
+
+  "expiresAt": "2026-09-20T10:35:00Z",
+
+  "commandHash": "sha256:..."
+}
+```
+
+然后：
+
+```text
+1. Identity Check
+   ↓
+2. Client Entitlement
+   ↓
+3. Instrument Permission
+   ↓
+4. Limit Check
+   ↓
+5. Market Rule Check
+   ↓
+6. Risk Tier = R4
+   ↓
+7. Human Approval
+   ↓
+8. Revalidate order-state-41
+   ↓
+9. Revalidate commandHash
+   ↓
+10. Idempotency Check
+   ↓
+11. Execute
+   ↓
+12. Verify post-condition
+```
+
+这时候 Agent 的作用非常清晰：
+
+> **Agent 提出了一个候选业务动作，但整个企业系统仍然拥有最终的决定权。**
+
+---
+
+# 五十九、这个架构与“Agent can reason, but cannot independently break authorization”完全一致
+
+可以把整个原则浓缩成：
+
+```text
+Agent
+  = Reason
+
+Command
+  = Intent
+
+Policy
+  = Authorization
+
+Approval
+  = Human / Business Decision
+
+Executor
+  = Action
+
+Business System
+  = Truth
+```
+
+因此：
+
+```text
+LLM
+≠
+Authorization
+
+LLM
+≠
+Business Rule
+
+LLM
+≠
+Business State
+
+Tool
+≠
+Approval
+
+Approval
+≠
+Execution
+```
+
+这些边界一旦明确，Agent 系统就会稳定很多。
+
+---
+
+# 六十、最终结论
+
+高风险业务操作之所以值得建模为 Command，不是因为“Command 是一种高级 API 写法”，也不是因为某个框架规定 Agent 必须使用 Command。
+
+真正原因是：
+
+> **Agent 的 reasoning 是概率性的，而高风险业务状态变化必须是确定的、受约束的、可审计的。**
+
+如果直接：
+
+```text
+LLM
+ ↓
+Tool
+ ↓
+Business Mutation
+```
+
+那么：
+
+```text
+模型输出
+```
+
+与：
+
+```text
+业务状态变化
+```
+
+之间几乎没有足够强的结构化边界。
+
+而 Command 架构变成：
+
+```text
+LLM
+ ↓
+CommandIntent
+ ↓
+Canonical Command
+ ↓
+Authorization
+ ↓
+Policy
+ ↓
+Approval
+ ↓
+Re-validation
+ ↓
+Idempotency
+ ↓
+Executor
+ ↓
+Business State
+```
+
+这让系统能够把几个本来混在一起的问题拆开：
+
+```text
+“想做什么？”
+→ Command
+
+“能不能做？”
+→ Authorization / Policy
+
+“是否需要人批准？”
+→ Approval
+
+“现在状态还允许吗？”
+→ Re-validation
+
+“执行一次还是重复执行？”
+→ Idempotency
+
+“最终发生了什么？”
+→ Business State / Event
+
+“事后怎么证明？”
+→ Audit Evidence
+```
+
+这正是金融系统特别需要的结构。
+
+尤其需要强调：
+
+> **Command 本身不是安全机制。**
+
+它不能替代 IAM、Data Entitlement、Policy、Risk Engine、Approval 或 Domain Rules。
+
+Command 的价值在于：
+
+> **它给这些控制提供了一个明确、稳定、可审计的业务对象。**
+
+这也是为什么 Command 非常适合成为 Agent 与传统 Enterprise Business System 之间的桥梁。
+
+---
+
+# 最终推荐的架构原则
+
+可以压缩成八句话：
+
+```text
+1. Agent 可以 propose，但不直接决定 Business State。
+2. Tool 表达 capability，Command 表达 business intent。
+3. Command 不等于 Authorization。
+4. Approval 必须绑定具体 Command。
+5. Approval 后执行前必须重新验证关键条件。
+6. Side-effecting Command 必须具备幂等和明确的失败语义。
+7. Business State 永远由 Business System 持有。
+8. Command / Approval / Execution / Business Event 应形成完整证据链。
+```
+
+再进一步：
+
+```text
+                 Reasoning Space
+                      很大
+                       │
+                       ▼
+                  Command
+                Boundary
+                      │
+                       ▼
+                 Authority Space
+                      很小
+                       │
+                       ▼
+                Business Side Effect
+                      最小
+```
+
+这应该成为金融服务 Agent 平台设计高风险操作时的一条基础原则：
+
+> **允许 Agent 自主思考，但不要允许 Agent 自主把思考直接变成业务事实。**
+
+---
+
+# 参考资料
+
+### 1. AWS — Secure Agent Tool Usage / Agentic AI Lens
+
+AWS 当前 Agentic AI Lens 将 Tool Authorization、最小权限、身份传播、高风险 mutation、Human-in-the-loop 和 Tool Registry 作为核心 Agent 安全控制。
+
+[AWS Agentic AI Lens — Secure agent tool usage](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentsec02.html?utm_source=chatgpt.com)
+
+### 2. AWS — Tiered Human Oversight and Approval
+
+按动作风险和可逆性分类 Autonomous / Notify / Approve，并要求高风险操作经过明确审批。
+
+[AWS Agentic AI Lens — Tiered human oversight and approval workflows](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentrel02-bp05.html?utm_source=chatgpt.com)
+
+### 3. AWS — Human-in-the-loop for Critical Decisions
+
+强调高风险操作执行前的人工监督、审批上下文、审计记录，以及将持久授权限制到具体 command、parameter shape 或 resource。
+
+[AWS Agentic AI Lens — Human-in-the-loop for critical decisions](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentsec04-bp02.html?utm_source=chatgpt.com)
+
+### 4. AWS — Security Design Principles
+
+明确提出 Agent 本身不是信任边界；应给予每个 Agent 独立身份和最小权限，并在 intent 与 action 之间设置分层 guardrails。
+
+[AWS Agentic AI Lens — Security design principles](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/security-design-principles.html?utm_source=chatgpt.com)
+
+### 5. Microsoft — CQRS Pattern
+
+Microsoft 的 CQRS 指南明确区分 Query 和 Command，并强调 Command 应代表具体业务任务，而不是低层数据更新；Command-side 负责 validation 和 business logic。
+
+[Microsoft Azure Architecture Center — CQRS Pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs?utm_source=chatgpt.com)
+
+### 6. Martin Fowler — Command Query Separation
+
+经典 Command Query Separation 定义：Query 返回结果且不修改系统可观察状态；Command 修改系统状态。
+
+[Martin Fowler — Command Query Separation](https://martinfowler.com/bliki/CommandQuerySeparation.html?utm_source=chatgpt.com)
+
+### 7. Microsoft — CQRS and Domain Model / Command Stack
+
+Microsoft 关于 DDD + CQRS 的资料进一步说明 command stack 负责修改状态、业务逻辑和一致性，是复杂业务模型的重要写入边界。
+
+[Microsoft — Cutting Edge: Rewrite a CRUD System with Events and CQRS](https://learn.microsoft.com/en-us/archive/msdn-magazine/2016/december/cutting-edge-rewrite-a-crud-system-with-events-and-cqrs?utm_source=chatgpt.com)
+
+### 8. Stripe — Idempotent Requests
+
+Stripe 的公开 API 文档说明 idempotency key 如何保护带副作用的请求免受重复 retry，并检查相同 key 对应参数的一致性。
+
+[Stripe API — Idempotent requests](https://docs.stripe.com/api/idempotent_requests?utm_source=chatgpt.com)
+
+### 9. SEC — Rule 15c3-5 Market Access Risk Controls
+
+SEC 要求具有市场准入的 broker-dealer 建立、记录、维护风险控制和监督程序，包括 pre-order risk controls、authorized-person restrictions、定期审查控制有效性等。这里是金融高风险自动化控制的具体监管案例，并非要求使用 Command Pattern。
+
+[SEC — Risk Management Controls for Brokers or Dealers With Market Access](https://www.sec.gov/rules-regulations/2011/06/risk-management-controls-brokers-dealers-market-access?utm_source=chatgpt.com)
+
+### 10. FINRA — Customer Order Handling / Best Execution
+
+FINRA 2026 年报告强调订单流监督、持续监控、定期严格评审以及对执行质量的证据化分析。
+
+[FINRA — Customer Order Handling: Best Execution and Order Routing Disclosures](https://www.finra.org/rules-guidance/guidance/reports/2026-finra-annual-regulatory-oversight-report/best-execution?utm_source=chatgpt.com)
+
+### 11. FINRA — GenAI: Continuing and Emerging Trends
+
+FINRA 2026 年针对 GenAI 的监管观察强调正式的 review/approval、治理与监控框架，以及对模型版本、Prompt、Output、可靠性和准确性的持续测试与监控。
+
+[FINRA — GenAI: Continuing and Emerging Trends](https://www.finra.org/rules-guidance/guidance/reports/2026-finra-annual-regulatory-oversight-report/gen-ai?utm_source=chatgpt.com)
+
+### 12. FSB — Financial Stability Implications of AI
+
+FSB 从金融稳定角度指出 AI 带来的 third-party dependency、provider concentration、cyber risk、model risk、data quality 和 governance 风险。
+
+[FSB — The Financial Stability Implications of Artificial Intelligence](https://www.fsb.org/2024/11/the-financial-stability-implications-of-artificial-intelligence/?utm_source=chatgpt.com)
+
+### 13. MCP Architecture
+
+MCP 官方架构将 Host 定位为负责连接权限、用户授权和安全边界的一侧，而 Server 负责提供聚焦能力；这支持“Tool/Protocol 与真正 Authorization Boundary 分离”的设计。
+
+[Model Context Protocol — Architecture](https://modelcontextprotocol.io/specification/2025-03-26/architecture?utm_source=chatgpt.com)
+
+### 14. AWS — AgentCore Policy / Tool Authorization
+
+AWS AgentCore 当前提供外部 Policy、Tool Authorization、细粒度工具访问和 Human-in-the-loop 能力，可作为 Command 前置控制层的实现参考。
+
+[AWS AgentCore Policy Permissions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/policy-permissions.html?utm_source=chatgpt.com)
+
+### 15. AWS — Appendix A: Agentic AI Lens Best Practice Reference
+
+包含 Agent Security、Human Oversight、Reliability、Memory/State、AgentOps 等完整 best practice 列表，适合作为进一步 Architecture Review 的扩展参考。
+
+[AWS Agentic AI Lens — Appendix A](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/appendix-a.html?utm_source=chatgpt.com)
