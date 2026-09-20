@@ -2768,3 +2768,344 @@ Agent Platform
     [FINOS — Fluxnova BPM Platform](https://github.com/finos/fluxnova-bpm-platform?utm_source=chatgpt.com)
 
 > 注：金融机构案例中的效率、成本和处理时长等数字主要来自 AWS、Google Cloud、Camunda 或合作机构公开案例。它们适合证明“该方案已经被实际采用”和理解实现方式，不应直接视为独立第三方评估或普遍适用的收益预测。
+
+
+
+-------------------------
+
+
+
+下面这些比一般博客更适合作为你这篇文章的参考资料。我按可信度和用途分组，**前 15 个最值得直接加入正文参考资料**。
+
+## 一、最值得加入正文：Workflow / Agent 边界
+
+1. **Anthropic — Building Effective Agents**
+   非常重要。直接明确区分：
+   `Workflows = predefined code paths`
+   `Agents = model dynamically directs process/tool usage`。
+   也是你“Workflow 和 Agent 不是对立关系”最好的行业来源之一。
+   [Building Effective Agents — Anthropic](https://www.anthropic.com/engineering/building-effective-agents?utm_source=chatgpt.com) ([Anthropic][1])
+
+2. **Google Cloud — Choose a design pattern for your agentic AI system**
+   目前非常完整的官方架构指南，覆盖 deterministic workflow、dynamic orchestration、custom logic、human-in-the-loop、ReAct、多 Agent 等。
+   [Google Cloud Agentic AI Design Patterns](https://docs.cloud.google.com/architecture/choose-design-pattern-agentic-ai-system?utm_source=chatgpt.com) ([Google Cloud Documentation][2])
+
+3. **Microsoft — Agent Framework Workflows**
+   特别适合证明“Agent 和 Workflow 可以组合”，官方直接支持：
+   `Agents in workflows`
+   `Workflows as agents`
+   `Human-in-the-loop`
+   `Checkpoints and resuming`。
+   [Microsoft Agent Framework — Workflow capabilities](https://learn.microsoft.com/en-us/agent-framework/workflows/?utm_source=chatgpt.com) ([Microsoft Learn][3])
+
+4. **Microsoft — Workflows journey**
+   这篇非常适合支撑“应该优先使用满足要求的最简单模式”，并明确把 Agent、Skill、Agents-as-Tools、Workflow 分成逐步增加复杂度的能力。
+   [Microsoft Agent Framework — Workflows](https://learn.microsoft.com/en-us/agent-framework/journey/workflows?utm_source=chatgpt.com) ([Microsoft Learn][4])
+
+5. **Google Cloud — Agentic AI architecture components**
+   适合补充 agent pattern 的成本、复杂度、latency、performance、单 Agent / 多 Agent 选择。
+   [Google Cloud — Choose your agentic AI architecture components](https://docs.cloud.google.com/architecture/choose-agentic-ai-architecture-components?utm_source=chatgpt.com) ([Google Cloud Documentation][5])
+
+6. **Google Cloud — What are agentic workflows?**
+   更偏工程实践，讲 planning、tool use、dynamic context 等 agentic workflow pattern。
+   [Google Cloud — What are agentic workflows?](https://cloud.google.com/discover/agentic-workflows?utm_source=chatgpt.com) ([Google Cloud][6])
+
+---
+
+## 二、非常适合支撑“Workflow 不等于 BPMN / Workflow Engine”
+
+7. **OMG — BPMN 官方规范**
+   这是最权威的 BPMN 定义来源。特别重要的一句话是 BPMN 既要让业务用户理解，也要足够精确地表达技术实现；并且 BPMN 本身是 implementation-independent notation。
+   [OMG — BPMN](https://www.omg.org/bpmn/?utm_source=chatgpt.com) ([OMG][7])
+
+8. **OMG — BPMN 2.0.2 Specification**
+   正式规范入口。
+   [BPMN 2.0.2 Specification](https://www.omg.org/spec/BPMN/2.0.2/?utm_source=chatgpt.com) ([OMG][8])
+
+9. **Microsoft — Durable Orchestrations**
+   对你的“软件工程师直接用 Python/代码实现 Workflow”非常重要。官方明确说 durable orchestration 可以**完全通过 procedural code 定义**，不需要 declarative schema 或 designer，同时支持 days/months-long workflow、checkpoint、retry、timer 等。
+   [Microsoft Durable Orchestrations](https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-orchestrations?tabs=python&utm_source=chatgpt.com) ([Microsoft Learn][9])
+
+10. **AWS — Step Functions with Python / Workflow Studio / States Language**
+    非常好地证明 Workflow 有多种 authoring方式，而不仅是 BPMN：Python、可视化设计器、Amazon States Language。
+    [AWS Step Functions — Python, Workflow Studio, States Language](https://aws.amazon.com/blogs/machine-learning/define-and-run-machine-learning-pipelines-on-step-functions-using-python-workflow-studio-or-states-language/?utm_source=chatgpt.com) ([Amazon Web Services, Inc.][10])
+
+11. **AWS — Step Functions human approval**
+    很适合你文章中的“Workflow 管等待、Human Task、Approval”。可以暂停数小时或更久等待人工审批。
+    [AWS Step Functions — Human Approval](https://docs.aws.amazon.com/step-functions/latest/dg/tutorial-human-approval.html?utm_source=chatgpt.com) ([AWS Documentation][11])
+
+---
+
+## 三、Agent durable execution / HITL
+
+12. **OpenAI Agents SDK — RunState**
+    证明 Agent 本身也可以 durable pause/resume，所以不能拿“是否 durable”作为 Workflow/Agent 的分界。
+    [OpenAI Agents SDK — RunState](https://openai.github.io/openai-agents-python/ref/run_state/?utm_source=chatgpt.com) ([OpenAI GitHub][12])
+
+13. **OpenAI Agents SDK — Human-in-the-loop**
+    包括 approval、interruptions、serialization、resume，以及长期等待期间如何保存状态。
+    [OpenAI Agents SDK — Human-in-the-loop](https://openai.github.io/openai-agents-python/human_in_the_loop/?utm_source=chatgpt.com) ([OpenAI GitHub][13])
+
+14. **OpenAI Agents SDK — Durable execution integrations**
+    官方直接列出 Dapr、Temporal、Restate 等 durable orchestration integration。
+    [OpenAI Agents SDK — Running Agents](https://openai.github.io/openai-agents-python/running_agents/?utm_source=chatgpt.com) ([OpenAI GitHub][14])
+
+15. **AWS Agentic AI Lens — Human-in-the-loop for critical decisions**
+    这份特别适合金融场景。AWS 明确要求高风险操作把 approval 绑定到具体 command、parameter/resource，而且 approval 要可审计、可撤销。
+    [AWS Agentic AI Lens — Human-in-the-loop for critical decisions](https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentsec04-bp02.html?utm_source=chatgpt.com) ([AWS Documentation][15])
+
+---
+
+# 四、非常重要：Workflow + Agent 正在成为主流组合
+
+16. **AWS — Step Functions + Bedrock AgentCore**
+    2026 年新增的官方集成：Workflow 中直接放 Agent reasoning step，可以在 Agent 前后加入 deterministic validation 和 human approval。这个来源非常贴合你文章的核心论点。
+    [AWS Step Functions adds AgentCore-powered agentic reasoning](https://aws.amazon.com/about-aws/whats-new/2026/06/aws-step-functions-agentcore/?utm_source=chatgpt.com) ([Amazon Web Services, Inc.][16])
+
+17. **AWS — Validating multi-agent decisions with Step Functions and AgentCore**
+    更直接：Agent 先 propose，deterministic code 再 validate，然后才能执行 action。和你文章的：
+    `Agent Proposal → Policy/Validation → Command`
+    几乎一模一样。
+    [AWS Step Functions — Validating multi-agent decisions](https://aws.amazon.com/blogs/compute/validating-multi-agent-decisions-with-step-functions-and-bedrock-agentcore/?utm_source=chatgpt.com) ([Amazon Web Services, Inc.][17])
+
+18. **Microsoft Agent Framework — Agents in Workflows**
+    官方直接把 Agent 作为 Workflow participant，同时支持 Workflow-as-Agent。
+    [Microsoft Agent Framework — Workflows](https://learn.microsoft.com/en-us/agent-framework/workflows/?utm_source=chatgpt.com) ([Microsoft Learn][3])
+
+19. **Microsoft — Multiple-agent Workflow Automation**
+    用多个 Agent 构成 organizational workflow automation 的完整 architecture example。
+    [Microsoft Azure Architecture — Multiple-Agent Workflow Automation](https://learn.microsoft.com/en-us/azure/architecture/ai-ml/idea/multiple-agent-workflow-automation?utm_source=chatgpt.com) ([Microsoft Learn][18])
+
+20. **Fluxnova — 2026 General Meeting**
+    FINOS 官方项目会议记录，已经演示 Agentic Subprocess，让 Agent 根据运行时信息选择 subprocess 中的任务；同时演示 restricted variables 和 granular authorization。这个非常适合你的文章，因为它同时说明了 Agent、Workflow 和权限控制正在融合。
+    [FINOS Fluxnova — June 2026 General Meeting](https://github.com/finos/fluxnova-bpm-platform/issues/214?utm_source=chatgpt.com) ([GitHub][19])
+
+21. **Fluxnova 3.0 Release**
+    2026 年正式加入 MCP、Agentic Adhoc Subprocess、AI integrations、restricted variables 等。
+    [Fluxnova 3.0 Release Notes](https://github.com/finos/fluxnova-bpm-platform/releases?utm_source=chatgpt.com) ([GitHub][20])
+
+---
+
+# 五、最适合支撑“BPMN / Workflow 有学习成本”
+
+22. **Forrester — Total Economic Impact of Camunda**
+    这是你上一轮特别强调的“Workflow Engine 有额外学习成本”最有价值的外部资料之一。Forrester 的 composite organization 中，developers/business analysts 使用 Camunda 后达到熟练水平按 **4 周或更短**建模；报告同时单独计算了培训成本。需要注明它是 **Camunda commissioned study**，不能当独立市场平均值。
+    [Forrester — The Total Economic Impact of Camunda for Enterprises](https://tei.forrester.com/go/camunda/enterprises/?utm_source=chatgpt.com) ([Forrester][21])
+
+23. **OMG BPMN 官方说明**
+    比较适合解释为什么需要 Process Engineer / Business Analyst / Developer 的协作：BPMN 的目标就是连接 business stakeholders 和 technical implementers。
+    [OMG — BPMN](https://www.omg.org/bpmn/?utm_source=chatgpt.com) ([OMG][7])
+
+24. **Camunda — One Model Approach**
+    虽然属于厂商资料，但对“业务分析师、开发者、IT、业务 owner 使用同一过程模型”的组织模型讲得很清楚。
+    [Camunda — One Model Approach to Process Orchestration](https://camunda.com/blog/2025/02/camunda-one-model-approach-to-process-orchestration/?utm_source=chatgpt.com) ([Camunda][22])
+
+25. **Camunda — How 13 Businesses Feel About BPMN**
+    可以作为不同企业对 BPMN collaboration / productivity 价值的案例补充，但可信度低于 OMG / Forrester。
+    ([Camunda][23])
+
+---
+
+# 六、Agent “业务人员自己用” / Skill / 企业工作方式
+
+26. **Microsoft Research — Agents for Productivity**
+    非常适合支撑“Agent 正在进入业务操作者日常工作”，同时明确指出 enterprise agent 的难点包括 workflow execution、context retention、orchestration 和 reliability。
+    [Microsoft Research — Agents for Productivity](https://www.microsoft.com/en-us/research/group/agents-for-productivity-a4p/?utm_source=chatgpt.com) ([Microsoft][24])
+
+27. **Microsoft Research — M365 Research**
+    对 enterprise agents 的描述很有价值：people、documents、meetings、messages、applications、processes、permissions 都成为 Agent 上下文，并明确指出这些能力同时会增加 latency、infra demand 和 cost。
+    [Microsoft Research — M365 Research](https://www.microsoft.com/en-us/research/group/m365-research/?utm_source=chatgpt.com) ([Microsoft][25])
+
+28. **Anthropic — Effective Context Engineering for AI Agents**
+    很适合 Skill / Agent runtime 部分，尤其是“不要把所有数据预先塞进 prompt，而是让 Agent 在允许的范围内通过 tools 动态取得 context”。
+    ([Anthropic][26])
+
+29. **Anthropic — Demystifying Evals for AI Agents**
+    非常适合支撑“Agent + Skill 并不是零工程”：Agent 的多轮、工具调用、状态修改和自主性使 evaluation 明显比传统软件复杂。
+    ([Anthropic][27])
+
+---
+
+# 七、金融监管 / Trust Source
+
+这些不直接证明“应该用 Workflow”，但非常适合支撑你文章中的**金融约束和为什么要保留控制边界**。
+
+30. **NIST — AI Risk Management Framework**
+    最通用的 AI governance / trustworthiness framework。
+    [NIST AI RMF](https://www.nist.gov/itl/ai-risk-management-framework?utm_source=chatgpt.com) ([NIST][28])
+
+31. **NIST — Generative AI Profile**
+    针对 GenAI 增加具体风险和 actions。
+    ([NIST AI Resource Center][29])
+
+32. **Bank of England / PRA — SS1/23 Model Risk Management**
+    对金融机构模型治理、责任、validation、risk mitigants 非常重要，而且当前版本已经在 2026 年 4 月生效。
+    ([Bank of England][30])
+
+33. **Bank of England — AI and ML in financial services**
+    特别适合你文章中“人、模型、数据、治理共同决定风险”的观点，也明确提到 human-in-the-loop 和第三方 AI expertise 问题。
+    ([Bank of England][31])
+
+34. **Bank of England — Financial Stability in Focus: AI**
+    很适合引用“AI autonomy / explainability 如果缺乏 testing、governance、risk controls，会增加金融风险”的观点。
+    ([Bank of England][32])
+
+35. **BIS — Regulating AI in the financial sector**
+    很强的监管来源，涵盖 governance、expertise and skills、model risk、data governance、third-party AI provider。
+    ([Bank for International Settlements][33])
+
+36. **BIS — Governance of AI adoption in central banks**
+    特别适合“三道防线 / governance / risk management”部分。
+    ([Bank for International Settlements][34])
+
+37. **BIS — Intelligent financial system: how AI is transforming finance**
+    学术/政策研究质量较高，直接讨论 GenAI 和 emerging AI agents 对 financial intermediation、insurance、asset management、payments 的影响。
+    ([Bank for International Settlements][35])
+
+38. **BIS — Supervising banks in an AI-shaped economy**
+    2026-09-18，与你当前文章时间点非常接近。直接讨论 AI 在 fraud、creditworthiness、compliance、customer service、risk management 中的应用，以及 operational / strategic resilience。
+    ([Bank for International Settlements][36])
+
+39. **FSB — Financial Stability Implications of AI**
+    适合支撑 AI 的 third-party dependency、cyber risk、model risk、governance。
+    ([Financial Stability Board][37])
+
+40. **FSB — Monitoring AI Adoption and Related Vulnerabilities**
+    2025 年进一步讨论 AI supply chain、third-party concentration、substitutability，非常适合金融 Agent Platform 的 vendor dependency 部分。
+    ([Financial Stability Board][38])
+
+---
+
+# 八、金融真实案例，尤其值得增加
+
+41. **Robinhood — Financial Crimes Investigations + Human-in-the-loop**
+    这个案例非常贴合你的 Hybrid 模型：Agent 辅助 FinCrime Investigation，但每个 summary 都保留 human in the loop，最终 decision 仍由 investigator 负责。
+    ([Amazon Web Services, Inc.][39])
+
+42. **Stripe — Production-grade AI agents for financial compliance**
+    2026-06，直接讨论 production Agent、financial compliance、human oversight，非常贴合你的文章。
+    ([Amazon Web Services, Inc.][40])
+
+43. **PitCrew — Agent + Automated Reasoning + Financial Policy**
+    非常适合证明：
+    `Agent Proposal → deterministic/formal validation → business action`
+    这个架构正在真实金融场景中出现。
+    ([Amazon Web Services, Inc.][41])
+
+44. **Deutsche Bank — Agentic Operational Resilience**
+    2026 年案例，Agent 用于 operational resilience / regulatory tabletop exercise，同时要求 evidence-ready output。
+    ([Google Cloud][42])
+
+45. **Wells Fargo — Agentic AI workforce**
+    适合你“业务操作者 + Agent”这一部分，属于员工生产力 / business user 模式。
+    ([Google Cloud][43])
+
+46. **Amazon Finance Technology — Regulatory Insights / Contract Review**
+    非常适合“Agent/GenAI 做知识工作，而不是直接成为 Business Process Engine”。
+    ([Amazon Web Services, Inc.][44])
+
+47. **Chime Financial — AI assistance for customer service**
+    很好的“AI augment human operator”案例，而不是 Agent 直接承担整个业务流程。
+    ([Amazon Web Services, Inc.][45])
+
+48. **Deutsche Bank DB Lumina**
+    Financial Research Agent 的代表案例。
+    ([Google Cloud][46])
+
+49. **Mr. Cooper — Multi-Agent Mortgage Service**
+    很好的 multi-agent + human worker 案例。
+    ([Google Cloud][46])
+
+---
+
+## 如果只选 12 个，我建议最终参考资料优先放这些
+
+```text
+1. Anthropic — Building Effective Agents
+2. Google Cloud — Choose a Design Pattern
+3. Microsoft — Agent Framework Workflows
+4. Microsoft — Durable Orchestrations
+5. OMG — BPMN
+6. AWS — Step Functions + AgentCore
+7. AWS — Agentic AI Lens / Human-in-the-loop
+8. OpenAI Agents SDK — RunState
+9. Forrester — Total Economic Impact of Camunda
+10. BIS — Regulating AI in Financial Sector
+11. Bank of England — SS1/23 Model Risk Management
+12. FSB — Financial Stability Implications of AI
+```
+
+其中与你这篇文章**最有价值的新增证据**其实是三组：
+
+```text
+Anthropic
+    → Workflow ≠ Agent
+
+Microsoft + AWS
+    → Code-first Workflow + Workflow + Agent 可以组合
+
+OMG + Forrester
+    → BPMN 是一种独立的过程建模/工程方法，
+      引入它意味着新的角色和学习成本
+```
+
+而金融部分再用：
+
+```text
+BIS
+Bank of England
+FSB
+Robinhood
+Stripe
+PitCrew
+Deutsche Bank
+```
+
+形成完整证据链。
+
+[1]: https://www.anthropic.com/engineering/building-effective-agents?slug=helpful-honest-harmless-ai&utm_source=chatgpt.com "Building Effective AI Agents \ Anthropic"
+[2]: https://docs.cloud.google.com/architecture/choose-design-pattern-agentic-ai-system?utm_source=chatgpt.com "Choose a design pattern for your agentic AI system  |  Cloud Architecture Center  |  Google Cloud Documentation"
+[3]: https://learn.microsoft.com/en-us/agent-framework/workflows/?utm_source=chatgpt.com "Workflow capabilities | Microsoft Learn"
+[4]: https://learn.microsoft.com/en-us/agent-framework/journey/workflows?utm_source=chatgpt.com "Workflows | Microsoft Learn"
+[5]: https://docs.cloud.google.com/architecture/choose-agentic-ai-architecture-components?utm_source=chatgpt.com "Choose your agentic AI architecture components  |  Cloud Architecture Center  |  Google Cloud Documentation"
+[6]: https://cloud.google.com/discover/agentic-workflows?utm_source=chatgpt.com "What are agentic workflows? | Google Cloud"
+[7]: https://www.omg.org/bpmn/?utm_source=chatgpt.com "Business Process Model & Notation™ (BPMN™) | Object Management Group"
+[8]: https://www.omg.org/spec/BPMN/?utm_source=chatgpt.com "About the Business Process Model and Notation Specification Version 2.0.2"
+[9]: https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-orchestrations?tabs=python&utm_source=chatgpt.com "Durable Orchestrations Overview - Azure | Microsoft Learn"
+[10]: https://aws.amazon.com/blogs/machine-learning/define-and-run-machine-learning-pipelines-on-step-functions-using-python-workflow-studio-or-states-language/?utm_source=chatgpt.com "Define and run Machine Learning pipelines on Step Functions using Python, Workflow Studio, or States Language | Artificial Intelligence"
+[11]: https://docs.aws.amazon.com/step-functions/latest/dg/tutorial-human-approval.html?utm_source=chatgpt.com "Deploying a workflow that waits for human approval in Step Functions - AWS Step Functions"
+[12]: https://openai.github.io/openai-agents-python/ref/run_state/?utm_source=chatgpt.com "Run state - OpenAI Agents SDK"
+[13]: https://openai.github.io/openai-agents-python/human_in_the_loop/?utm_source=chatgpt.com "Human-in-the-loop - OpenAI Agents SDK"
+[14]: https://openai.github.io/openai-agents-python/running_agents/?utm_source=chatgpt.com "Running agents - OpenAI Agents SDK"
+[15]: https://docs.aws.amazon.com/wellarchitected/latest/agentic-ai-lens/agentsec04-bp02.html?utm_source=chatgpt.com "AGENTSEC04-BP02 Human-in-the-loop for critical decisions - Agentic AI Lens"
+[16]: https://aws.amazon.com/about-aws/whats-new/2026/06/aws-step-functions-agentcore/?utm_source=chatgpt.com "AWS Step Functions adds AgentCore-powered agentic reasoning step - AWS"
+[17]: https://aws.amazon.com/blogs/compute/category/application-services/aws-step-functions/?utm_source=chatgpt.com "AWS Step Functions | AWS Compute Blog"
+[18]: https://learn.microsoft.com/en-us/azure/architecture/ai-ml/idea/multiple-agent-workflow-automation?utm_source=chatgpt.com "Build a Multiple-Agent Workflow Automation Solution by using Microsoft Agent Framework - Azure Architecture Center | Microsoft Learn"
+[19]: https://github.com/finos/fluxnova-bpm-platform/issues/214?utm_source=chatgpt.com "Fluxnova General Meeting - 16 JUNE 2026 · Issue #214 · finos/fluxnova-bpm-platform · GitHub"
+[20]: https://github.com/finos/fluxnova-bpm-platform/releases?utm_source=chatgpt.com "Releases · finos/fluxnova-bpm-platform · GitHub"
+[21]: https://tei.forrester.com/go/camunda/enterprises/?utm_source=chatgpt.com "The Total Economic Impact™ Of Camunda For Enterprises - Forrester"
+[22]: https://camunda.com/blog/2025/02/camunda-one-model-approach-to-process-orchestration/?utm_source=chatgpt.com "Camunda’s One Model Approach to Process Orchestration | Camunda"
+[23]: https://camunda.com/blog/2024/07/how-13-businesses-feel-about-bpmn/?utm_source=chatgpt.com "How 13 Businesses Really Feel about BPMN | Camunda"
+[24]: https://www.microsoft.com/en-us/research/group/agents-for-productivity-a4p/?lang=zh-cn&utm_source=chatgpt.com "Agents for Productivity (A4P) - Microsoft Research"
+[25]: https://www.microsoft.com/en-us/research/group/m365-research/?utm_source=chatgpt.com "M365 Research - Microsoft Research"
+[26]: https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents?utm_source=chatgpt.com "Effective context engineering for AI agents \ Anthropic"
+[27]: https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents?utm_source=chatgpt.com "Demystifying evals for AI agents \ Anthropic"
+[28]: https://www.nist.gov/itl/ai-risk-management-framework?utm_source=chatgpt.com "AI Risk Management Framework | NIST"
+[29]: https://airc.nist.gov/technical-reports/?utm_source=chatgpt.com "Technical Reports - AIRC"
+[30]: https://www.bankofengland.co.uk/prudential-regulation/publication/2023/may/model-risk-management-principles-for-banks-ss?utm_source=chatgpt.com "SS1/23 – Model risk management principles for banks | Bank of England – the UK's central bank"
+[31]: https://www.bankofengland.co.uk/prudential-regulation/publication/2023/october/artificial-intelligence-and-machine-learning?utm_source=chatgpt.com "FS2/23 – Artificial Intelligence and Machine Learning | Bank of England – the UK's central bank"
+[32]: https://www.bankofengland.co.uk/financial-stability-in-focus/2025/april-2025?utm_source=chatgpt.com "Financial Stability in Focus: Artificial intelligence in the financial system | Bank of England – the UK's central bank"
+[33]: https://www.bis.org/publications/fsi-insight-63-regulating-ai-financial-sector-recent-developments-and-main-challenges?utm_source=chatgpt.com "Regulating AI in the financial sector: recent developments and main challenges"
+[34]: https://www.bis.org/publications/governance-ai-adoption-central-banks?utm_source=chatgpt.com "Governance of AI adoption in central banks"
+[35]: https://www.bis.org/publications/working-paper-1194-intelligent-financial-system-how-ai-transforming-finance?utm_source=chatgpt.com "Intelligent financial system: how AI is transforming finance"
+[36]: https://www.bis.org/speeches/20260918-supervising-banks-ai-shaped-economy?utm_source=chatgpt.com "Supervising banks in an AI-shaped economy | Bank for International Settlements"
+[37]: https://www.fsb.org/2024/11/the-financial-stability-implications-of-artificial-intelligence/?utm_source=chatgpt.com "The Financial Stability Implications of Artificial Intelligence - Financial Stability Board"
+[38]: https://www.fsb.org/2025/10/monitoring-adoption-of-artificial-intelligence-and-related-vulnerabilities-in-the-financial-sector/?utm_source=chatgpt.com "Monitoring Adoption of Artificial Intelligence and Related Vulnerabilities in the Financial Sector - Financial Stability Board"
+[39]: https://aws.amazon.com/solutions/case-studies/robinhood-case-study/?utm_source=chatgpt.com "Robinhood Transforms Financial Crimes Investigations Using Amazon Bedrock"
+[40]: https://aws.amazon.com/blogs/machine-learning/production-grade-ai-agents-for-financial-compliance-lessons-from-stripe/?utm_source=chatgpt.com "Production-grade AI agents for financial compliance: Lessons from Stripe | Artificial Intelligence"
+[41]: https://aws.amazon.com/solutions/case-studies/pitcrew-case-study/?utm_source=chatgpt.com "PitCrew verifies AI agent decisions with Automated Reasoning on AWS | Case Study | AWS"
+[42]: https://cloud.google.com/blog/topics/financial-services/building-operational-resilience-with-agentic-ai-in-financial-services?utm_source=chatgpt.com "Building operational resilience with agentic AI in financial services | Google Cloud Blog"
+[43]: https://cloud.google.com/blog/topics/financial-services/wells-fargo-agentic-ai-agentspace-empowering-workers?utm_source=chatgpt.com "Wells Fargo brings the agentic era to financial services with Google Cloud AI | Google Cloud Blog"
+[44]: https://aws.amazon.com/solutions/case-studies/amazon-finance-case-study/?utm_source=chatgpt.com "Delivering Regulatory Insights 92% Faster Using AWS with Amazon Finance Technology | Case Study | AWS"
+[45]: https://aws.amazon.com/solutions/case-studies/chime-financial-case-study/?utm_source=chatgpt.com "Chime Financial improves member experience and saves 250,000+ hours annually with AI-powered call summaries using Amazon Bedrock"
+[46]: https://cloud.google.com/blog/topics/financial-services/assembling-a-team-of-ai-agents-to-handle-complex-mortgage-questions-at-mr-cooper?utm_source=chatgpt.com "Assembling a team of AI agents to handle complex mortgage questions at Mr. Cooper | Google Cloud Blog"
