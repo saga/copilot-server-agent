@@ -82,10 +82,10 @@ Agent Runtime Adapter：Copilot SDK / DeepAgents / LangGraph 如何替换 *
 如何设计一个与 Agent Framework 无关的 Workflow Engine *
 
 
-搜索 Web，结合业界研究、大厂实践和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接，如果有真实案例佐证最好。
+搜索 Web，分析业界研究、大厂实践、实际案例和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接，如果有真实案例佐证最好。
 写完后先内部 review：检查主要论点是否有充分依据、是否混淆事实与推论、是否把结论说得过头；发现问题先修改文章。
 最终只输出修改后的完整文章和参考资料，不要输出 review、分析过程、修改建议或生成过程。
-主题：“为什么 Workflow DSL 应该先 Parse，再 Validate，再 Analyze”
+主题：“研究业界实际案例，金融服务领域的业务需求，什么时候应该用workflow(类似cumanda，fluxnova)，什么时候应该用AI Agent（类似deepagents），decision tree什么样“
 
 
 八、Agent Runtime / Skills / Tooling
