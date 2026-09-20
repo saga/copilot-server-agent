@@ -1,78 +1,160 @@
 # 什么时候应该用 Workflow，什么时候应该用 AI Agent：金融服务场景下的架构选型与决策树
 
-在企业 AI 项目里，一个越来越常见的问题是：
+在企业 AI 项目中，一个越来越常见的问题是：
 
-> 一个业务流程，到底应该做成 Workflow，还是做成 AI Agent？
+> 一个业务需求，到底应该做成 Workflow，还是做成 AI Agent？
 
-这里的 Workflow，可以理解为 Camunda、你提到的 FluxNova 这一类 **Process / Workflow Orchestration Runtime**；AI Agent，则以 DeepAgents、OpenAI Agents SDK、类似 Agent Harness 为代表。
-
-很多团队实际上是在比较两个错误的东西：
+很多架构讨论一开始就变成：
 
 ```text
 Camunda vs DeepAgents
-```
-
-或者：
-
-```text
 Workflow vs Agent
+BPMN vs Agent Loop
 ```
 
-真正应该比较的是：
+但这其实不是最好的比较方式。
 
-> **业务流程中，究竟哪些部分应该由“预先定义的控制逻辑”决定，哪些部分应该交给“运行时推理”决定？**
+真正应该问的是：
 
-这两个技术并不是天然互斥的。
+> **这个系统中，哪些决策应该在运行前确定，哪些决策必须留到运行时由模型根据上下文决定？**
 
-Google Cloud 将 deterministic workflow 描述为：任务和路径在执行前基本已知、从开始到结束具有明确路径；而 Agent 则适用于需要运行时规划、工具选择和根据环境反馈动态调整策略的场景。Google 的架构指南甚至明确指出，对于确定性问题，完全可以不使用 agentic architecture，因为其他方法可能更高效、更经济。
+进一步还要问：
 
-IBM 对 agentic workflow 的描述也采用类似区分：传统自动化偏向预定义规则和设计模式，而 agentic workflow 的价值在于根据实时数据和意外条件动态调整。IBM 同时特别指出，纯概率式 Agent 在复杂流程中可能带来不可预测性，而 deterministic workflow 则提供固定顺序、分支、循环、状态管理和并行处理。
+> **Agent 产生的是建议，还是业务系统的权威决定？**
 
-因此，本文最终给出的不是“Workflow 更好”或“Agent 更先进”，而是一套更实用的判断：
+这两个问题非常重要。
 
-> **Workflow 管过程；Agent 管不确定性。**
+Google Cloud 当前的架构指南已经把 deterministic workflow 与需要动态 orchestration 的 agentic pattern 明确区分：如果任务步骤和路径可以预先定义，就不需要让模型承担 orchestration；只有当任务需要运行时规划、动态工具选择和根据环境反馈调整策略时，Agent 才有明显价值。Google 同时也提醒，不是所有多步骤任务都需要 Agent。
 
-进一步说：
+金融领域的实际案例也呈现出类似结构：
 
-> **已经知道“应该怎么做”的部分，用 Workflow。**
->
-> **只知道“要达到什么目标”，但不知道运行时应该怎么做的部分，用 Agent。**
->
-> **金融业务中真正重要的流程，通常采用 Hybrid：Workflow 在外层控制业务状态、权限、审批、SLA 和最终动作；Agent 在内部处理检索、理解、分析、规划等认知任务。**
+* Jyske Bank 用 Camunda 编排 KYC、定时器、用户任务和合规流程；
+* Goldman Sachs 用 Camunda 支撑 Payment Processing、Client Billing 和 Decision Services；
+* Capital One 用 Step Functions 编排大量支票处理 Workflow，并明确处理需要人工 Review 的分支；
+* OneMain Financial 用 Step Functions 编排安全取证，并把人工授权放在高风险 snapshot 操作之前；
+* Deutsche Bank 的 DB Lumina 则将 Agent 用于金融研究；
+* Mr. Cooper 用多 Agent 处理复杂 mortgage 问题；
+* Nequi 明确将 multi-agent system 与 deterministic flows 结合起来；
+* PitCrew 则把 Agent、业务控制和 Automated Reasoning 放在金融服务 Workflow 中。
+
+因此，真正值得采用的结论不是：
+
+> Workflow 或 Agent，二选一。
+
+而是：
+
+> **Workflow 管业务过程控制；Agent 管受约束的运行时推理；Rules / Decision Service 管确定性决策；Human 管需要人为判断或授权的节点。**
+
+对于金融服务，再加一条：
+
+> **Agent 可以参与业务决策过程，但不应该因为拥有推理能力，就自动拥有业务状态机、授权边界和最终副作用的控制权。**
 
 ---
 
-# 1. 先把 Workflow 和 Agent 的边界说清楚
+# 1. 先把四种东西分开
 
-一个 Workflow 的核心是：
+很多“Workflow vs Agent”的争论，其实是把四种不同能力混在了一起。
+
+## 1.1 Code / Rules / Decision Service
+
+负责：
 
 ```text
-State
-  ↓
-Transition
-  ↓
-Next State
+已知规则
++
+确定性输入
++
+确定性计算
+=
+确定性结果
 ```
 
 例如：
 
 ```text
-Receive Trade Request
-        ↓
-Validate
-        ↓
-Risk Check
-        ↓
-Approval
-        ↓
-Execute
-        ↓
-Complete
+amount > 1M
+    → Director Approval
+
+amount <= 1M
+    → Straight Through
 ```
 
-每一步是什么、什么时候执行、谁可以执行、失败怎么办、超时怎么办，原则上都可以预先定义。
+这种问题不应该为了“AI-native”而引入 Agent。
 
-Agent 的核心则不同：
+它更适合：
+
+```text
+Code
+Rules Engine
+DMN
+Decision Service
+SQL
+Optimization Solver
+```
+
+---
+
+## 1.2 Workflow
+
+Workflow 主要解决：
+
+```text
+业务过程是什么？
+现在处于什么状态？
+下一步允许发生什么？
+什么时候等待？
+什么时候超时？
+谁需要处理？
+什么条件下可以继续？
+失败后走哪条恢复路径？
+```
+
+可以抽象成：
+
+```text
+Business State
+      ↓
+Allowed Transition
+      ↓
+Next Business State
+```
+
+例如：
+
+```text
+Trade Request
+      ↓
+Risk Review
+      ↓
+Approval
+      ↓
+Execution
+      ↓
+Settlement
+```
+
+Workflow 的价值不是“能不能调用 API”。
+
+普通代码也可以调用 API。
+
+Workflow 的价值是：
+
+> **把跨系统、跨人员、长时间运行的业务过程变成一个可持久化、可观察、可恢复、可治理的执行对象。**
+
+Jyske Bank 的 KYC 就是非常典型的例子：流程涉及客户数据更新、新客户 KYC、周期性重新 KYC、多个团队、客户响应期限、升级和用户任务，最终用 Camunda 做过程编排。
+
+---
+
+## 1.3 AI Agent
+
+Agent 解决的是另一个问题：
+
+```text
+目标已知
+但达到目标的步骤不完全知道
+```
+
+它的典型循环是：
 
 ```text
 Goal
@@ -81,11 +163,11 @@ Observe
  ↓
 Reason
  ↓
-Plan
+Choose Action
  ↓
-Act
+Tool
  ↓
-Observe again
+Observe Result
  ↓
 Replan
 ```
@@ -93,1948 +175,388 @@ Replan
 例如：
 
 ```text
-“帮我调查这个客户最近的风险变化，并告诉我应该关注什么。”
+“调查这个客户最近为什么出现风险变化。”
 ```
 
-事先无法完全知道：
+系统事先很难写死：
 
 ```text
-需要查哪些资料？
-先查哪一个系统？
-某个异常意味着什么？
-还需要补充什么信息？
-是否应该追问？
-应该让哪个 specialist agent 处理？
+先查什么？
+第二步查什么？
+发现异常后还应该查什么？
+需要读取哪些文档？
+需要让哪个 specialist 参与？
+什么时候信息足够？
 ```
 
-这正是 Agent 的价值。
+这种情况下，运行时规划才是 Agent 的价值。
 
-AWS 对 Agent 的定义也强调了这一点：Agent 接收目标后，可以自主选择为完成目标所需的动作，并通过工具、数据源和环境反馈持续推进任务。
+DeepAgents 的定位本身就是这种 agent harness：提供 planning、subagents、filesystem、context management 和长期 memory 等能力。
 
-DeepAgents 的设计同样明确把 planning、task decomposition、subagent spawning、context management 和 human-in-the-loop 作为 Agent Harness 的核心能力；它还明确把这种能力建立在 agent loop 之上，而不是传统业务流程引擎之上。
-
-所以从架构角度，可以先把二者理解成：
-
-```mermaid
-flowchart LR
-
-    W[Workflow]
-    A[Agent]
-
-    W --> W1["预先定义状态与路径"]
-    W --> W2["确定性控制"]
-    W --> W3["SLA / Approval / Audit"]
-    W --> W4["长期持久化"]
-
-    A --> A1["运行时规划"]
-    A --> A2["工具选择"]
-    A --> A3["信息理解"]
-    A --> A4["动态调整"]
-```
+OpenAI Agents SDK 同样把 Agent 定义为一个由模型、instructions、tools、handoff、guardrails 和运行时行为构成的执行单元，并由 Runner 管理 agent loop。
 
 ---
 
-# 2. 最重要的判断标准不是“流程复杂不复杂”
+## 1.4 Human
 
-这是实际项目中最容易犯的错误。
+Human 并不是 Workflow 的一种“错误处理机制”。
 
-很多人会说：
-
-> “这个流程太复杂，所以应该用 Agent。”
-
-其实恰恰可能相反。
-
-例如一个金融机构的 KYC 流程可能非常复杂：
+有些问题：
 
 ```text
-Customer Onboarding
-    ↓
-Identity Verification
-    ↓
-Sanctions Screening
-    ↓
-Risk Classification
-    ↓
-Document Collection
-    ↓
-Manual Review
-    ↓
-Approval
-    ↓
-Account Opening
+规则明确
 ```
 
-几十个节点、很多系统、很多异常、很多人工参与。
+可以自动化。
 
-它依然非常适合 Workflow。
+有些问题：
 
-Jyske Bank 的 KYC 项目就是一个典型案例。该行需要处理客户数据更新、新客户 KYC、定期重新 KYC，并需要处理多种 endpoint、流程步骤以及客户不响应等情况，因此选择 Camunda 做流程编排。
+```text
+需要开放式推理
+```
+
+适合 Agent。
+
+但还有一类：
+
+```text
+即使系统拥有足够信息，组织仍然要求由人决定
+```
+
+例如：
+
+```text
+大型交易审批
+特殊客户例外
+高风险合规判断
+主观性较强的投诉处理
+重大风险豁免
+```
+
+这时候应该进入 Human Task。
+
+Google Cloud 的 Agent Architecture 指南也明确把 high-stakes、safety-critical、compliance-sensitive 或需要 subjective judgment 的任务列为 Human-in-the-loop 的典型场景。
+
+---
+
+# 2. 真正的架构分界：不是“复杂度”，而是“谁决定下一步”
+
+这是旧版本最需要修改的地方。
+
+“复杂”没有什么架构含义。
+
+下面两个问题都可能很复杂：
+
+```text
+A:
+一个有 80 个节点、12 个审批节点、10 个系统的 KYC Workflow
+
+B:
+一个需要阅读 300 份报告并调查某公司风险变化的研究任务
+```
+
+A 很复杂，但路径高度可定义。
+
+B 也很复杂，但路径高度开放。
 
 所以：
 
 ```text
-复杂 ≠ Agent
+Complex ≠ Agent
 ```
 
-真正的判断标准是：
+真正应该观察的是：
 
 ```text
-路径是否预先可定义？
+下一步是否在运行前已经有足够明确的定义？
 ```
-
-也就是说：
-
-```text
-Complex + Deterministic
-        → Workflow
-
-Simple + Uncertain
-        → Agent
-```
-
-例如：
-
-```text
-“查这个客户是否完成了 KYC？”
-```
-
-可能很简单，但需要跨多个系统理解数据、识别自然语言语义，甚至需要追问。
-
-它可能更适合 Agent。
-
----
-
-# 3. 最核心的架构变量：Uncertainty 在哪里？
-
-这是整篇文章最重要的判断方式。
-
-把业务问题拆成：
-
-```text
-Goal
-  ↓
-Interpretation
-  ↓
-Plan
-  ↓
-Execution
-  ↓
-Control
-```
-
-问五个问题：
-
-```text
-1. Goal 是否明确？
-2. Interpretation 是否确定？
-3. Plan 是否可以提前写死？
-4. Execution 是否可以提前写死？
-5. Control 是否必须绝对确定？
-```
-
-通常：
-
-### Workflow
-
-```text
-Goal         已知
-Interpretation 已知
-Plan         已知
-Execution    大部分已知
-Control      必须确定
-```
-
-### Agent
-
-```text
-Goal         已知
-Interpretation 不确定
-Plan         不确定
-Execution    动态
-Control      由外部系统限制
-```
-
-### Hybrid
-
-```text
-Goal         已知
-Interpretation 部分不确定
-Plan         局部动态
-Execution    受限
-Control      Workflow 固定
-```
-
-因此，一个非常实用的架构原则是：
-
-> **不要问“这个业务要不要 Agent”，而应该问“这个业务的哪一个不确定性值得由 Agent 处理”。**
-
----
-
-# 4. 金融服务为什么特别适合 Hybrid
-
-金融业务有一个很特殊的结构：
-
-```text
-业务过程通常高度确定
-+
-信息理解通常高度不确定
-```
-
-例如：
-
-```text
-Mortgage Review
-```
-
-流程可能是：
-
-```text
-Application
-    ↓
-Eligibility
-    ↓
-Document Collection
-    ↓
-Risk Assessment
-    ↓
-Approval
-    ↓
-Offer
-```
-
-这是确定的。
-
-但：
-
-```text
-客户为什么收入突然下降？
-这份 PDF 是否包含需要关注的条款？
-客户的解释是否与历史资料一致？
-有哪些异常模式？
-需要补充什么信息？
-```
-
-这些是认知任务。
-
-所以自然会出现：
-
-```text
-Workflow
-    ↓
-Agent
-    ↓
-Structured Result
-    ↓
-Workflow
-```
-
-而不是：
-
-```text
-Agent
-  ↓
-Agent
-  ↓
-Agent
-  ↓
-Agent
-```
-
-直接掌握整个业务过程。
-
----
-
-# 5. 现实中的金融机构已经出现了非常清晰的两种模式
-
-## 5.1 Workflow-centric：Goldman Sachs
-
-Goldman Sachs 的公开案例非常典型。
-
-其基于 Camunda 建设集中式 Workflow Automation Platform，公开数据包括：
-
-```text
-15+ internal teams
-60K unique users / year
-6M tasks / week
-```
-
-核心场景包括：
-
-```text
-Payment Processing
-Client Billing
-Microservices Automation
-Decision Services
-```
-
-其中 Decision Services 使用 DMN，让技术和业务团队能够对业务规则进行建模和一致执行。
-
-这是非常典型的：
-
-```text
-Business Process
-+
-Business Rules
-+
-High Volume
-+
-Strong Governance
-        ↓
-Workflow
-```
-
-而不是让 Agent 决定：
-
-```text
-Payment → Billing → Accounting → Complete
-```
-
-这些控制路径。
-
----
-
-# 6. 另一个更大规模的案例：BNY Mellon
-
-BNY Mellon 的公开案例更加说明问题。
-
-该行使用 Camunda 做企业级 Business Process Automation，公开信息显示其拥有：
-
-```text
-70+ Camunda projects
-100M+ individual process instances / task operations
-```
-
-应用涉及：
-
-```text
-Investment Operations
-Compliance Workflows
-Client Reporting
-```
-
-并将流程编排作为企业级基础能力。
-
-这类业务具有非常明显的特征：
-
-```text
-流程长期存在
-+
-业务状态重要
-+
-大量人工任务
-+
-需要可追踪
-+
-需要跨系统协调
-+
-需要稳定运行
-```
-
-这些都天然属于 Workflow Runtime 的优势范围。
-
----
-
-# 7. Capital One 的支票处理更能说明 Workflow 的价值
-
-Capital One 的 check-clearing application 使用 AWS Step Functions 进行 Workflow orchestration。
-
-流程并不意味着所有事情都自动化：
-
-```text
-大部分支票
-   ↓
-自动处理
-
-少量支票
-   ↓
-人工 Review
-```
-
-Capital One 后来使用 Distributed Map 扩大并行能力，公开案例称总体处理时间降低约 75–80%，并能够并行关闭数千个 Workflow；人工审核仍作为流程中的一个明确分支存在。
-
-这说明：
-
-> **“有人工判断”不等于“应该用 Agent”。**
 
 如果：
 
 ```text
-99% 情况
-    → A
-
-特定条件
-    → Human Review
-
-Review 完成
-    → B
+是
 ```
 
-仍然是标准 Workflow 问题。
-
-只有“Review 本身是什么”无法预定义时，才开始需要 Agent。
-
----
-
-# 8. OneMain Financial 也是类似模式
-
-OneMain Financial 的 OneFor(ensics) 使用 AWS Step Functions 编排安全取证流程。
-
-SOC analyst 发起调查后，系统：
-
-```text
-Validate
-  ↓
-Notify authorized person
-  ↓
-Wait for approval
-  ↓
-Snapshot
-  ↓
-Continue investigation
-```
-
-也就是说，即便业务过程中包含：
-
-```text
-安全分析
-人工判断
-高风险操作
-```
-
-核心过程仍然是 Workflow。
-
-AWS 公开案例称，该方案将从安全告警到调查的时间缩短了 97.5%。
-
-这个例子特别重要，因为它非常接近金融企业普遍面对的模式：
-
-> **自动化可以做很多事情，但高风险动作仍然需要明确的状态、授权和人工控制点。**
-
----
-
-# 9. Agent-centric 的金融案例则呈现另一种模式
-
-## 9.1 Wells Fargo：信息理解型 Agent
-
-Wells Fargo 与 Google Cloud 公开合作案例显示，其在不同业务中使用 Agent：
-
-```text
-FX post-trade inquiries
-Policy / Procedure navigation
-Contract management
-Customer service
-Research
-```
-
-例如企业合同领域，需要从约 25 万份 vendor agreement 中查找特定 clause、payment terms、contract types 等信息。
-
-这类问题具有共同特征：
-
-```text
-资料很多
-+
-问题开放
-+
-自然语言输入
-+
-需要检索
-+
-需要综合
-+
-具体执行步骤难以预先枚举
-```
-
-这明显更接近 Agent。
-
----
-
-# 10. Mr. Cooper 的 CIERA 更直接地展示了 Agent 的适用边界
-
-Mr. Cooper 针对 mortgage servicing 开发 CIERA，多 Agent 协同处理复杂客户问题。
-
-公开架构中包括：
-
-```text
-Sage
-Ava
-Lex
-Sky
-Remy
-Iris
-```
-
-其中：
-
-```text
-Ava → Orchestrator
-Lex → Task Specialist
-Sky → Data Specialist
-Remy → Memory
-Iris → Evaluation
-```
-
-一个客户问：
-
-> “为什么我的 escrow payment 增加？新的 total payment 是多少？”
-
-系统可以把任务拆成：
-
-```text
-为什么增加？
-        ↓
-查 escrow analysis document
-
-新的 payment 是多少？
-        ↓
-读取系统数据
-        ↓
-计算
-```
-
-两个子任务可以并行处理，然后由人类客服确认最终回答。
-
-这个案例非常有代表性：
-
-```text
-Workflow:
-客户问题 → 客服 → 最终回复
-
-Agent:
-        ↑
-     CIERA
-        ↓
-拆问题
-→ 检索
-→ 分析
-→ 计算
-→ 汇总
-```
-
-这里 Agent 并不是替代整个 mortgage servicing workflow。
-
-它是在 Workflow 的某一个“认知密集型步骤”内部工作。
-
----
-
-# 11. Deutsche Bank 的 DB Lumina 更接近 Knowledge Work Agent
-
-Deutsche Bank Research 与 Google Cloud 公布的 DB Lumina，则是另一类典型案例。
-
-研究员过去需要：
-
-```text
-Financial Statements
-Regulatory Filings
-Industry Reports
-Past Research
-External Documents
-```
-
-然后：
-
-```text
-检索
-→ 阅读
-→ 交叉比较
-→ 建模
-→ 发现关系
-→ 形成研究观点
-```
-
-DB Lumina 被设计为 AI-powered research agent，采用 RAG，连接内部研究、SEC filings 等知识源，并提供 inline citations、source viewer、受控访问和 audit logging。
-
-这里的核心不是：
-
-```text
-流程节点很多
-```
-
-而是：
-
-```text
-研究目标明确
-但实现路径不固定
-```
-
-因此 Agent 很合适。
-
----
-
-# 12. Nequi 的案例尤其值得注意：它同时用了 Agent 和 Deterministic Flow
-
-Nequi 的 AWS 案例是本文最有价值的现实例子之一。
-
-Nequi 建立了多 Agent 架构，由 supervisor agent 协调多个 specialist agents，同时又明确提到其系统结合了：
-
-```text
-multiagent system
-+
-deterministic flows
-+
-complementary collection strategies
-```
-
-公开案例称，其 AI-driven operating model 被用于客户自助服务、alternative credit scoring 和 collections；AWS 描述其多 Agent 架构与 deterministic flows 并存。
-
-这比“Workflow vs Agent”二选一的讨论更接近真实企业架构：
-
-```text
-Agent
-+
-Deterministic Process
-+
-ML Models
-+
-Human
-```
-
-而不是：
-
-```text
-All Agent
-```
-
----
-
-# 13. PitCrew 的案例进一步说明金融机构需要“两套世界结合”
-
-AWS 公布的 PitCrew 案例针对 wealth management 和 broker-dealer operations。
-
-其流程涉及：
-
-```text
-CRM
-Custodian
-Billing
-Documents
-Policies
-Regulations
-```
-
-并把：
-
-```text
-AI agents
-+
-integrations
-+
-customer-specific controls
-```
-
-组合进 Workflow。
-
-尤其值得关注的是：
-
-```text
-Domain experts approve every workflow before deployment
-```
-
-同时，PitCrew 使用 Automated Reasoning 对 Agent 的输出进行逻辑验证。
-
-这里已经非常接近现代金融 Agent Platform 的目标架构：
-
-```text
-Agent = intelligence
-Workflow = process
-Policy = control
-Reasoning engine = verification
-Human = accountability
-```
-
----
-
-# 14. 这其实解释了金融服务为什么很少适合“纯 Agent 驱动整个业务流程”
-
-FSB 对金融行业 AI 的研究持续指出几个重要风险：
-
-```text
-Third-party dependency
-Model risk
-Data quality
-Governance
-Cyber risk
-Complexity / opacity
-```
-
-并特别指出金融机构目前对 GenAI 的采用仍然主要集中在相对低风险、运营效率类场景，而关键功能和关键运营中的使用仍然相对谨慎。
-
-FCA 对金融 AI 的实践观察同样强调：
-
-```text
-goal / outcome
-risk
-mitigation
-human oversight
-testing
-governance
-```
-
-应该从一开始就被考虑，而不是 AI 上线后再补。
-
-BIS 在 2026 年关于 AI 与银行监管的讨论中也强调，生成式和 agentic AI 对传统模型治理提出新的挑战，需要通过其他风险管理和治理机制建立控制。
-
-因此，对于：
-
-```text
-Payment
-Trade
-Asset Transfer
-Credit Decision
-Client Account Change
-Regulatory Submission
-```
-
-不应该因为 Agent 能够“自己完成任务”，就自然让 Agent 成为最终 Workflow Controller。
-
-这是一条架构建议，而不是某一项监管规则直接规定的产品选择。
-
----
-
-# 15. 一个非常重要的反直觉结论
-
-很多人认为：
-
-> Workflow 适合简单流程，Agent 适合复杂流程。
-
-更准确的说法应该是：
-
-> **Workflow 适合“复杂但可预定义”的问题；Agent 适合“路径本身需要运行时决定”的问题。**
-
-例如：
-
-| 场景                               | 复杂度 | 路径确定性 | 更合适的核心               |
-| -------------------------------- | --: | ----: | -------------------- |
-| KYC                              |   高 |     高 | Workflow             |
-| Payment                          |   高 |     高 | Workflow             |
-| Trade Settlement                 |   高 |     高 | Workflow             |
-| Regulatory Reporting             |   高 |     高 | Workflow             |
-| Mortgage document explanation    |   高 |     低 | Agent                |
-| Investment research              |   高 |     低 | Agent                |
-| Customer complaint investigation |   高 |   中/低 | Hybrid               |
-| Fraud investigation              |   高 |   中/低 | Hybrid               |
-| Credit approval                  |   高 |     中 | Hybrid               |
-| Internal policy Q&A              |   中 |     低 | Agent                |
-| Simple ETL                       |   低 |     高 | Code / Data Pipeline |
-| Simple document summarization    |   低 |     高 | LLM call，不一定需要 Agent |
-
-最后一类特别重要：
-
-> **并不是每一个 AI 问题都需要 Agent。**
-
-Google 官方架构指南直接给出了类似建议：文档摘要、翻译、客户反馈分类等确定性较高、路径简单的任务，不需要额外引入 agentic workflow。
-
----
-
-# 16. Decision Tree 应该长什么样
-
-下面这棵树可以作为企业架构评审时的第一版：
-
-```mermaid
-flowchart TD
-
-    A[业务需求] --> B{是否有明确的业务目标和完成条件?}
-
-    B -->|否| C[先做业务定义 / 不急于选技术]
-    B -->|是| D{执行路径是否可以在运行前基本定义?}
-
-    D -->|是| E{是否需要长期状态 / SLA / 人工审批 / 审计?}
-
-    E -->|是| F[Workflow]
-    E -->|否| G{是否只是简单确定性自动化?}
-
-    G -->|是| H[Code / API / Batch / Data Pipeline]
-    G -->|否| F
-
-    D -->|否| I{主要不确定性是否来自信息理解、检索、规划或工具选择?}
-
-    I -->|否| J[Workflow + Rules / Decision Service]
-    I -->|是| K{Agent 是否可以限制在明确的工具和权限边界内?}
-
-    K -->|否| L[先增加 Control Boundary]
-    K -->|是| M{是否直接产生高影响、不可逆的业务动作?}
-
-    M -->|是| N[Hybrid:
-Workflow + Agent + Policy/Human Gate]
-
-    M -->|否| O[Agent]
-```
-
-这棵树还有一个重要的原则：
-
-> **先判断“决策自由度”，再判断“是否需要 Agent”。**
-
----
-
-# 17. 再把 Decision Tree 压缩成 8 个问题
-
-架构评审实际可以只问八个问题。
-
-## Q1：业务流程是否已知？
-
-```text
-是 → Workflow 倾向
-否 → Agent 倾向
-```
-
----
-
-## Q2：下一步是否由业务规则决定？
-
-例如：
-
-```text
-amount > 1M
-    → approval
-
-amount <= 1M
-    → straight-through
-```
-
-如果是：
-
-```text
-Workflow / Decision Service
-```
-
-而不是让 LLM 决定。
-
----
-
-## Q3：下一步是否需要理解非结构化信息？
-
-例如：
-
-```text
-“分析这 300 份 SEC filings，找出哪些公司风险发生变化。”
-```
-
-这是：
-
-```text
-Agent
-```
-
----
-
-## Q4：需要“探索”还是“执行”？
-
-```text
-探索
-→ Agent
-
-执行
-→ Workflow
-```
-
-例如：
-
-```text
-Find why customer is upset
-→ Agent
-
-Process refund
-→ Workflow
-```
-
----
-
-# 18. Q5：是否需要长期状态？
-
-如果需要：
-
-```text
-等待审批
-等待客户
-等待外部系统
-SLA
-Escalation
-Retry
-Compensation
-Reconciliation
-```
-
-Workflow 的优势非常明显。
-
-Camunda User Task 就是典型例子：流程到达 User Task 后，生成 Human Task instance，Process Instance 停止等待，任务完成以后再继续。
-
-Agent Loop 本身不应该成为企业长期业务状态机。
-
----
-
-# 19. Q6：失败后应该怎么办？
-
-如果可以预先定义：
-
-```text
-Retry
-Timeout
-Escalate
-Compensate
-Reconcile
-```
-
-Workflow 非常适合。
-
-如果需要：
-
-```text
-“根据当前情况想办法”
-```
-
-Agent 才有明显价值。
-
-这是一个很好的边界：
-
-```text
-Known Recovery
-    → Workflow
-
-Unknown Recovery Strategy
-    → Agent can assist planning
-```
-
-但即便如此，最终 Recovery Policy 对金融高风险动作仍然应该由 Workflow / Policy 层控制。
-
----
-
-# 20. Q7：结果是否必须可重现？
-
-如果需要：
-
-```text
-same input
-+
-same rule
-+
-same version
-≈
-same decision
-```
-
-Workflow / Rules / Decision Engine 更合适。
-
-例如：
-
-```text
-Fee calculation
-Tax calculation
-Credit policy threshold
-Approval routing
-Authority limit
-```
-
-通常不应该由 LLM 自由决定。
-
----
-
-# 21. Q8：失败的成本是否高？
+倾向 Workflow / Rules。
 
 如果：
 
 ```text
-wrong answer
+不是
 ```
 
-只需要：
+再问：
 
-```text
-重新回答
-```
+> 为什么不知道？
 
-Agent 可以有较大自由度。
-
-如果：
-
-```text
-wrong action
-```
-
-意味着：
-
-```text
-资金转错
-交易执行
-客户账户修改
-监管申报错误
-```
-
-则应显著增加：
-
-```text
-Workflow
-Policy
-Authorization
-Human Approval
-Idempotency
-Audit
-```
-
-这不是说 Agent 永远不能参与，而是：
-
-> **Agent 的自主范围应该缩小到“认知任务”，而不是无限扩大到“业务控制权”。**
+这是整个 Decision Tree 最重要的一步。
 
 ---
 
-# 22. 一个非常实用的二维矩阵
+# 3. “不知道下一步”不等于“应该用 Agent”
 
-如果要快速选型，可以把业务放到：
-
-```text
-Y = 不确定性
-X = 业务控制要求
-```
-
-```text
-                      控制要求高
-                          ↑
-                          │
-       Workflow + Agent   │   Workflow
-                          │
-                          │
- 不确定性低 ──────────────┼──────────────→ 不确定性高
-                          │
-                          │
-          Simple LLM      │   Agent
-                          │
-                          ↓
-                      控制要求低
-```
-
-不过这个图还不够准确。
-
-更准确的是：
-
-```text
-                           高控制
-                             ↑
-                             │
-                 Hybrid     │     Workflow
-                             │
-                             │
-     Agent ──────────────────┼──────────────── Rules/Code
-                             │
-                             │
-                             ↓
-                           低控制
-
-                         ← 不确定性高
-                           不确定性低 →
-```
-
-因此：
-
-```text
-低不确定性 + 高控制
-    → Workflow
-
-高不确定性 + 低控制
-    → Agent
-
-高不确定性 + 高控制
-    → Hybrid
-```
-
-这基本就是金融服务最重要的区域。
-
----
-
-# 23. Hybrid 到底应该怎么架构
-
-推荐的结构不是：
-
-```text
-Workflow
-  ↓
-Agent
-  ↓
-Agent
-  ↓
-Agent
-```
-
-而是：
-
-```mermaid
-flowchart TB
-
-    W1[Workflow Start]
-    P1[Policy / Authorization]
-    A[Agent Task]
-    V[Deterministic Validation]
-    H[Human Approval]
-    X[Business Action]
-    R[Reconciliation]
-    W2[Workflow Resume]
-
-    W1 --> P1
-    P1 --> A
-    A --> V
-
-    V -->|valid| H
-    V -->|invalid| A
-
-    H -->|approved| X
-    H -->|rejected| W2
-
-    X -->|confirmed| W2
-    X -->|unknown| R
-    R --> W2
-```
-
-这套结构实际上非常符合近期真实金融案例。
-
----
-
-# 24. Agent 最适合成为 Workflow 的“认知节点”
-
-例如一个 Trade Review：
-
-```text
-Workflow
-    ↓
-Load Trade
-    ↓
-Check deterministic rules
-    ↓
-Agent: Analyze market commentary
-    ↓
-Agent: Review research documents
-    ↓
-Structured result
-    ↓
-Policy Decision
-    ↓
-Human Approval
-    ↓
-Execute
-```
-
-Agent 并没有：
-
-```text
-直接跳到 Execute
-```
-
-而是：
-
-```text
-Generate Evidence
-Generate Recommendation
-Generate Classification
-```
-
-然后由：
-
-```text
-Workflow / Policy
-```
-
-决定是否进入下一步。
-
----
-
-# 25. 这里需要区分 Agent “Decision Support”和“Business Decision”
-
-这两个概念经常混淆。
+这是旧文章最大的逻辑缺口。
 
 例如：
 
 ```text
-Agent:
-“从公开资料来看，我认为这个 trade 有 3 个值得关注的风险。”
+amount > ?
 ```
 
-这是：
+不知道下一步，可能因为：
+
+### 情况 A：规则没写清楚
+
+应该：
 
 ```text
-Decision Support
+Business Analysis
 ```
 
-而：
-
-```text
-Workflow:
-“Amount > limit → Director Approval required”
-```
-
-这是：
-
-```text
-Business Decision
-```
-
-再例如：
-
-```text
-Agent:
-“建议人工进一步 review。”
-```
-
-这可以是：
-
-```text
-Agent Recommendation
-```
-
-但：
-
-```text
-Workflow:
-“Risk Policy = REVIEW_REQUIRED → create Human Task”
-```
-
-才是：
-
-```text
-Process Transition
-```
-
-这正是 Agent 和 Workflow 最容易混淆的地方。
+不是 Agent。
 
 ---
 
-# 26. 不要让 Agent 成为 Workflow State Machine
+### 情况 B：规则非常明确，但实现成决策表
 
-一个非常危险的设计是：
+应该：
+
+```text
+Decision Service / DMN
+```
+
+不是 Agent。
+
+---
+
+### 情况 C：需要数学优化
+
+例如：
+
+```text
+Portfolio Allocation
+Resource Allocation
+Pricing Optimization
+```
+
+应该考虑：
+
+```text
+Optimization Solver
+```
+
+不是 Agent。
+
+---
+
+### 情况 D：需要人判断
+
+应该：
+
+```text
+Human Task
+```
+
+不是 Agent。
+
+---
+
+### 情况 E：需要阅读非结构化信息、探索多个来源、动态选择工具
+
+才更接近：
 
 ```text
 Agent
-  ↓
-decides:
-  next = "compliance_review"
-  ↓
-Workflow
-  ↓
-execute(next)
 ```
 
-看起来灵活。
-
-但生产环境很快会遇到：
+所以更准确的判断链是：
 
 ```text
-为什么去了这个节点？
-为什么绕过另一个节点？
-这个 transition 是否允许？
-能否静态分析？
-能否做 SoD？
-能否证明一定会审批？
+Path unknown
+      ↓
+Why?
+ ┌────┼─────┬────────┬─────────┐
+ ↓    ↓     ↓        ↓
+Rule  Human  Solver   Open-ended reasoning
+ ↓    ↓     ↓        ↓
+Rules Human Solver   Agent
 ```
 
-更好的结构是：
+这一点非常重要。
+
+否则很容易形成：
+
+> **“凡是规则写不完的地方都塞 Agent。”**
+
+这会把很多本来应该进入业务分析、规则引擎、优化算法和人工流程的问题，错误地交给 LLM。
+
+---
+
+# 4. 第二个核心维度：结果是不是“业务权威结果”
+
+这可能是金融架构里比“路径是否确定”更重要的维度。
+
+假设 Agent 输出：
 
 ```text
-Agent
-   ↓
+“这个客户看起来存在较高风险。”
+```
+
+这只是：
+
+```text
+Recommendation
+```
+
+如果 Agent 输出：
+
+```text
+“建议调查。”
+```
+
+仍然是：
+
+```text
 Proposal
-   ↓
-Workflow validates proposal
-   ↓
-Allowed Transition
-   ↓
-Continue
 ```
 
-OpenAI Agents SDK 的设计可以很好地说明 Agent 层本身的角色：它支持 Agents、Tools、Handoffs、Guardrails，以及 Agent 内部的动态协作；但这些都是一次 Agent Run 内部的 orchestration primitives。SDK 同时明确提供 Human-in-the-loop 和 Tool Guardrails，用来约束 Agent 的工具行为。
+但如果系统根据它直接：
 
-也就是说：
+```text
+冻结账户
+执行交易
+改变客户状态
+转移资金
+批准贷款
+提交监管报告
+```
 
-> **Agent 可以拥有局部自主性，但不应该因此成为企业业务流程的唯一状态机。**
+那么 Agent 已经不只是“思考”。
+
+它正在产生：
+
+```text
+Authoritative Business Side Effect
+```
+
+这时架构要求完全不同。
 
 ---
 
-# 27. DeepAgents 为什么适合“问题解决”，而不是天然适合“业务流程”
+# 5. 一个非常有用的二维模型
 
-DeepAgents 的设计目标非常明确：
-
-```text
-planning
-subagents
-filesystem
-memory
-context management
-HITL
-```
-
-它解决的是：
-
-> 给 Agent 一个复杂目标，让它自己拆任务、管理上下文、调用工具、生成中间结果，并不断调整计划。
-
-例如：
+可以把整个选型问题放在两个轴上：
 
 ```text
-“研究某家公司的信用风险。”
+X 轴：运行时决策自由度
+     低 -------------------- 高
+
+Y 轴：业务副作用 / 控制要求
+     低
+     |
+     |
+     高
 ```
 
-Agent 可以：
+得到：
 
 ```text
-查公司资料
-查 filings
-查新闻
-查市场数据
-比较历史
-让 specialist 做分析
-汇总
-自我检查
+                         高业务控制要求
+                               ↑
+                               │
+                Hybrid         │       Workflow
+                               │
+                               │
+                               │
+ Agent / Knowledge Work         │       Rules / Code
+                               │
+                               └────────────────────→
+                                  高运行时自由度
 ```
 
-这非常适合 DeepAgents 类框架。
-
-但如果问题是：
-
-```text
-客户提交贷款申请
-→ KYC
-→ Sanctions
-→ Credit
-→ Approval
-→ Disbursement
-```
-
-那么 Agent Harness 并不是这个问题的第一抽象。
-
-这是：
-
-```text
-Business Process
-```
-
-不是：
-
-```text
-Open-ended Problem Solving
-```
-
----
-
-# 28. Agent 自己规划和 Workflow 预先规划是两个完全不同的“Planning”
-
-两者经常都叫 Planning，所以容易混淆。
-
-## Workflow Planning
-
-```text
-业务专家在系统上线以前定义：
-
-A → B → C → D
-```
-
-这是：
-
-```text
-Design-time planning
-```
-
----
-
-## Agent Planning
-
-```text
-运行时：
-
-Goal
-→ 当前情况
-→ Agent 认为先做 A
-→ A 结果
-→ 决定 B
-→ B 结果
-→ 改成 C
-```
-
-这是：
-
-```text
-Run-time planning
-```
-
-这两个 planning 并不冲突。
-
-实际上成熟系统经常是：
-
-```text
-Design-time:
-Workflow defines boundary
-
-Run-time:
-Agent plans inside boundary
-```
-
----
-
-# 29. Google 对 Agentic Architecture 的研究也支持这个划分
-
-Google Cloud 的 Agent Architecture 文档明确把 deterministic workflows 与 agentic patterns 区分开：
-
-> deterministic workflow：步骤和路径预先知道；
-
-而 Agent patterns 更适合：
-
-```text
-dynamic planning
-tool selection
-runtime adaptation
-```
-
-。
-
-Google Research 对 Agent 系统的大规模实验也强调，真正 agentic 的任务具有：
-
-```text
-持续多步骤交互
-+
-部分可观测环境
-+
-根据反馈调整策略
-```
-
-而在需要严格 sequential reasoning 的任务中，多 Agent 协作反而可能显著降低性能。
-
-这说明：
-
-> **“更多 Agent”不等于“更智能”。**
-
-对于本来就可以定义好的顺序，再增加 Agent 层可能只是增加通信、状态和失败面。
-
----
-
-# 30. 这也是为什么“把整个 Workflow Agent 化”往往不是好架构
-
-假设原本：
-
-```text
-A → B → C → D
-```
-
-全部确定。
-
-为了“AI-native”，改成：
-
-```text
-Agent
- ↓
-“Decide what to do”
- ↓
-A
- ↓
-Agent
- ↓
-“Decide what next”
- ↓
-B
- ↓
-Agent
- ↓
-...
-```
-
-得到的主要不是更多智能，而是：
-
-```text
-更多 token
-更多 latency
-更多 variance
-更多 evaluation
-更多 observability
-更多 failure modes
-更多 governance difficulty
-```
-
-已有研究也指出，agentic system 会面临 non-determinism、长链路错误传播、工具协调开销和可重复性问题。
-
-因此：
-
-> **已经能写成明确流程的部分，不应该为了使用 Agent 而 Agent 化。**
-
----
-
-# 31. 反过来，“把开放问题硬编码成 Workflow”也一样错误
-
-例如：
-
-```text
-Research
-A → Search Website 1
-B → Search Website 2
-C → Search Website 3
-D → Read PDF
-E → Compare
-F → Produce Report
-```
-
-表面上很确定。
-
-但现实中：
-
-```text
-某网站没有信息
-PDF 结构不同
-数据不足
-需要寻找另一来源
-发现矛盾
-需要补充搜索
-问题出现新的方向
-```
-
-于是 Workflow 很快变成：
-
-```text
-if A
-  if B
-    if C
-       if D
-          ...
-```
-
-最终产生大量：
-
-```text
-exception branch
-special cases
-manual override
-ad-hoc routing
-```
-
-这说明：
-
-> **当业务问题本身具有探索性时，过度 Workflow 化也会导致系统失去灵活性。**
-
----
-
-# 32. 一个非常实用的判断：看“例外”在哪里
-
-这可能是实际架构设计中最好用的指标之一。
-
-假设：
-
-```text
-1000 个 Case
-```
-
-绝大多数：
-
-```text
-A → B → C → D
-```
-
-但：
-
-```text
-50 个
-```
-
-需要：
-
-```text
-额外判断
-额外检索
-重新规划
-```
-
-那么：
-
-```text
-Workflow
-  ↓
-Agent Exception Handler
-```
-
-通常合理。
-
-如果：
-
-```text
-1000 个 Case
-```
-
-每一个都可能：
-
-```text
-路径完全不同
-```
-
-那么 Workflow 就可能变成：
-
-```text
-一个非常大的 if / else tree
-```
-
-此时 Agent 更有意义。
-
-所以可以问：
-
-> **流程图的“控制流熵”高不高？**
-
-低：
-
-```text
-多数实例遵循同一条路径
-```
-
-→ Workflow。
-
-高：
-
-```text
-每个实例经常产生完全不同的行动序列
-```
-
-→ Agent 或 Hybrid。
-
-这里的“控制流熵”是一个架构分析概念，不是一个需要计算精确 Shannon entropy 的硬指标。
-
----
-
-# 33. 可以进一步定义一个“Agent 值得存在”的条件
-
-Agent 最有价值的地方通常是：
-
-```text
-输入不完整
-+
-信息来源多
-+
-语义复杂
-+
-执行路径未知
-+
-需要迭代探索
-+
-人的目标可以用自然语言表达
-```
-
-例如：
-
-```text
-Investigate suspicious customer activity
-```
-
-这个目标非常真实。
-
-但它没有天然对应：
-
-```text
-A → B → C → D
-```
-
-Agent 可以负责：
-
-```text
-先看客户画像
-→
-发现异常交易
-→
-查相关新闻
-→
-查历史投诉
-→
-检查 KYC
-→
-形成 investigation summary
-```
-
-然后把结果交给：
-
-```text
-Workflow
-```
-
-决定是否：
-
-```text
-Freeze
-Escalate
-Review
-Close
-```
-
----
-
-# 34. 金融领域可以把业务大致分成四类
-
-## 第一类：交易执行型
-
-例如：
-
-```text
-Payment
-Settlement
-Transfer
-Trade Booking
-Corporate Action
-```
-
-特点：
-
-```text
-状态明确
-副作用强
-权限严格
-SLA 明确
-审计要求高
-```
-
-核心：
-
-```text
-Workflow
-+
-Policy
-+
-Deterministic Rules
-```
-
-Agent 通常作为辅助分析节点。
-
----
-
-## 第二类：规则审批型
-
-例如：
-
-```text
-Credit Approval
-Account Opening
-KYC
-AML Case
-Limit Approval
-Exception Approval
-```
-
-特点：
-
-```text
-业务规则明确
-但资料理解可能复杂
-人工审批常见
-```
-
-核心：
-
-```text
-Workflow
-+
-Decision Service
-+
-Agent
-+
-Human
-```
-
----
-
-## 第三类：调查分析型
+更准确地说：
+
+| 运行时自由度 | 业务影响 | 主体架构                                 |
+| ------ | ---- | ------------------------------------ |
+| 低      | 低    | Code / Rules / 普通 LLM Call           |
+| 低      | 高    | Workflow + Rules / Policy            |
+| 高      | 低    | Agent                                |
+| 高      | 高    | Workflow + Agent + Policy/Human Gate |
+
+第四象限才是金融服务最值得讨论的地方。
 
 例如：
 
 ```text
 Fraud Investigation
-Research
-Compliance Investigation
-Client Due Diligence
-Document Review
-Root Cause Analysis
 ```
 
-特点：
+需要 Agent：
 
 ```text
-信息异构
-步骤动态
-需要探索
+高认知自由度
 ```
 
-核心：
+但最终：
 
 ```text
-Agent
-+
-Workflow Boundary
+Freeze Account
 ```
 
----
+属于高影响动作。
 
-## 第四类：知识工作型
-
-例如：
-
-```text
-Policy Q&A
-Research Assistant
-Customer Support
-Employee Copilot
-Document Summarization
-```
-
-特点：
-
-```text
-低副作用
-信息密集
-交互性高
-```
-
-核心：
+所以应该：
 
 ```text
 Agent
-```
-
-但如果 Agent 开始执行：
-
-```text
-change account
-submit payment
-approve trade
-```
-
-就应该重新回到 Workflow / Policy 控制域。
-
----
-
-# 35. 决策树再进一步：什么时候甚至不需要 Agent
-
-这是一个经常被忽略的第三选项。
-
-例如：
-
-```text
-Calculate fee
-Transform file
-Validate schema
-Map fields
-Route based on fixed rule
-Move data
-Call three APIs sequentially
-```
-
-不要因为系统里“有 AI”就加入：
-
-```text
-Agent
-```
-
-可以直接：
-
-```text
-Code
-Rule Engine
-Decision Table
+ ↓
+Evidence / Proposal
+ ↓
+Policy
+ ↓
 Workflow
-ETL
-```
-
-Google Cloud 也明确建议，对确定性问题优先考虑传统方法，而不是为了 agentic architecture 引入不必要的复杂度。
-
-因此真正的选择其实是：
-
-```text
-                ┌── Code / Rules
-                │
-Business Need ──┼── Workflow
-                │
-                ├── Agent
-                │
-                └── Hybrid
+ ↓
+Human / Authorization
+ ↓
+Business Command
 ```
 
 而不是：
 
 ```text
-Workflow vs Agent
+Agent
+ ↓
+Freeze Account
 ```
 
 ---
 
-# 36. 一个更完整的 Enterprise Decision Tree
+# 6. 这也是为什么“Workflow 外层，Agent 内部”很常见
 
-可以作为 Architecture Review 的标准模板：
-
-```mermaid
-flowchart TD
-
-    A[业务需求]
-
-    A --> B{是否可以写出明确的完成条件?}
-    B -->|否| C[先定义业务问题]
-    B -->|是| D{关键状态和业务路径能否预先定义?}
-
-    D -->|是| E{是否存在长期状态 / SLA / Approval / Audit?}
-    D -->|否| F{需要运行时探索、检索、推理或规划?}
-
-    E -->|是| G[Workflow]
-    E -->|否| H{是否只是简单确定性自动化?}
-
-    H -->|是| I[Code / Rule / Pipeline]
-    H -->|否| G
-
-    F -->|否| J[Decision Service / Rules / Human]
-    F -->|是| K{是否涉及高影响或不可逆动作?}
-
-    K -->|否| L[Agent]
-    K -->|是| M{能否把 Agent 限制为认知任务?}
-
-    M -->|是| N[Hybrid]
-    M -->|否| O[增加 Policy / Approval / Control Boundary]
-
-    N --> P{Agent 输出是否必须进入确定性验证?}
-    P -->|是| Q[Agent → Validation → Workflow]
-    P -->|否| R[Agent with bounded tools]
-
-    G --> S{流程内部是否有大量非结构化认知工作?}
-    S -->|是| Q
-    S -->|否| G
-```
-
----
-
-# 37. 这棵树可以进一步压缩成一句话
-
-> **如果你能在架构设计阶段画出稳定的状态机，就先用 Workflow；如果你能定义目标但不能稳定定义达到目标的步骤，再考虑 Agent；如果两者同时存在，就做 Hybrid。**
-
-这比：
-
-```text
-“Agent 更先进”
-```
-
-或者：
-
-```text
-“Workflow 更可靠”
-```
-
-更有实际意义。
-
----
-
-# 38. 金融领域最推荐的默认架构
-
-如果没有特别理由，金融企业可以把默认架构设计成：
+在金融场景中，可以把架构拆成：
 
 ```mermaid
 flowchart TB
 
-    U[User / Event]
+    W[Workflow]
 
-    U --> W[Workflow Control Plane]
+    W --> P[Policy / Decision Service]
+    W --> A[Agent Task]
+    W --> H[Human Task]
+    W --> C[Business Command]
 
-    W --> P[Policy / Authorization]
+    A --> R[Retrieval]
+    A --> T[Tools]
+    A --> S[Subagents]
 
-    P --> A[Agent Task]
+    A --> V[Structured Result]
 
-    A --> V[Deterministic Validation]
+    V --> P
+    P --> H
+    H --> C
+    P --> C
 
-    V --> P2[Policy Decision]
-
-    P2 --> H[Human Approval]
-
-    H --> X[Business Action]
-
-    X --> R[Reconciliation]
-
-    R --> W
-
-    W --> E[Audit / Evidence]
+    C --> D[Domain System]
 ```
 
 这里：
@@ -2044,14 +566,13 @@ flowchart TB
 负责：
 
 ```text
-Business State
-Transition
+状态
+过程
 SLA
+等待
+审批
+升级
 Retry
-Timeout
-Human Task
-Approval
-Escalation
 Compensation
 Reconciliation
 ```
@@ -2061,946 +582,2117 @@ Reconciliation
 负责：
 
 ```text
-Understand
-Search
-Summarize
-Classify
-Investigate
-Plan bounded work
-Generate recommendation
-Extract facts
+理解
+检索
+调查
+分类
+总结
+规划
+建议
 ```
 
-### Policy
+### Policy / Decision Service
 
 负责：
 
 ```text
-Authorization
-Limit
+规则
+权限
+阈值
+Eligibility
 SoD
-Mandatory approval
-Allowed actions
-Data entitlement
+Limit
+Mandatory Controls
 ```
 
-### Business System
+### Domain System
 
 负责：
 
 ```text
-System of Record
+真正的业务事实
+真正的业务副作用
 ```
 
-### Audit
+### Human
 
 负责：
 
 ```text
-Evidence
+必须由组织成员承担的判断和授权
 ```
+
+这比简单说：
+
+```text
+Workflow = deterministic
+Agent = non-deterministic
+```
+
+更加完整。
 
 ---
 
-# 39. Agent 不应该成为 Data / Authorization Boundary
+# 7. 一个重要修正：Durable 并不是 Workflow 与 Agent 的分界线
+
+旧版本有一些地方容易让人理解成：
+
+```text
+Long-running
+→ Workflow
+
+Short-running
+→ Agent
+```
+
+这个判断不成立。
+
+现在 Agent Runtime 本身也可以持久化和恢复。
+
+例如 OpenAI Agents SDK 当前已经支持：
+
+```text
+RunState
+pause / resume
+Human-in-the-loop
+sessions
+durable execution integrations
+```
+
+并且官方提供与 Temporal、Dapr、Restate、DBOS 的 durable execution 集成。
+
+因此不能说：
+
+> Agent 不适合长期运行。
+
+更准确的是：
+
+> **Agent 可以拥有自己的 durable execution，但这不等于 Agent Runtime 就应该成为企业业务过程的唯一控制平面。**
+
+这是两个不同的问题。
 
 例如：
 
 ```text
-Agent:
-“我要查这个客户所有资料。”
+Agent Run
 ```
 
-Agent 不应该自己决定：
+可以持续三天。
+
+但：
 
 ```text
-这个用户有权限吗？
-能看到哪些数据？
-是否允许跨客户查询？
+Business Case
 ```
 
-它应该得到：
+仍然可以由 Workflow 控制：
 
 ```text
-Allowed Tools
-Allowed Data
-Allowed Scope
+Case Created
+ ↓
+Agent Investigation
+ ↓
+Human Review
+ ↓
+Policy Decision
+ ↓
+Execute
+```
+
+所以：
+
+```text
+Durability
+≠
+Business Process Ownership
+```
+
+这是非常重要的架构边界。
+
+---
+
+# 8. 另一个修正：Workflow 也不等于完全确定性
+
+Workflow 本身可以包含：
+
+```text
+Dynamic Event
+Human Decision
+External Data
+Agent Node
+Dynamic Branch
+```
+
+Google 当前的 Agent Architecture 指南甚至把：
+
+```text
+deterministic sequential pattern
++
+dynamic orchestration pattern
+```
+
+都放在 agentic workflow 的范围内，并明确区分“流程固定”与“模型负责动态 orchestration”。
+
+所以更准确的定义是：
+
+> **Workflow 是过程控制模型。**
+
+它可以包含：
+
+```text
+deterministic
+human-driven
+event-driven
+agentic
+```
+
+多个节点类型。
+
+同理：
+
+> **Agent 是运行时推理模型。**
+
+它可以被：
+
+```text
+Workflow
+Application
+Interactive UI
+Another Agent
+```
+
+调用。
+
+因此：
+
+```text
+Workflow ≠ deterministic code only
+Agent ≠ entire application
+```
+
+---
+
+# 9. 决策树应该重新设计
+
+真正可用的 Decision Tree 应该是：
+
+```mermaid
+flowchart TD
+
+    A[业务需求]
+    
+    A --> B{目标和完成条件是否明确?}
+
+    B -->|否| C[先澄清业务需求]
+    B -->|是| D{核心问题是否可以用确定性代码/规则/Decision Service解决?}
+
+    D -->|是| E[Code / Rules / Decision Service]
+    D -->|否| F{是否需要一个跨步骤、跨系统、可持久化的业务过程?}
+
+    F -->|否| G{是否需要运行时探索、检索、推理或动态规划?}
+
+    G -->|否| H[普通 LLM Call / API / Human]
+    G -->|是| I{输出主要是信息/建议，还是会改变业务状态?}
+
+    F -->|是| I
+
+    I -->|信息 / 建议| J[Agent]
+    I -->|业务状态 / 副作用| K{业务路径和控制要求是否可以由 Workflow / Policy 定义?}
+
+    K -->|是| L[Workflow + Agent + Policy]
+    K -->|否| M{是否必须由人承担最终判断?}
+
+    M -->|是| N[Workflow + Agent + Human]
+    M -->|否| O[Agent Proposal + 强约束 Command / Policy Boundary]
+
+    L --> P[Business Command]
+    N --> P
+    O --> P
+
+    P --> Q[Domain System / System of Record]
+```
+
+这棵树和原版本最大的不同是：
+
+> **“路径未知”不是终点，而是重新问一层：未知是因为规则不足、人类判断、数学优化，还是开放式认知任务。**
+
+只有最后一种才自然进入 Agent。
+
+---
+
+# 10. 再压缩成十个架构问题
+
+实际 Architecture Review 不需要讨论几十个问题。
+
+先问下面十个：
+
+### 1. 最终目标是什么？
+
+不是：
+
+```text
+“我们想做一个 Agent。”
+```
+
+而是：
+
+```text
+“业务到底想完成什么？”
+```
+
+---
+
+### 2. 成功条件是什么？
+
+能不能定义：
+
+```text
+Done
+```
+
+如果连完成条件都说不清，先不要选技术。
+
+---
+
+### 3. 下一步能不能在设计时定义？
+
+```text
+能
+→ Workflow / Rules
+
+不能
+→ 继续判断为什么
+```
+
+---
+
+### 4. 如果不能，是因为需要理解非结构化信息吗？
+
+例如：
+
+```text
+PDF
+Email
+Contract
+Research
+Natural Language
+Cross-document Evidence
+```
+
+是：
+
+```text
+Agent
+```
+
+的重要候选。
+
+---
+
+### 5. 是因为规则特别复杂吗？
+
+如果是：
+
+```text
+DMN
+Rules Engine
+Decision Service
+Optimization
+```
+
+应该优先考虑。
+
+---
+
+### 6. 是不是需要探索？
+
+例如：
+
+```text
+“找出为什么这个客户风险发生变化。”
+```
+
+这种 open-ended investigation 很适合 Agent。
+
+---
+
+### 7. Agent 的输出只是建议，还是会改变业务状态？
+
+这是关键分界：
+
+```text
+Recommendation
+    → Agent 可以拥有更高自由度
+
+Authoritative Business Decision
+    → Policy / Workflow / Human 必须介入
+```
+
+---
+
+### 8. 是否存在高影响、不可逆副作用？
+
+例如：
+
+```text
+付款
+交易
+账户变更
+资产转移
+额度调整
+客户状态冻结
+监管申报
+```
+
+只要存在，就需要显著强化：
+
+```text
+Authorization
+Policy
+Idempotency
+Approval
+Audit
+Reconciliation
+```
+
+---
+
+### 9. 是否需要长期业务状态？
+
+如果是：
+
+```text
+等待客户
+等待审批
+等待外部系统
+SLA
+Escalation
+Compensation
+Reconciliation
+```
+
+Workflow 的价值会明显增加。
+
+但注意：
+
+> 这不能单独证明“不能用 Agent”。
+
+Agent 可以嵌入其中。
+
+---
+
+### 10. 谁拥有最终控制权？
+
+这是最终问题：
+
+```text
+Agent
+Workflow
+Policy
+Human
+```
+
+谁可以决定：
+
+```text
+“现在真的允许发生这个业务动作吗？”
+```
+
+金融系统里，这个问题往往比：
+
+```text
+“模型有多聪明？”
+```
+
+重要得多。
+
+---
+
+# 11. 四种典型架构模式
+
+根据上面的决策树，最终通常会落到四种模式。
+
+## 模式 A：Deterministic Automation
+
+```text
+Code
+ ↓
+Rule
+ ↓
+API
+ ↓
+Result
+```
+
+适合：
+
+```text
+Fee Calculation
+Data Transformation
+Fixed Validation
+Fixed Routing
+ETL
+Batch
+```
+
+不要引入 Workflow，更不要 Agent，除非确实需要它们额外提供的能力。
+
+---
+
+## 模式 B：Business Workflow
+
+```text
+Event
+ ↓
+Workflow
+ ↓
+Rule
+ ↓
+Human
+ ↓
+Command
+```
+
+适合：
+
+```text
+KYC
+Payment
+Settlement
+Account Opening
+Regulatory Process
+Approval
+Claims
+```
+
+核心特点：
+
+```text
+过程明确
+状态重要
+控制重要
+```
+
+---
+
+## 模式 C：Knowledge Agent
+
+```text
+Goal
+ ↓
+Agent
+ ├── Search
+ ├── Retrieve
+ ├── Tool
+ ├── Reason
+ └── Synthesize
+ ↓
+Answer / Recommendation
+```
+
+适合：
+
+```text
+Research
+Investigation
+Document Analysis
+Policy Q&A
+Knowledge Assistant
+Root Cause Analysis
+```
+
+输出通常是：
+
+```text
+Information
+Evidence
+Recommendation
+Draft
+```
+
+而不是直接修改权威业务状态。
+
+---
+
+## 模式 D：Controlled Hybrid
+
+```text
+Workflow
+   ↓
+Agent
+   ↓
+Evidence / Proposal
+   ↓
+Policy
+   ↓
+Human / Authorization
+   ↓
+Command
+   ↓
+Business System
+```
+
+这是金融服务里最重要的一类。
+
+典型：
+
+```text
+Fraud Investigation
+Credit Review
+Complex Complaint
+Exception Handling
+Client Due Diligence
+Trade Research + Approval
+```
+
+---
+
+# 12. 金融服务中，哪些业务明显偏 Workflow
+
+## KYC / Account Opening
+
+典型过程：
+
+```text
+Application
+ ↓
+Identity
+ ↓
+Sanctions
+ ↓
+Risk
+ ↓
+Document
+ ↓
+Review
+ ↓
+Approval
+ ↓
+Open Account
+```
+
+路径、角色、期限、监管要求、人工节点都可以被明确建模。
+
+Jyske Bank 的案例就是这种模式：流程包含多个阶段、客户信息收集、截止时间、升级、人工任务和周期性重新 KYC。
+
+---
+
+## Payment / Settlement
+
+例如：
+
+```text
+Receive
+ ↓
+Validate
+ ↓
+Risk
+ ↓
+Authorize
+ ↓
+Submit
+ ↓
+Confirm
+ ↓
+Reconcile
+```
+
+这里：
+
+```text
+Retry
+Timeout
+Idempotency
+Authorization
+Reconciliation
+```
+
+都比“让 Agent 决定下一步”重要。
+
+---
+
+## High-volume Straight-through Processing
+
+Capital One 的 check processing 很典型。
+
+它使用 Step Functions Distributed Map 将处理并行化，公开案例称整体处理时间降低约 75–80%，并可以同时运行大量 Workflow；遇到需要人工处理的支票，再进入对应的人工路径。
+
+这个案例说明：
+
+> **大量分支、复杂并发、人工例外，并不意味着需要 Agent。**
+
+它仍然可以是纯 Workflow。
+
+---
+
+# 13. 金融服务中，哪些业务明显偏 Agent
+
+## Financial Research
+
+Deutsche Bank 的 DB Lumina 是非常典型的案例。
+
+研究工作需要：
+
+```text
+Financial Statements
+Regulatory Filings
+Industry Reports
+Past Research
+External Information
+```
+
+然后由研究人员进行：
+
+```text
+Search
+Read
+Compare
+Synthesize
+Model
+Identify Patterns
+Form Insights
+```
+
+DB Lumina 被定位为 AI-powered research agent，用于帮助研究分析师自动化数据分析和研究工作，同时保留适用于金融机构的隐私和治理要求。
+
+这里显然不是：
+
+```text
+A → B → C → D
+```
+
+的问题。
+
+而是：
+
+```text
+Goal → Investigation → Insight
+```
+
+因此 Agent 很合适。
+
+---
+
+# 14. Mortgage / Customer Knowledge Work
+
+Mr. Cooper 的 CIERA 是另一个代表性案例。
+
+客户问：
+
+```text
+“为什么 escrow payment 增加了？”
+```
+
+系统需要理解：
+
+```text
+客户问题
++
+历史数据
++
+文件
++
+计算结果
+```
+
+再把任务拆成多个 Agent 子任务。
+
+Google Cloud 的案例明确描述了 CIERA 使用多个具有不同职责的 Agent，并强调它的目标是支持人类客服，让人类把更多精力放在 empathy、judgment 和 customer connection 上。
+
+这是：
+
+```text
+Agent = cognitive work
+Human = judgment / interaction
+```
+
+而不是：
+
+```text
+Agent = entire mortgage process
+```
+
+---
+
+# 15. Fraud Investigation 是最典型的 Hybrid
+
+Fraud Investigation 同时包含：
+
+```text
+确定性部分
++
+探索性部分
+```
+
+确定性：
+
+```text
+Alert Created
+ ↓
+Case Created
+ ↓
+Assignment
+ ↓
+SLA
+ ↓
+Review
+ ↓
+Close
+```
+
+探索性：
+
+```text
+到底哪里异常？
+还有哪些交易相关？
+应该查哪些客户关系？
+哪些外部资料值得看？
+有没有其它关联账户？
+```
+
+因此：
+
+```mermaid
+flowchart LR
+
+    A[Fraud Case Workflow]
+    B[Investigation Agent]
+    C[Evidence]
+    D[Policy]
+    E[Human]
+    F[Business Action]
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+```
+
+这是典型 Hybrid。
+
+---
+
+# 16. Credit Approval 同样不是“Workflow or Agent”
+
+信用审批可以拆成：
+
+```text
+Workflow
+    ├── Application
+    ├── KYC
+    ├── Data Collection
+    ├── Approval
+    └── Disbursement
+
+Decision Service
+    ├── Eligibility
+    ├── Limits
+    └── Policy
+
+Agent
+    ├── Document Interpretation
+    ├── Income Explanation
+    ├── Missing Information
+    └── Underwriter Summary
+
+Human
+    └── Exception / Approval
+```
+
+这里最容易犯的错误就是：
+
+> “Credit Approval 很复杂，所以用一个 Credit Agent。”
+
+这样做会把：
+
+```text
+Document understanding
+Risk analysis
+Policy decision
+Authorization
+Business command
+```
+
+全部塞进一个运行时黑盒。
+
+更好的架构是把它们拆开。
+
+---
+
+# 17. Goldman Sachs 的案例说明“复杂业务过程”并不自动变成 Agent
+
+Goldman Sachs 的公开案例显示，其集中式 Camunda Workflow 平台已经被用于：
+
+```text
+Payment Processing
+Client Billing
+Microservices Automation
+Decision Services
+```
+
+公开数据包括 15+ internal teams、约 60K annual unique users，以及约 6M tasks/week。
+
+这里最大的启示不是：
+
+> Camunda 比 Agent 好。
+
+而是：
+
+> **金融企业可能拥有非常复杂、非常大规模、非常跨团队的业务过程，同时仍然需要确定性的 Process Orchestration。**
+
+---
+
+# 18. BNY Mellon 进一步说明规模本身不是 Agent 的理由
+
+BNY Mellon 的公开案例描述了：
+
+```text
+70+ Camunda projects
+100M+ individual process instances
+```
+
+覆盖：
+
+```text
+Investment Operations
+Compliance Workflows
+Client Reporting
+```
+
+。
+
+因此：
+
+```text
+大规模
++
+复杂
++
+跨团队
++
+多系统
+```
+
+依然可以是 Workflow 问题。
+
+真正的问题还是：
+
+```text
+Process control
+```
+
+而不是：
+
+```text
+How many nodes?
+```
+
+---
+
+# 19. OneMain Financial 是一个很好的“高风险 + Workflow”案例
+
+OneMain Financial 的 OneFor(ensics) 使用 Step Functions 编排安全取证：
+
+```text
+Alert
+ ↓
+Validate
+ ↓
+Authorize
+ ↓
+Snapshot
+ ↓
+Analyze
+ ↓
+Report
+```
+
+尤其关键的是：
+
+```text
+Snapshot
+```
+
+之前存在明确的 authorized-person approval。
+
+AWS 公布的数据称，从告警到调查的时间下降了 97.5%。
+
+这个案例说明：
+
+> **即使业务本身包含“分析”和“调查”，只要关键控制点可以预先定义，Workflow 仍然是非常自然的控制层。**
+
+---
+
+# 20. Nequi 是最值得研究的反例
+
+Nequi 的案例特别有价值，因为它没有选择：
+
+```text
+All Workflow
+```
+
+也没有选择：
+
+```text
+All Agent
+```
+
+而是明确将：
+
+```text
+Multi-agent system
++
+Deterministic flows
++
+Collection strategies
+```
+
+组合使用。
+
+AWS 的公开案例描述其用这种组合方式支持 credit management，并称 80% 的 overdue portfolio 可以在内部数字化处理。
+
+因此：
+
+> **真实系统更可能是“确定性过程 + 动态认知”，而不是单一编程模型。**
+
+---
+
+# 21. PitCrew 进一步说明“Agent 也需要外部控制”
+
+PitCrew 的 AWS 案例非常接近我们今天真正想建设的金融 Agent Platform。
+
+其架构包含：
+
+```text
+AI Agents
++
+Integrations
++
+Customer-specific Controls
++
+Automated Reasoning
+```
+
+并明确把这些能力放进金融服务 Workflows。
+
+例如 Form ADV Review Agent：
+
+```text
+Document
+ ↓
+LLM Extraction
+ ↓
+Claims
+ ↓
+Automated Reasoning
+ ↓
+Policy Validation
+ ↓
+Ready to File / Correction
+```
+
+AWS 的案例说明其使用 Automated Reasoning 将业务规则转成逻辑约束，对 Agent 产生的判断进行验证。
+
+这是非常值得借鉴的结构：
+
+```text
+LLM
+    → flexible interpretation
+
+Reasoning / Rules
+    → deterministic validation
+
+Workflow
+    → process control
+
+Business System
+    → authoritative action
+```
+
+---
+
+# 22. 当前业界其实越来越接近“Deterministic + Agentic”而不是二选一
+
+Camunda 2026 年的 Agentic Orchestration 材料直接把两者定义为：
+
+```text
+deterministic orchestration
++
+dynamic AI reasoning
+```
+
+并提出让 Agent 作为受控的 process participant，而不是成为脱离业务过程的“free agent”。这属于 Camunda 的产品和架构观点，不应当当成行业共识本身，但它与 Google 的 deterministic/dynamic patterns，以及 Nequi 等实际案例呈现出的架构方向是一致的。
+
+更有意思的是，Camunda 自己已经把 AI Agent 建模成 BPMN process 中的 agentic participant，这实际上说明：
+
+> **Workflow Engine 和 Agent Runtime 并不是必然的替代关系。**
+
+它们完全可以成为上下层。
+
+---
+
+# 23. “Agent Outer / Workflow Inner”并非绝对错误
+
+需要避免另一种过度结论。
+
+不能说：
+
+```text
+Agent 永远只能作为 Workflow Node
+```
+
+一些问题确实可以：
+
+```text
+Agent
+    ↓
+Tool / Subagent
+    ↓
+Tool
+    ↓
+Final
+```
+
+直接完成。
+
+例如：
+
+```text
+Research Assistant
+Coding Agent
+Document Investigation
+Internal Knowledge Assistant
+```
+
+如果：
+
+```text
+副作用低
+没有长期业务状态
+不需要复杂审批
+目标是开放式知识任务
+```
+
+Agent 完全可以成为整个应用的主要 Runtime。
+
+Google 当前的 Agent Architecture 指南也明确为开放式、多步骤、工具驱动的问题提供 single-agent、coordinator、hierarchical、swarm 等模式。
+
+所以：
+
+> **“Workflow 外、Agent 内”是金融高影响业务的强默认模式，不是所有 Agent 应用的唯一模式。**
+
+---
+
+# 24. 同理，Workflow 也可以动态调用 Agent
+
+现代 Workflow 不应该被理解为：
+
+```text
+只能执行固定 Task
+```
+
+完全可以：
+
+```text
+Workflow
+  ↓
+Agent
+  ↓
+Agent dynamically chooses tools
+  ↓
+Structured Result
+  ↓
+Workflow
+```
+
+Google 的 custom logic pattern 就明确允许把 predefined rules 与 model reasoning 混合在同一个 execution structure 中。
+
+因此成熟的企业 Workflow DSL 应该支持：
+
+```text
+Deterministic Node
+Agent Node
+Human Node
+Decision Node
+External Event
+Timer
+Subworkflow
+```
+
+而不是：
+
+```text
+Workflow = only deterministic APIs
+```
+
+---
+
+# 25. Multi-Agent 也不能成为默认选择
+
+这是当前文章另一个应该收紧的地方。
+
+“复杂问题 → 多 Agent”也过于简单。
+
+Google Research 在 2026 年对 180 种 Agent 配置进行受控评估后发现，多 Agent 在可并行的问题上可能明显提升效果，但在强顺序依赖任务上反而可能下降；研究还指出，多 Agent 的通信与协调成本会随着工具和任务结构增加。
+
+因此：
+
+```text
+复杂
+≠
+Multi-Agent
+```
+
+而应该问：
+
+```text
+任务是否可以自然分解？
+子任务是否相互独立？
+是否值得为并行性付出协调成本？
+```
+
+---
+
+# 26. 对 DeepAgents 一类框架，真正应该问什么
+
+如果考虑 DeepAgents，不应该问：
+
+> “能不能做 Workflow？”
+
+当然可以通过代码、状态、检查点等机制做出 Workflow。
+
+更应该问：
+
+> **“让 Agent 自己规划这部分，是否真的比预定义流程更有价值？”**
+
+例如：
+
+```text
+“调查客户风险”
+```
+
+适合。
+
+因为 Agent 可以：
+
+```text
+search
+→ inspect
+→ compare
+→ discover
+→ search again
+```
+
+但：
+
+```text
+“达到 1M 美元必须 Director Approval”
+```
+
+不需要 Agent。
+
+这是：
+
+```text
+Rule
+```
+
+而：
+
+```text
+“发送批准请求、等待批准、超时升级”
+```
+
+是：
+
+```text
+Workflow
+```
+
+最后：
+
+```text
+“判断哪些材料值得提交给 Director”
+```
+
+可能是：
+
+```text
+Agent
+```
+
+所以真正有价值的是：
+
+```text
+DeepAgents
+    解决认知子问题
+
+Workflow
+    控制业务过程
+
+Decision Service
+    控制业务规则
+```
+
+而不是把三者互相替代。
+
+---
+
+# 27. 金融 Agent 最重要的边界：Proposal 和 Decision
+
+这是整个问题最终应该落到的地方。
+
+例如：
+
+```text
+Agent
+→ “我认为这笔交易应该进入人工 Review。”
+```
+
+这是：
+
+```text
+Proposal
 ```
 
 然后：
 
 ```text
-Agent
-   ↓
-Tool
-   ↓
-Authorization
-   ↓
-Data
+Policy
+→ Review Required
 ```
 
-而不是：
+这是：
 
 ```text
-Agent
-   ↓
-Direct Database
+Business Decision
 ```
 
-这与金融 AI 的治理关注是一致的。FSB 将第三方依赖、数据治理、模型风险和 cyber risk 列为 AI 在金融领域的重要脆弱性；FCA 也持续强调 AI 系统应从整体视角考虑 people、processes、technology、testing 和 governance。
-
----
-
-# 40. Agent 可以选择工具，但 Workflow 决定“能不能用”
-
-例如：
-
-```text
-Agent sees:
-- get_customer
-- search_documents
-- calculate_risk
-- submit_trade
-```
-
-Agent 可以判断：
-
-```text
-“我需要 get_customer”
-“我需要 search_documents”
-```
-
-但不应该因此获得：
-
-```text
-submit_trade
-```
-
-的最终权限。
-
-应该是：
-
-```text
-Agent proposes:
-    submit_trade
-
-Workflow / Policy:
-    Is this transition allowed?
-```
-
-所以：
-
-```text
-Agent chooses within capability set
-Workflow controls business transition
-```
-
----
-
-# 41. Agent 的工具集合也应该有层级
-
-推荐：
-
-```text
-Tier 1 — Read
-    Search
-    Retrieve
-    Query
-
-Tier 2 — Compute
-    Analyze
-    Calculate
-    Transform
-
-Tier 3 — Propose
-    Create Draft
-    Recommend
-    Prepare Transaction
-
-Tier 4 — Commit
-    Submit Trade
-    Transfer Money
-    Change Customer State
-```
-
-通常：
-
-```text
-Tier 1/2
-    → Agent 可以高度自主
-
-Tier 3
-    → Agent + validation
-
-Tier 4
-    → Workflow + Policy + Approval
-```
-
-这不是法律上的统一强制规则，而是一种适合金融企业风险分层的架构模式。
-
----
-
-# 42. 为什么 Agent 最适合“读”和“想”，Workflow 最适合“决定和做”
-
-可以进一步把 Agent 的优势概括为：
-
-```text
-Read
-Understand
-Search
-Compare
-Reason
-Suggest
-Plan
-```
-
-Workflow 的优势则是：
-
-```text
-Decide
-Authorize
-Wait
-Commit
-Retry
-Compensate
-Audit
-```
-
-这里的：
-
-```text
-Decide
-```
-
-指的是企业流程状态和控制规则，而不是所有业务判断都必须硬编码。
-
-例如：
-
-```text
-Policy Engine:
-ALLOW / DENY / REVIEW
-```
-
-Agent：
-
-```text
-Recommend / Explain
-```
-
-Workflow：
-
-```text
-根据 Policy Result 转移状态
-```
-
-三者职责清楚。
-
----
-
-# 43. 一个非常重要的金融场景：Credit Approval
-
-考虑一个完整的 Credit Approval：
-
-```text
-Customer Application
-       ↓
-KYC
-       ↓
-Credit Bureau
-       ↓
-Income Documents
-       ↓
-Risk Assessment
-       ↓
-Decision
-       ↓
-Approval
-       ↓
-Offer
-       ↓
-Disbursement
-```
-
-不要问：
-
-> Workflow 还是 Agent？
-
-应该拆：
-
-```text
-Workflow:
-Customer Application
-KYC
-Credit Bureau
-Approval
-Offer
-Disbursement
-
-Rules / Model:
-Credit Score
-Debt Ratio
-Policy Rules
-
-Agent:
-读取复杂收入文件
-解释异常收入
-寻找缺失资料
-总结客户情况
-协助 Underwriter
-
-Human:
-处理例外
-最终审批
-```
-
-这实际上是一种：
-
-```text
-Workflow + Decision Engine + Agent + Human
-```
-
-而不是单一产品可以全部替代。
-
----
-
-# 44. 一个典型的 Fraud Investigation 反过来
-
-Fraud Investigation：
-
-```text
-Alert
- ↓
-Investigate
- ↓
-Collect evidence
- ↓
-Correlate transactions
- ↓
-Search customer history
- ↓
-Check external signals
- ↓
-Form hypothesis
- ↓
-Review
- ↓
-Action
-```
-
-其中：
-
-```text
-Alert
-Review
-Action
-```
-
-很适合 Workflow。
-
-但：
-
-```text
-Collect evidence
-Correlate
-Search
-Form hypothesis
-```
-
-非常适合 Agent。
-
-所以：
-
-```mermaid
-flowchart LR
-
-    W1[Alert Workflow]
-    A[Fraud Investigation Agent]
-    H[Human Review]
-    W2[Action Workflow]
-
-    W1 --> A
-    A --> H
-    H --> W2
-```
-
----
-
-# 45. 客户投诉又是一个非常典型的 Hybrid
-
-例如：
-
-```text
-Customer Complaint
-        ↓
-Classify
-        ↓
-Identify Issue
-        ↓
-Investigate
-        ↓
-Determine Compensation
-        ↓
-Approve
-        ↓
-Respond
-```
-
-可以：
-
-```text
-Workflow:
-Intake
-SLA
-Assignment
-Approval
-Response
-Closure
-```
-
-Agent：
-
-```text
-阅读客户历史
-理解投诉内容
-分析上下文
-寻找相关 policy
-生成 response draft
-```
-
-Policy：
-
-```text
-Compensation limits
-Approval authority
-Regulatory deadline
-```
-
-这个模式比：
-
-```text
-“一个 Agent 负责投诉直到结束”
-```
-
-更容易治理。
-
----
-
-# 46. 实际案例越来越指向这个 Hybrid 模型
-
-Wells Fargo 的案例把 Agent 用在：
-
-```text
-信息发现
-复杂问答
-contract analysis
-post-trade inquiry
-customer service
-```
-
-并明确强调其 AI 部署建立在 governance、accuracy、fairness、transparency、accountability 和 security 上。
-
-Mr. Cooper 的 CIERA 则明确采取：
-
-```text
-AI agents
-+
-human experts
-```
-
-由 Agent 进行任务分解、数据查询、复杂分析，而人类保留最终响应和判断。
-
-Nequi 更直接地将：
-
-```text
-multi-agent system
-+
-deterministic flows
-```
-
-并行组合。
-
-这些实际案例共同指向一个比“Workflow vs Agent”更有价值的架构：
-
-> **Agent 应该嵌入业务过程，而不是天然取代业务过程。**
-
----
-
-# 47. 什么时候应该直接使用 Workflow
-
-可以很明确地给出条件。
-
-满足以下多数条件时：
-
-```text
-业务状态明确
-路径明确
-规则明确
-审批明确
-SLA 明确
-异常模式明确
-需要长期运行
-需要恢复
-需要审计
-需要并发控制
-需要严格权限
-有明确 System of Record
-```
-
-优先：
+然后：
 
 ```text
 Workflow
+→ Create Human Task
 ```
 
-典型：
+这是：
 
 ```text
-KYC
-Account Opening
-Payment
-Settlement
-Trade Processing
-Claims Processing
-Regulatory Reporting
-Exception Approval
+Process Transition
 ```
+
+最后：
+
+```text
+Human
+→ Approve
+```
+
+这是：
+
+```text
+Authorization / Accountability
+```
+
+最终：
+
+```text
+Command
+→ Execute Trade
+```
+
+这是：
+
+```text
+Business Action
+```
+
+五件事情不能混在一起。
 
 ---
 
-# 48. 什么时候应该直接使用 Agent
+# 28. 一个金融 Agent 的推荐执行链
 
-满足以下多数条件时：
+```mermaid
+sequenceDiagram
 
-```text
-目标明确
-路径不明确
-输入多为非结构化信息
-需要自然语言理解
-需要搜索 / retrieval
-需要多步探索
-工具选择依赖上下文
-需要动态规划
-错误恢复依赖环境反馈
+    participant U as User / Event
+    participant W as Workflow
+    participant A as Agent
+    participant P as Policy
+    participant H as Human
+    participant C as Command
+    participant D as Domain System
+    participant E as Audit
+
+    U->>W: Start Case
+
+    W->>A: Analyze / Investigate
+    A-->>W: Proposal + Evidence
+
+    W->>P: Evaluate Policy
+    P-->>W: ALLOW / DENY / REVIEW
+
+    alt REVIEW
+        W->>H: Human Approval
+        H-->>W: APPROVED / REJECTED
+    end
+
+    alt Allowed
+        W->>C: Create Business Command
+        C->>D: Execute
+    end
+
+    W->>E: Record Process + Decision Evidence
 ```
 
-优先：
+这里的关键是：
 
 ```text
 Agent
 ```
 
-典型：
+不会直接替代：
 
 ```text
-Research
-Investigation
-Knowledge Assistant
-Document Analysis
-Customer Support
-Root Cause Analysis
-Policy Q&A
+Policy
+Workflow
+Command
+Audit
 ```
 
 ---
 
-# 49. 什么时候必须考虑 Hybrid
+# 29. “High-risk → Hybrid”也需要再严谨一点
 
-尤其出现以下任何一种：
+不能简单说：
 
 ```text
-Agent 需要执行业务动作
-Agent 需要等待人工
-Agent 需要调用高权限工具
-Agent 输出会影响资金 / 客户 / 监管
-Agent 需要长期运行
-Agent 需要跨系统
-Agent 需要遵守业务 Policy
-Agent 的结果必须形成 Audit Evidence
+高风险
+→ Workflow + Agent
 ```
 
-优先考虑：
+因为：
 
 ```text
-Workflow outer
-Agent inner
+高风险 + 路径确定
+```
+
+可能根本不需要 Agent。
+
+例如：
+
+```text
+Payment > 1M
+→ Director Approval
+```
+
+这是：
+
+```text
+Workflow + Policy
+```
+
+完全可以没有 Agent。
+
+真正应该是：
+
+```text
+高风险
++
+需要开放式认知
+→ Hybrid
+```
+
+例如：
+
+```text
+复杂 Fraud Investigation
+```
+
+才是：
+
+```text
+Agent
++
+Workflow
++
+Policy
++
+Human
+```
+
+这比原来的判断更精确。
+
+---
+
+# 30. 金融领域可以形成四种默认模板
+
+| 业务类型           | 推荐架构                              |
+| -------------- | --------------------------------- |
+| 固定交易处理         | Workflow + Rules                  |
+| 固定流程中的文档理解     | Workflow + Agent                  |
+| 开放式研究 / 调查     | Agent，必要时外包给 Workflow             |
+| 开放式判断 + 高风险副作用 | Workflow + Agent + Policy + Human |
+
+例如：
+
+### Payment
+
+```text
+Workflow
++
+Rules
++
+Command
+```
+
+### KYC
+
+```text
+Workflow
++
+Rules
++
+Agent for documents
++
+Human exception
+```
+
+### Fraud Investigation
+
+```text
+Workflow
++
+Investigation Agent
++
+Policy
++
+Human
+```
+
+### Financial Research
+
+```text
+Agent
++
+RAG
++
+Tools
++
+Citation / Evidence
+```
+
+### Trade Execution Research
+
+```text
+Workflow
++
+Research Agent
++
+Policy
++
+Human Approval
++
+Trade Command
+```
+
+---
+
+# 31. 一个非常重要的反模式：Agent 驱动 Business State
+
+不推荐：
+
+```text
+Agent
+ ↓
+decide()
+ ↓
+nextNode = "executeTrade"
+ ↓
+Workflow
+ ↓
+executeTrade
+```
+
+因为：
+
+```text
+Workflow State
+```
+
+实际上已经被：
+
+```text
+LLM
+```
+
+控制。
+
+更合理：
+
+```text
+Agent
+ ↓
+Proposal
+ ↓
+Allowed Transition Validation
+ ↓
+Workflow
 ```
 
 即：
 
+> **Agent 可以提出下一步，但不能单方面赋予自己下一步的业务权限。**
+
+---
+
+# 32. 另一个反模式：把所有知识工作都变成 Workflow
+
+例如：
+
+```text
+Research Workflow
+ ↓
+Search Bloomberg
+ ↓
+Search SEC
+ ↓
+Search Reuters
+ ↓
+Read PDF
+ ↓
+Search another source
+ ↓
+Compare
+ ↓
+Search again
+```
+
+最终 Workflow DSL 里出现：
+
+```text
+if missing
+if conflict
+if new topic
+if unexpected
+if document unavailable
+if source contradicts
+```
+
+这种系统会逐渐把开放式问题硬编码成一个巨大 State Machine。
+
+这时应该考虑：
+
 ```text
 Workflow
-  ├── Policy
-  ├── Agent
-  ├── Validation
-  ├── Human
-  └── Business Action
-```
-
----
-
-# 50. 什么时候不应该为了“AI Native”而选择 Agent
-
-如果需求是：
-
-```text
-每天 500 万条记录
-按固定规则处理
-失败重试
-月底结算
-最终结果必须一致
-```
-
-那么：
-
-```text
-Agent
-```
-
-通常不是首选。
-
-如果需求是：
-
-```text
-客户输入一句话
-需要理解意图
-从十几个系统找答案
-判断还缺什么
-再决定查什么
-```
-
-那么：
-
-```text
-Agent
-```
-
-非常有价值。
-
-核心不是：
-
-```text
-AI vs non-AI
-```
-
-而是：
-
-```text
-Fixed procedure vs adaptive problem solving
-```
-
----
-
-# 51. 一套可以直接用于 Architecture Review 的评分表
-
-不是为了算分，而是帮助架构师逐项回答问题。
-
-| 问题             | Workflow 倾向 | Agent 倾向        |
-| -------------- | ----------- | --------------- |
-| 路径是否已知         | 强           | 弱               |
-| 状态是否稳定         | 强           | 弱               |
-| SLA / Timer    | 强           | 弱               |
-| 人工审批           | 强           | 可以参与            |
-| 审计             | 强           | 需额外建设           |
-| 规则明确           | 强           | 弱               |
-| 非结构化信息         | 弱           | 强               |
-| 动态规划           | 弱           | 强               |
-| Tool selection | 固定          | 动态              |
-| 多轮探索           | 弱           | 强               |
-| 新问题            | 弱           | 强               |
-| 大量例外           | 可管理         | 强               |
-| 结果可证明          | 强           | 较难              |
-| 输出高度概率化        | 弱           | 强               |
-| 副作用强           | 强           | 受限              |
-| 高度不可逆          | 强           | 需 Control Plane |
-| 长期持久化          | 强           | 需额外 Runtime     |
-
----
-
-# 52. 一个更好的最终架构决策原则
-
-可以把全部内容压缩为四条。
-
-## 规则一：路径已知 → Workflow
-
-```text
-“知道下一步是什么”
-```
-
-这是 Workflow。
-
----
-
-## 规则二：路径未知 → Agent
-
-```text
-“知道目标，但不知道下一步是什么”
-```
-
-这是 Agent。
-
----
-
-## 规则三：路径未知，但动作有风险 → Hybrid
-
-```text
-Agent:
-决定怎么解决
-
-Workflow:
-决定哪些事情允许真正发生
-```
-
----
-
-## 规则四：路径和目标都明确 → Code / Rules / Workflow，不需要 Agent
-
-```text
-不要因为问题里有 AI，就强行引入 Agent。
-```
-
----
-
-# 53. 最值得落地的企业架构模式
-
-对于金融服务领域，我会把推荐架构画成：
-
-```mermaid
-flowchart TB
-
-    subgraph Control["Enterprise Control Plane"]
-        W[Workflow Runtime]
-        P[Policy / Authorization]
-        H[Human Task]
-        A[Audit / Evidence]
-    end
-
-    subgraph Intelligence["Agent Runtime"]
-        AG[Agent / DeepAgents]
-        R[Retrieval]
-        T[Tools]
-        S[Subagents]
-        M[Memory]
-    end
-
-    subgraph Business["Business Systems"]
-        D[Domain Services]
-        DB[System of Record]
-        X[External Providers]
-    end
-
-    W --> P
-    W --> AG
-    AG --> R
-    AG --> T
-    AG --> S
-    AG --> M
-
-    AG --> W
-
-    W --> H
-    H --> W
-
-    W --> D
-    D --> DB
-    D --> X
-
-    W --> A
-    AG --> A
-```
-
-其中：
-
-```text
-Workflow Runtime
-    = business process authority
-
-Agent Runtime
-    = reasoning authority within a bounded task
-
-Policy
-    = authorization / control authority
-
-Business Systems
-    = source of business truth
-
-Audit
-    = evidence
-```
-
----
-
-# 54. 这与当前业界 Agent Runtime 的方向其实是一致的
-
-OpenAI Agents SDK 本身也是把：
-
-```text
-Agent
-Tools
-Handoffs
-Guardrails
-Sessions
-Human-in-the-loop
-Tracing
-```
-
-作为 Agent Runtime primitives，而不是把它描述成一个企业级业务流程引擎。
-
-Guardrails 还专门提供 Tool-level enforcement，可以在工具执行前后进行检查，并在敏感工具调用前要求 approval。
-
-DeepAgents 则进一步强化：
-
-```text
-planning
-subagents
-context
-filesystem
-memory
-HITL
-```
-
-。
-
-这些能力非常适合成为：
-
-```text
-Workflow Node
-```
-
-而不是自动替代：
-
-```text
-Workflow Runtime
-```
-
----
-
-# 55. 一个值得关注的研究趋势：Workflow 与 Agent 正在逐渐融合
-
-近期研究已经出现非常明确的趋势。
-
-2025 年的 Agent Workflow Survey 对 20 多个代表性系统进行了分类，指出 Agent Workflow 正逐渐成为：
-
-```text
-Agent
-+
-Planning
-+
-Multi-Agent Collaboration
-+
-External API
-+
-Specification
-+
-Orchestration
-```
-
-的结合层。
-
-另有研究直接提出 **Blueprint First, Model Second**：先把专家定义的业务程序写成确定性的 execution blueprint，再把 LLM 放进限定的复杂子任务中，而不是让 LLM 自己决定整个执行路径。该研究在 tau-bench 上报告了比其 baseline 更高的结果。这里属于研究论文结果，不应直接外推成所有企业场景都更优，但它很好地验证了一个重要架构思想：**把生成式推理与确定性过程控制解耦。**
-
-2026 年另一项关于个人 Agent 的研究也从软件工程角度提出，临时生成的 agent loop 在高风险场景下可能缺少严格测试、部署和验证，因此提出复用经过工程化、约束和验证的 AI Workflow。
-
-这说明未来架构很可能不是：
-
-```text
-Workflow → obsolete
-```
-
-也不是：
-
-```text
-Agent → everything
-```
-
-而是：
-
-```text
-Deterministic Control
-        +
-Probabilistic Intelligence
-```
-
----
-
-# 56. 最终的 Decision Tree，可以简化成一个架构师真正会问的问题
-
-面对一个新需求，不需要先问：
-
-> “应该用 Camunda 还是 DeepAgents？”
-
-应该依次问：
-
-```text
-1. 业务目标是什么？
-        ↓
-2. 成功条件是什么？
-        ↓
-3. 业务状态是什么？
-        ↓
-4. 能否预先定义合法路径？
-        ↓
-5. 如果能 → Workflow
-        ↓
-6. 如果不能 → 为什么不能？
-        ↓
-7. 是因为信息理解困难？
-        → Agent
-
-8. 是因为规则非常复杂？
-        → Decision Engine / Rules
-
-9. 是因为存在大量未知例外？
-        → Agent
-
-10. Agent 是否要真正执行业务动作？
-        → 如果是，增加 Workflow / Policy Boundary
-
-11. 动作是否高风险、不可逆？
-        → Workflow + Policy + Human
-
-12. Agent 是否只是提供建议 / 分析？
-        → 可以保留较大自主性
-```
-
-最终会得到：
-
-```text
-                 ┌── Code / Rules
-                 │
-                 ├── Workflow
-Business Need ───┤
-                 ├── Agent
-                 │
-                 └── Hybrid
+ ↓
+Research Agent
 ```
 
 而不是：
+
+```text
+Workflow 继续膨胀
+```
+
+---
+
+# 33. 一个很实用的判断指标：变化来自哪里？
+
+可以问：
+
+> **流程变化主要来自业务规则，还是来自问题本身？**
+
+### 如果变化来自业务规则
+
+例如：
+
+```text
+2027 年金额阈值从 1M 改成 2M
+```
+
+用：
+
+```text
+Policy / Decision Service / Workflow Version
+```
+
+---
+
+### 如果变化来自问题本身
+
+例如：
+
+```text
+不同客户的问题完全不同
+不同研究主题需要不同搜索路径
+调查会产生新的调查方向
+```
+
+用：
+
+```text
+Agent
+```
+
+---
+
+### 如果两个都存在
+
+用：
+
+```text
+Workflow + Policy + Agent
+```
+
+---
+
+# 34. 这也是金融服务架构和普通 Agent App 最大的区别
+
+普通 Agent App 常常优化：
+
+```text
+Task completion
+Answer quality
+User experience
+```
+
+金融业务还必须优化：
+
+```text
+State correctness
+Authorization
+Policy compliance
+Evidence
+Recoverability
+Reconciliation
+Operational resilience
+```
+
+FSB 在 2025 年关于金融行业 AI 的监测报告继续把第三方依赖、数据、网络风险、模型风险和治理挑战列为重要脆弱性来源。
+
+BIS 在 2026 年 9 月的最新讲话也明确指出，AI 在金融领域的采用已经涉及 fraud detection、creditworthiness、compliance、customer service 和 risk management，同时监管需要同时考虑技术治理与 operational resilience。
+
+因此金融 Agent 架构天然不能只讨论：
+
+```text
+“Agent 能不能完成任务？”
+```
+
+还要讨论：
+
+```text
+“谁控制最终状态？”
+```
+
+---
+
+# 35. 最终架构可以归结为五个角色
+
+如果要建设企业级金融 Agent Platform，可以把角色固定成：
+
+```text
+                    ┌──────────────┐
+                    │   Workflow   │
+                    │ Process State │
+                    └──────┬───────┘
+                           │
+             ┌─────────────┼─────────────┐
+             ↓             ↓             ↓
+        ┌─────────┐   ┌─────────┐   ┌─────────┐
+        │ Policy  │   │  Agent  │   │ Human  │
+        │ Control │   │Reasoning│   │Judgment│
+        └─────────┘   └─────────┘   └─────────┘
+             │             │             │
+             └─────────────┼─────────────┘
+                           ↓
+                    ┌─────────────┐
+                    │   Command   │
+                    │ Business    │
+                    │   Action     │
+                    └──────┬──────┘
+                           ↓
+                    ┌─────────────┐
+                    │ Domain/SOR  │
+                    └─────────────┘
+```
+
+分别负责：
+
+```text
+Workflow
+= 过程
+
+Policy
+= 允许不允许
+
+Agent
+= 怎么理解、怎么调查、怎么规划
+
+Human
+= 什么情况下必须由人判断
+
+Command / Domain
+= 真正改变业务事实
+```
+
+这比：
 
 ```text
 Workflow vs Agent
 ```
 
+这个二元模型更准确。
+
 ---
 
-# 57. 最终结论
+# 36. 最终 Decision Tree
 
-从业界实际案例来看，金融服务领域并没有出现一个“Agent 全面替代 Workflow”的架构趋势。
+如果只保留一张图，我建议使用这一版：
 
-相反，公开案例呈现出三个非常清楚的事实。
+```mermaid
+flowchart TD
 
-第一，**核心业务流程仍然高度依赖确定性 Process Orchestration。**
+    A[业务需求]
+    
+    A --> B{目标和完成条件明确?}
 
-Goldman Sachs 使用 Camunda 支撑支付、billing、microservices automation 和 decision services；BNY Mellon 使用 Camunda 规模化支撑投资运营、合规和客户报告；Jyske Bank 用 Workflow 编排 KYC；Capital One 用 Step Functions 编排大规模 check processing。
+    B -->|否| C[先澄清业务问题]
+    B -->|是| D{是否可以由 Code / Rules / Decision Service 完成?}
 
-第二，**Agent 的价值主要集中在 Workflow 难以预先定义的认知任务。**
+    D -->|是| E[Code / Rules / Decision Service]
+    D -->|否| F{是否需要业务过程控制?}
 
-Wells Fargo 使用 Agents 处理 post-trade inquiry、政策检索、合同分析和研究；Mr. Cooper 使用多 Agent 协作解决复杂 mortgage questions；Deutsche Bank 的 DB Lumina 面向 financial research；这些场景共同特点是输入非结构化、问题需要理解、检索和动态分析，执行路径无法完全预先写死。
+    F -->|否| G{是否需要开放式理解 / 检索 / 推理 / 动态规划?}
 
-第三，**最值得关注的是 Hybrid，而不是二选一。**
+    G -->|否| H[普通 LLM Call / API / Human]
+    G -->|是| I[Agent]
 
-Nequi 公开案例同时使用 multi-agent system 和 deterministic flows；PitCrew 则将 AI agents、integrations 和 customer-specific controls 放进 financial-services workflows，并通过 Automated Reasoning 做进一步验证。
+    F -->|是| J{路径是否基本可定义?}
 
-因此，对于金融服务领域，一个更可靠的默认架构不是：
+    J -->|是| K[Workflow]
+
+    J -->|否| L{不确定性是否来自开放式认知任务?}
+
+    L -->|否| M[Human / Decision Service / Solver]
+    L -->|是| N[Workflow + Agent]
+
+    K --> O{流程中是否存在 Agent-worthy 子任务?}
+    O -->|否| P[Workflow]
+    O -->|是| N
+
+    I --> Q{输出是否直接改变权威业务状态?}
+    Q -->|否| R[Agent]
+    Q -->|是| N
+
+    N --> S[Agent Proposal / Evidence]
+    S --> T[Policy / Validation]
+    T --> U{需要 Human Approval?}
+
+    U -->|是| V[Human Task]
+    U -->|否| W[Authorized Command]
+
+    V --> W
+    W --> X[Domain System / System of Record]
+```
+
+这张图比原来的版本多了两个关键分叉：
+
+```text
+是不是 Rule / Decision Service 问题？
+```
+
+以及：
+
+```text
+Agent 输出是否直接改变权威业务状态？
+```
+
+这两个问题能够挡住大量错误的 Agent 化设计。
+
+---
+
+# 37. 最终可以压缩成一句话
+
+原版本的核心句子：
+
+> Workflow 管过程；Agent 管不确定性。
+
+方向对，但还不够完整。
+
+我建议最终改成：
+
+> **Workflow 管业务过程和状态；Decision Service 管确定性业务规则；Agent 管运行时的开放式认知任务；Human 管必须承担判断或授权的节点。**
+
+再进一步：
+
+> **是否使用 Agent，不取决于流程有多复杂，而取决于下一步是否需要运行时推理，以及这种推理是否会越过业务控制边界。**
+
+对于金融服务：
+
+> **确定性的业务过程留给 Workflow，确定性的业务规则留给 Policy / Decision Service，开放式调查和知识工作交给 Agent；一旦 Agent 的结果准备改变权威业务状态，就通过 Workflow、Policy、Authorization 和 Command 再进入业务系统。**
+
+---
+
+# 38. 对 Camunda / FluxNova 与 DeepAgents 的最终定位
+
+因此，两者不应该被简单理解成竞争关系。
+
+更合理的是：
+
+```text
+Camunda / FluxNova 类
+    ↓
+Business Process Orchestration
+    ↓
+State
+Policy
+Human Task
+SLA
+Retry
+Approval
+Compensation
+Audit
+
+DeepAgents 类
+    ↓
+Agent Runtime / Agent Harness
+    ↓
+Reasoning
+Planning
+Tool Selection
+Subagents
+Context
+Retrieval
+Replanning
+```
+
+在一个金融 Agent 平台里：
+
+```text
+Workflow
+    ↓
+Agent
+    ↓
+Structured Result
+    ↓
+Policy
+    ↓
+Human / Authorization
+    ↓
+Command
+```
+
+往往比：
+
+```text
+Agent
+    ↓
+everything
+```
+
+更符合实际业务需要。
+
+但也不要反过来做成：
+
+```text
+Workflow
+    ↓
+every single decision
+```
+
+因为开放式调查、研究、文档分析、知识发现本身并不适合硬编码成一张巨大 BPMN 图。
+
+因此，真正应该建设的是：
+
+```text
+Deterministic Control
++
+Probabilistic Intelligence
+```
+
+而不是：
+
+```text
+Workflow
+vs
+Agent
+```
+
+---
+
+# 39. 最终判断原则
+
+可以把整篇文章最后浓缩成四条：
+
+### 规则一：确定性计算 → Code / Rules / Decision Service
+
+```text
+已知规则
+已知输入
+已知结果
+```
+
+不要引入 Agent。
+
+### 规则二：确定性业务过程 → Workflow
+
+```text
+状态
+顺序
+审批
+等待
+SLA
+重试
+补偿
+```
+
+交给 Workflow。
+
+### 规则三：开放式认知任务 → Agent
+
+```text
+检索
+调查
+理解
+比较
+分析
+规划
+```
+
+交给 Agent。
+
+### 规则四：开放式认知 + 高影响业务动作 → Hybrid
+
+```text
+Agent
+ ↓
+Proposal / Evidence
+ ↓
+Policy / Validation
+ ↓
+Human / Authorization
+ ↓
+Command
+ ↓
+Business System
+```
+
+这是金融服务中最值得默认采用的模式。
+
+---
+
+# 40. 最终结论
+
+重新审视之后，原文章最需要改变的不是具体案例，而是 **Decision Tree 的抽象层次**。
+
+原模型大致是：
+
+```text
+路径已知
+    → Workflow
+
+路径未知
+    → Agent
+
+高风险
+    → Hybrid
+```
+
+这个模型太容易误导。
+
+更准确的模型应该是：
+
+```text
+                业务需求
+                    │
+          ┌─────────┼──────────┐
+          ↓         ↓          ↓
+       Code/Rules Workflow    Agent
+          │         │          │
+          │         │          │
+          └─────────┼──────────┘
+                    ↓
+                  Human
+                    ↓
+             Business Command
+                    ↓
+              System of Record
+```
+
+而选择逻辑是：
+
+```text
+能否确定性解决？
+    → Code / Rules
+
+是否需要长期、跨系统、跨人员的业务过程？
+    → Workflow
+
+是否需要运行时开放式理解、检索、规划？
+    → Agent
+
+Agent 是否会产生权威业务副作用？
+    → Workflow + Policy / Human Boundary
+```
+
+这比“Workflow 还是 Agent”更接近真实企业架构。
+
+现实中的金融案例也越来越呈现这个方向：
+
+* Jyske Bank 的 KYC 说明复杂、长期、合规且包含人工任务的流程仍然是典型 Workflow 问题。
+* Goldman Sachs 和 BNY Mellon 说明大型金融机构可以在非常大规模的业务过程中持续依赖 Process Orchestration。
+* Capital One、OneMain Financial 说明高并发和高风险人工控制点同样可以由确定性 Workflow 编排。
+* Deutsche Bank、Mr. Cooper 说明开放式研究、复杂文档和知识密集型问题确实是 Agent 更有价值的地方。
+* Nequi 则直接展示了 multi-agent 和 deterministic flow 共存的现实架构。
+* PitCrew 展示了在金融服务中，Agent 可以负责认知工作，但其输出仍然需要业务政策和逻辑验证。
+* Google 2026 年的 Agent 研究进一步说明，Agent 架构本身也应该由任务性质决定，而不是机械增加 Agent 数量；并行任务和强顺序任务对多 Agent 的收益可能完全不同。
+
+因此，真正值得记住的不是：
+
+> Workflow 比 Agent 好。
+
+也不是：
+
+> Agent 是 Workflow 的下一代。
+
+而是：
+
+> **Workflow 和 Agent 解决的是不同层次的问题。**
+
+Workflow 解决：
+
+```text
+业务过程怎么被控制？
+```
+
+Agent 解决：
+
+```text
+在允许的范围内，面对未知信息，下一步应该怎么想？
+```
+
+Decision Service 解决：
+
+```text
+已知业务规则下，应该判定什么？
+```
+
+Human 解决：
+
+```text
+哪些决定必须由组织中的人承担？
+```
+
+Business System 解决：
+
+```text
+最终业务事实是什么？
+```
+
+所以，对于金融服务领域，最值得采用的默认架构不是：
 
 ```text
 Workflow OR Agent
@@ -3009,201 +2701,97 @@ Workflow OR Agent
 而是：
 
 ```text
-                 Enterprise Workflow
-                        │
-             ┌──────────┼──────────┐
-             ↓          ↓          ↓
-          Policy      Human      Agent
-             │          │          │
-             └──────────┼──────────┘
-                        ↓
-                 Deterministic
-                 Business Action
-                        ↓
-                     Audit
+                 Workflow
+                    │
+          ┌─────────┼─────────┐
+          ↓         ↓         ↓
+       Policy     Agent     Human
+          │         │         │
+          └─────────┼─────────┘
+                    ↓
+                 Command
+                    ↓
+             Business System
 ```
 
-一句话概括：
+一句话：
 
-> **Workflow 决定“业务过程允许怎么走”，Agent 决定“在允许的范围内，为了完成目标应该怎么想、怎么查、怎么组合工具”。**
-
-对于金融业务尤其应该坚持：
-
-> **Agent 可以拥有推理自由，但不应该因此获得无限的业务流程自由。**
-
-或者更工程化地表达：
-
-```text
-Agent
-    = Runtime Reasoning
-
-Workflow
-    = Business State Machine
-
-Policy
-    = Authorization Boundary
-
-Human
-    = Escalation / Accountability
-
-Business System
-    = Source of Truth
-
-Audit
-    = Evidence
-```
-
-这比简单讨论“Camunda 还是 DeepAgents”更接近真正的架构问题。
-
-最终，最值得采用的 Decision Tree 其实只有三句话：
-
-```text
-路径已知
-    → Workflow
-
-目标已知、路径未知
-    → Agent
-
-目标已知、路径部分未知，但最终动作受强控制
-    → Workflow + Agent
-```
-
-而在金融服务领域，第三种通常才是最值得重点设计的那一类。
+> **把“过程控制”确定下来，把“认知自由度”限制在需要它的地方；Agent 可以负责思考，但不能因为会思考，就自动拥有业务过程和业务权力。**
 
 ---
 
 # 参考资料
 
-### Workflow / Process Orchestration
+1. **Google Cloud — Choose a design pattern for your agentic AI system**
+   当前 Google Cloud 官方架构指南，明确区分 deterministic workflows、dynamic orchestration、human-in-the-loop、custom logic 等模式。
+   [Google Cloud — Agentic AI Architecture Patterns](https://docs.cloud.google.com/architecture/choose-design-pattern-agentic-ai-system?utm_source=chatgpt.com)
 
-1. **Camunda — User Tasks**
-   User Task 到达后创建 Human Task，Process Instance 等待任务完成后继续。
-   [Camunda 8 — User Tasks](https://docs.camunda.io/docs/components/modeler/bpmn/user-tasks/)
+2. **Google Research — Towards a science of scaling agent systems**
+   2026 年对 180 种 Agent 配置的受控研究，说明多 Agent 并非普遍有效，其收益取决于任务是否可并行、工具数量和顺序依赖。
+   [Google Research — Towards a science of scaling agent systems](https://research.google/blog/towards-a-science-of-scaling-agent-systems-when-and-why-agent-systems-work/?utm_source=chatgpt.com)
 
-2. **Goldman Sachs + Camunda**
-   Camunda 企业级 Workflow Automation、Payment Processing、Decision Services；公开数据包括 15+ teams、60K users/year、6M tasks/week。
-   [Goldman Sachs + Camunda](https://camunda.com/about/customers/goldman-sachs/)
+3. **OpenAI Agents SDK — Running agents**
+   Agent loop、session、pause/resume，以及 Dapr、Temporal、Restate、DBOS 等 durable execution integrations。
+   [OpenAI Agents SDK — Running agents](https://openai.github.io/openai-agents-python/running_agents/?utm_source=chatgpt.com)
 
-3. **BNY Mellon + Camunda**
-   企业级业务流程自动化，覆盖投资运营、合规和客户报告，公开案例提到 70+ projects、100M+ process/task operations。
-   [BNY Mellon + Camunda](https://camunda.com/about/customers/bank-of-ny-mellon/)
+4. **OpenAI Agents SDK — RunState**
+   定义可序列化、可恢复的 Agent RunState，说明 Agent Runtime 本身也可以拥有 durable pause/resume 能力。
+   [OpenAI Agents SDK — RunState](https://openai.github.io/openai-agents-python/ref/run_state/?utm_source=chatgpt.com)
 
-4. **Jyske Bank + Camunda**
-   KYC、新客户 onboarding 和定期 KYC 流程的 Workflow Orchestration 案例。
-   [Jyske Bank Increased Customer Satisfaction Using Camunda](https://camunda.com/case-studies/jyske-bank/)
+5. **LangChain — Deep Agents Overview**
+   DeepAgents 的 planning、subagents、filesystem、context management、long-term memory 以及 agent harness 定位。
+   [LangChain — Deep Agents Overview](https://docs.langchain.com/oss/javascript/deepagents/overview?utm_source=chatgpt.com)
 
-5. **Capital One + AWS Step Functions**
-   Check clearing、并行 Workflow、人工 Review，使用 Distributed Map 后整体处理时间降低约 75–80%。
-   [Capital One — Step Functions Distributed Map](https://aws.amazon.com/solutions/case-studies/capital-one-distributed-map/)
+6. **Camunda — Goldman Sachs**
+   Goldman Sachs 使用 Camunda 支撑 Payment Processing、Client Billing、Microservices Automation 和 Decision Services。
+   [Goldman Sachs + Camunda](https://camunda.com/about/customers/goldman-sachs/?utm_source=chatgpt.com)
 
-6. **OneMain Financial + AWS Step Functions**
-   Security forensics Workflow，包含授权审批后再执行高风险 snapshot 操作。
-   [OneMain Financial — AWS Step Functions](https://aws.amazon.com/solutions/case-studies/onemain-financial-aws-step-functions-case-study/)
+7. **Camunda — BNY Mellon**
+   BNY Mellon 的大规模 Process Orchestration，公开案例包括 70+ projects 和 100M+ process instances。
+   [BNY Mellon + Camunda](https://camunda.com/about/customers/bank-of-ny-mellon/?utm_source=chatgpt.com)
 
-7. **AWS Step Functions — Use Cases**
-   官方 Workflow orchestration、parallel processing、approval、retry/catch 模式。
-   [AWS Step Functions — Use Cases](https://aws.amazon.com/step-functions/use-cases/)
+8. **Camunda — Jyske Bank KYC**
+   KYC、新客户 onboarding、周期性重新 KYC、用户任务、截止时间和升级等真实金融流程案例。
+   [Jyske Bank + Camunda](https://camunda.com/case-studies/jyske-bank/?utm_source=chatgpt.com)
 
-### Agent / Agent Runtime
+9. **AWS — Capital One Distributed Map**
+   Capital One 用 Step Functions Distributed Map 处理 check clearing，公开数据称处理时间降低最高约 80%。
+   [Capital One — Step Functions Distributed Map](https://aws.amazon.com/solutions/case-studies/capital-one-distributed-map/?utm_source=chatgpt.com)
 
-8. **Deep Agents Overview — LangChain**
-   Planning、subagents、filesystem、memory、skills 和 human-in-the-loop。
-   [LangChain — Deep Agents Overview](https://docs.langchain.com/oss/javascript/deepagents/overview)
+10. **AWS — OneMain Financial**
+    OneFor(ensics) 使用 Step Functions 编排安全取证，并在高风险 snapshot 操作前引入授权审批；公开数据显示调查时间下降 97.5%。
+    [OneMain Financial — AWS Step Functions](https://aws.amazon.com/solutions/case-studies/onemain-financial-aws-step-functions-case-study/?utm_source=chatgpt.com)
 
-9. **OpenAI Agents SDK**
-   Agents、Tools、Handoffs、Guardrails、Sessions、Human-in-the-loop、Tracing。
-   [OpenAI Agents SDK](https://openai.github.io/openai-agents-python/)
+11. **Google Cloud — Mr. Cooper CIERA**
+    多 Agent 处理复杂 mortgage servicing 问题，并强调与人类客服协作。
+    [Mr. Cooper — CIERA](https://cloud.google.com/blog/topics/financial-services/assembling-a-team-of-ai-agents-to-handle-complex-mortgage-questions-at-mr-cooper?utm_source=chatgpt.com)
 
-10. **OpenAI Agents SDK — Guardrails**
-    Input、Output、Tool Guardrails，以及敏感工具调用的阻断和 approval。
-    [OpenAI Agents SDK — Guardrails](https://openai.github.io/openai-agents-python/guardrails/)
+12. **Google Cloud — Deutsche Bank DB Lumina**
+    AI-powered financial research agent，用于研究资料检索、分析与综合，并考虑金融行业的数据隐私要求。
+    [Deutsche Bank — DB Lumina](https://cloud.google.com/blog/topics/financial-services/deutsche-bank-delivers-ai-powered-financial-research-with-db-lumina?utm_source=chatgpt.com)
 
-11. **OpenAI Agents SDK — Agent Orchestration**
-    Agents-as-tools 与 Handoffs 两种多 Agent 组合方式。
-    [OpenAI Agents SDK — Multi-Agent Orchestration](https://openai.github.io/openai-agents-python/multi_agent/)
+13. **AWS — Nequi**
+    明确展示 multi-agent system 与 deterministic flows 的组合，用于金融服务场景。
+    [Nequi — AWS Success Story](https://aws.amazon.com/solutions/case-studies/nequi-bedrock/?utm_source=chatgpt.com)
 
-12. **AWS — What are AI Agents?**
-    Agent 的 autonomy、goal orientation、planning、tool integration 等定义。
-    [AWS — What are AI Agents?](https://aws.amazon.com/what-is/ai-agents/)
+14. **AWS — PitCrew**
+    Agent、金融业务控制和 Automated Reasoning 组合，展示 Agent 如何嵌入金融业务 Workflow。
+    [PitCrew — AWS Case Study](https://aws.amazon.com/solutions/case-studies/pitcrew-case-study/?utm_source=chatgpt.com)
 
-13. **Google Cloud — Choose a design pattern for your agentic AI system**
-    明确区分 deterministic workflows 与需要动态规划、工具选择和运行时适应的 agentic patterns。
-    [Google Cloud — Agentic AI Architecture Patterns](https://docs.cloud.google.com/architecture/choose-design-pattern-agentic-ai-system)
+15. **Camunda — Guardrails and Best Practices for Agentic Orchestration**
+    Camunda 2026 年关于 deterministic process、dynamic process、agentic orchestration 和 guardrails 的架构观点。这里属于厂商观点，应与其它来源结合理解。
+    [Camunda — Guardrails and Best Practices for Agentic Orchestration](https://camunda.com/blog/2026/01/guardrails-and-best-practices-for-agentic-orchestration/?utm_source=chatgpt.com)
 
-14. **Google Cloud — Choose agentic AI architecture components**
-    明确指出确定性任务不一定需要 Agent，可考虑传统程序、规则或更简单的 AI 方式。
-    [Google Cloud — Agentic AI Architecture Components](https://docs.cloud.google.com/architecture/choose-agentic-ai-architecture-components)
+16. **Camunda — Choosing AI Orchestration**
+    讨论将 Agent 嵌入金融业务流程、治理、状态和人工控制点。
+    [Camunda — Choosing AI Orchestration](https://camunda.com/blog/2026/04/choosing-ai-orchestration-a-practical-assessment-guide-for-developers/?utm_source=chatgpt.com)
 
-15. **IBM — Agentic Workflows**
-    比较概率式 Agent 与 deterministic workflow，并讨论 loops、branching、state 和 parallelism。
-    [IBM — Agentic Workflows](https://www.ibm.com/docs/en/watsonx/watson-orchestrate/base?topic=tools-agentic-workflows)
+17. **Financial Stability Board — Monitoring Adoption of AI and Related Vulnerabilities in the Financial Sector**
+    2025 年 FSB 报告，讨论金融 AI 的第三方依赖、网络风险、模型风险和治理等脆弱性。
+    [FSB — Monitoring Adoption of AI](https://www.fsb.org/2025/10/monitoring-adoption-of-artificial-intelligence-and-related-vulnerabilities-in-the-financial-sector/?utm_source=chatgpt.com)
 
-### 金融 Agent 实际案例
+18. **BIS — Supervising banks in an AI-shaped economy**
+    2026 年 9 月的最新金融监管讲话，讨论 AI 在 fraud、creditworthiness、compliance、customer service、risk management 中的应用，以及 governance、accountability 和 resilience。
+    [BIS — Supervising banks in an AI-shaped economy](https://www.bis.org/speeches/20260918-supervising-banks-ai-shaped-economy?utm_source=chatgpt.com)
 
-16. **Wells Fargo + Google Cloud — Agentic AI**
-    FX post-trade inquiry、policy navigation、contract management、customer service 和 enterprise search 等场景。
-    [Wells Fargo — Agentic AI with Google Cloud](https://cloud.google.com/blog/topics/financial-services/wells-fargo-agentic-ai-agentspace-empowering-workers)
-
-17. **Mr. Cooper — CIERA Multi-Agent Mortgage Support**
-    多 Agent 协同处理 mortgage servicing 中的复杂问题，并保留 human-in-the-loop。
-    [Mr. Cooper — Team of AI Agents for Mortgage Questions](https://cloud.google.com/blog/topics/financial-services/assembling-a-team-of-ai-agents-to-handle-complex-mortgage-questions-at-mr-cooper)
-
-18. **Deutsche Bank — DB Lumina**
-    AI-powered financial research agent、RAG、内部研究、SEC filings、citations、controlled access 和 audit logging。
-    [Deutsche Bank — DB Lumina](https://cloud.google.com/blog/topics/financial-services/deutsche-bank-delivers-ai-powered-financial-research-with-db-lumina)
-
-19. **Nequi — AI-driven operating model**
-    Multi-agent architecture 与 deterministic flows 并存，用于客户服务、lending、collections 等场景。
-    [AWS — Nequi Success Story](https://aws.amazon.com/solutions/case-studies/nequi-bedrock/)
-
-20. **PitCrew — AI Agents + Controls for Financial Services**
-    AI agents、integrations 和 customer-specific controls 组合在金融业务 Workflow 中，并使用 Automated Reasoning 验证规则。
-    [AWS — PitCrew Case Study](https://aws.amazon.com/solutions/case-studies/pitcrew-case-study/)
-
-### 金融行业治理与监管环境
-
-21. **Financial Stability Board — Monitoring Adoption of AI and Related Vulnerabilities in the Financial Sector**
-    讨论金融机构 AI adoption、third-party dependencies、concentration、model governance 和 operational vulnerabilities。
-    [FSB — Monitoring Adoption of AI](https://www.fsb.org/2025/10/monitoring-adoption-of-artificial-intelligence-and-related-vulnerabilities-in-the-financial-sector/)
-
-22. **FCA — AI Live Testing**
-    强调应从 AI system 整体考虑 model、data pipeline、human oversight、testing 和 governance，而不仅是模型本身。
-    [FCA — AI Live Testing](https://www.fca.org.uk/news/blogs/ai-live-testing-use-ai-uk-financial-markets-promise-practice)
-
-23. **FCA — AI in Financial Services**
-    关注 AI governance、testing、monitoring、customer outcomes 和 explainability。
-    [FCA — AI and Financial Services](https://www.fca.org.uk/news/blogs/ai-financial-services-approach)
-
-24. **BIS — Artificial Intelligence in the Financial System**
-    讨论 GenAI / Agentic AI 与传统模型风险管理框架之间的差异，以及未来 governance 需求。
-    [BIS — Artificial Intelligence in the Financial System](https://www.bis.org/speeches/20260505-artificial-intelligence-financial-system)
-
-25. **BIS — Supervising Banks in an AI-shaped Economy**
-    2026 年关于 Agentic AI、银行监管、governance、accountability、human oversight 和 AI 风险的最新讨论。
-    [BIS — Supervising Banks in an AI-shaped Economy](https://www.bis.org/speeches/20260918-supervising-banks-ai-shaped-economy)
-
-26. **FSB — Financial Stability Implications of Artificial Intelligence**
-    讨论金融行业 AI 的 third-party dependency、model risk、data governance、cyber risk 等系统性问题。
-    [FSB — Financial Stability Implications of AI](https://www.fsb.org/2024/11/the-financial-stability-implications-of-artificial-intelligence/)
-
-### 学术研究
-
-27. **Google Research — Towards a Science of Scaling Agent Systems**
-    对 180 个 Agent 配置进行大规模评估，研究 Agent 架构、任务类型、错误放大和工具协调成本。
-    [Google Research — Science of Scaling Agent Systems](https://research.google/blog/towards-a-science-of-scaling-agent-systems-when-and-why-agent-systems-work/)
-
-28. **AI Agent Systems: Architectures, Applications, and Evaluation**
-    综述 Agent 的 planning、memory、tool use、multi-agent orchestration，以及 autonomy / controllability / reliability trade-offs。
-    [arXiv — AI Agent Systems](https://arxiv.org/abs/2601.01743)
-
-29. **A Survey on Agent Workflow — Status and Future**
-    对 20 多个 Agent Workflow 系统进行分类，涵盖 planning、multi-agent、external API、workflow specification 等。
-    [arXiv — A Survey on Agent Workflow](https://arxiv.org/abs/2508.01186)
-
-30. **Blueprint First, Model Second: A Framework for Deterministic LLM Workflow**
-    研究将业务流程与 LLM 推理解耦，让确定性执行引擎控制流程，而 LLM 负责受限复杂子任务。
-    [arXiv — Blueprint First, Model Second](https://arxiv.org/abs/2508.02721)
-
-31. **Engineering Robustness into Personal Agents with the AI Workflow Store**
-    讨论 on-the-fly Agent 与经过工程化、测试和部署约束的 Workflow 在高风险环境中的可靠性差异。
-    [arXiv — AI Workflow Store](https://arxiv.org/abs/2605.10907)
+> 注：上述 Goldman Sachs、BNY Mellon、Jyske Bank、OneMain Financial、Capital One、Nequi、PitCrew、Mr. Cooper、Deutsche Bank 案例主要来自厂商或合作方公开 Case Study。它们适合证明“该架构已经被真实机构采用”和理解具体实现方式，但其中的效率数字属于案例方/厂商披露，不应视为独立第三方评估结果。
