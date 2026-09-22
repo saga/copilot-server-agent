@@ -82,12 +82,6 @@ Agent Runtime Adapter：Copilot SDK / DeepAgents / LangGraph 如何替换 *
 如何设计一个与 Agent Framework 无关的 Workflow Engine *
 
 
-搜索 Web，分析业界研究、大厂实践、实际案例和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接，如果有真实案例佐证最好。
-写完后先内部 review：检查主要论点是否有充分依据、是否混淆事实与推论、是否把结论说得过头；发现问题先修改文章。
-最终只输出修改后的完整文章和参考资料，不要输出 review、分析过程、修改建议或生成过程。
-主题：“研究业界实际案例，金融服务领域的业务需求，什么时候应该用workflow(类似cumanda，fluxnova)，什么时候应该用AI Agent（类似deepagents），decision tree什么样“
-
-
 八、Agent Runtime / Skills / Tooling
 Skill、Tool、Capability、Command 四者到底有什么区别
 为什么 Skill 不是 Tool 的集合
@@ -98,6 +92,7 @@ Deterministic Check + LLM Reasoning：企业 Agent Skill 的组合模式
 AI Agent 的工具调用为什么需要第二层 Policy
 Server-side Agent Runtime 与 IDE Agent Runtime 的架构差异
 
+
 九、工程可靠性
 Agent Execution 的状态机应该如何设计
 Agent Session 与 Business Execution 为什么应该分离
@@ -107,6 +102,15 @@ Agent Session Lost 后为什么业务状态仍然不能丢
 AI Workflow 的并发控制与 Single Writer 模式
 AI Agent Workflow 的 Failure Boundary 如何设计
 为什么 Agent Runtime 可以失败，但 Business Workflow 不能失控
+
+
+搜索 Web，分析业界研究、大厂实践、实际案例和金融服务领域经验，写一篇完整架构研究、分析的文章，标注可靠引用和链接，如果有真实案例佐证最好。
+写完后先内部 review：检查主要论点是否有充分依据、是否混淆事实与推论、是否把结论说得过头；发现问题先修改文章。
+最终只输出修改后的完整文章和参考资料，不要输出 review、分析过程、修改建议或生成过程。
+主题：“Agent Session 与 Business Execution 为什么应该分离，如果Agent(deepagents)执行在一个k8s的容器sandbox，该如何设计“
+
+
+
 十、非常值得结合你当前项目写的几个“方法论”文档
 
 这几个我认为最容易沉淀成以后反复使用的架构文章：
