@@ -1,4 +1,5 @@
 import type { CopilotSession } from '@github/copilot-sdk';
+import { config } from '../config.js';
 import { executionSink } from '../execution/sink.js';
 import type { LlmUsageSample } from '../execution/usage.js';
 import { EXECUTION_EVENT_TYPES } from '../execution/types.js';
@@ -20,8 +21,66 @@ export interface RunTurnInput {
   prompt: string;
   model?: string;
   handlers?: AgentTurnHandlers;
-  /** 客户端断开等外部中止信号（置为 true 后 runner 结束时标记 aborted） */
-  shouldAbort?: () => boolean;
+  /** Optional per-turn override; defaults to COPILOT_TURN_TIMEOUT_MS (300 seconds). 0 disables it. */
+  timeoutMs?: number;
+}
+
+const ABORT_IDLE_GRACE_MS = 10_000;
+
+function isTurnTimeout(error: unknown): boolean {
+  return error instanceof Error
+    && /Timeout after \\d+ms waiting for session\\.idle/i.test(error.message);
+}
+
+function watchSessionIdle(
+  session: CopilotSession,
+  timeoutMs: number,
+): { promise: Promise<boolean>; cancel: () => void } {
+  let settled = false;
+  let off = () => {};
+  let timer: NodeJS.Timeout | undefined;
+  let finish: (value: boolean) => void = () => {};
+
+  const promise = new Promise<boolean>((resolve) => {
+    finish = (value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      off();
+      resolve(value);
+    };
+    off = session.on('session.idle', () => finish(true));
+    timer = setTimeout(() => finish(false), timeoutMs);
+  });
+
+  return { promise, cancel: () => finish(false) };
+}
+
+/** A sendAndWait timeout only stops waiting; explicitly abort and observe idle before failing the turn. */
+async function abortTimedOutTurn(session: CopilotSession): Promise<void> {
+  const idle = watchSessionIdle(session, ABORT_IDLE_GRACE_MS);
+  let abortTimer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      session.abort(),
+      new Promise<never>((_, reject) => {
+        abortTimer = setTimeout(
+          () => reject(new Error('Copilot session.abort() timed out')),
+          ABORT_IDLE_GRACE_MS,
+        );
+      }),
+    ]);
+  } catch (error) {
+    idle.cancel();
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`Copilot turn timed out and abort failed: ${reason}`);
+  } finally {
+    if (abortTimer) clearTimeout(abortTimer);
+  }
+
+  if (!(await idle.promise)) {
+    throw new Error(`Copilot turn timed out; session.idle was not observed within ${ABORT_IDLE_GRACE_MS}ms after abort.`);
+  }
 }
 
 /** usage 事件流入 execution 的累加器（execution-local，并发 turn 不串数据） */
@@ -69,9 +128,36 @@ export async function runTurn(input: RunTurnInput): Promise<AgentTurnResult> {
 
   try {
     if (model) await session.setModel(model);
-    const finalEvent = await session.sendAndWait({ prompt });
+
+    const timeoutMs = input.timeoutMs ?? config.copilotTurnTimeoutMs;
+    const send = session.sendAndWait({ prompt }, timeoutMs > 0 ? timeoutMs + 1_000 : undefined);
+    let watchdog: NodeJS.Timeout | undefined;
+    let finalEvent: Awaited<typeof send>;
+    try {
+      finalEvent = timeoutMs > 0
+        ? await Promise.race([
+            send,
+            new Promise<never>((_, reject) => {
+              watchdog = setTimeout(
+                () => reject(new Error(`Timeout after ${timeoutMs}ms waiting for session.idle`)),
+                timeoutMs,
+              );
+            }),
+          ])
+        : await send;
+    } catch (error) {
+      if (timeoutMs > 0 && isTurnTimeout(error)) {
+        // Don't mark the execution failed while the Copilot session keeps working in the background.
+        await abortTimedOutTurn(session);
+      }
+      throw error;
+    } finally {
+      if (watchdog) clearTimeout(watchdog);
+    }
+
     const content =
       (finalEvent as unknown as { data?: { content?: string } } | undefined)?.data?.content ?? '';
+    chars = content.length;
     return { content, chars, outcome: 'completed' };
   } finally {
     offDelta();
