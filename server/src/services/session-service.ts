@@ -515,6 +515,14 @@ class SessionService {
       // session 最大工具集合（mode: "empty" 必填；agent.tools 必须为其子集，见 #2356 说明）
       availableTools: BUILTIN_TOOLS,
       onPermissionRequest: createPermissionHandler(policyCtx),
+      // No host OAuth token broker or MCP login UI is configured in this service.
+      // Cancel challenges explicitly rather than leaving an auth request pending.
+      onMcpAuthRequest: async (request) => {
+        console.warn(
+          `[copilot] MCP OAuth request for "${request.serverName}" cancelled: no host token broker is configured.`,
+        );
+        return { kind: 'cancelled' as const };
+      },
       ...(resolved.systemMessage ? { systemMessage: resolved.systemMessage } : {}),
       ...(customAgents.length ? { customAgents } : {}),
       ...(opts.agent ? { agent: opts.agent } : {}),
