@@ -200,7 +200,7 @@ curl -X POST localhost:3001/api/executions/<id>/run        # workflow 不需要 
 
 参考官方 session-persistence / mcp 两篇文档：
 
-- **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 按「自己拥有的 + 自己参与的」列会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。`COPILOT_TURN_TIMEOUT_MS`（毫秒，默认 300000，0=关闭）限制单个 Agent turn；超时会调用 `session.abort()` 并等待 `session.idle`，不能只停止等待。归属与 execution 同库（默认 SQLite），重启后不会退化成“谁先访问谁认领”。
+- **持久化**：建会话传 `sessionId`（推荐 `user-xxx-task-yyy` 结构，非法直接 400）即为可恢复会话；`POST /api/sessions/:id/resume` 在服务重启后继续（可附带重配 model/agents/skills/mcp，BYOK 凭证由服务端当前通道自动重传，无需调用方操心）；`GET /api/sessions` 按「自己拥有的 + 自己参与的」列会话（`attached` 标记是否在本进程内存）；`DELETE` 默认断开不断数据、`?permanent=true` 彻底删除。`COPILOT_SESSION_IDLE_TIMEOUT`（秒，0=关闭）可让 runtime 自动回收无活动会话。单个 Agent turn 的硬超时由 `COPILOT_TURN_TIMEOUT_MS`（毫秒，默认 300000，0=关闭）限制单个 Agent turn；超时会调用 `session.abort()` 并等待 `session.idle`，不能只停止等待。归属与 execution 同库（默认 SQLite），重启后不会退化成“谁先访问谁认领”。
 - **MCP**（`server/src/mcp/registry.ts`）：内置 `filesystem` 预设（官方 server，授权目录限定仓库根，可用 `COPILOT_MCP_FS_DIR` 改、`COPILOT_MCP_FILESYSTEM=false` 关）；运维经 `COPILOT_MCP_SERVERS`（JSON）预置额外 servers；前端建会话用 `mcp: [...]` 按名启用、`disabledMcpServers` 精确禁用。安全门：内联 `local/stdio` MCP = 在服务器执行任意命令，默认 400 拒绝（`COPILOT_ALLOW_INLINE_MCP_LOCAL=true` 才放行）；内联 `http/sse` 默认允许。`GET /api/mcp` 只返回元信息，headers/env 密钥永不外泄。
 
 ## Session 访问模型（single / shared）
