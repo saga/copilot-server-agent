@@ -51,6 +51,7 @@ test('execution.model 会作用到本轮 turn（setModel 被调用）', async ()
   );
 
   assert.equal(result.content, 'ok');
+  assert.equal(result.chars, 2, 'chars must reflect the returned final content even without delta events');
   assert.deepEqual(setModelCalls, ['gpt-5-mini'], 'execution 上的 model 必须传给 runTurn');
 });
 
