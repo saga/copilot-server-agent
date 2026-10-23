@@ -96,6 +96,12 @@ export const config = {
   sessionIdleTimeoutSeconds:
     parseNonNegativeInt(env('COPILOT_SESSION_IDLE_TIMEOUT', ''), 'COPILOT_SESSION_IDLE_TIMEOUT', 0) ||
     undefined,
+  /** Hard limit for one Agent turn in milliseconds; 0 disables the application watchdog. */
+  copilotTurnTimeoutMs: parseNonNegativeInt(
+    env('COPILOT_TURN_TIMEOUT_MS', ''),
+    'COPILOT_TURN_TIMEOUT_MS',
+    300_000,
+  ),
   // --- Runtime 连接：留空=SDK 自己拉起本地 runtime；K8s sidecar/远端填 http://127.0.0.1:4321 ---
   runtimeUrl: env('COPILOT_RUNTIME_URL', '') || undefined,
   /** 启动时后台预热 runtime（首屏徽章与首个会话不用等 CLI 拉起；设 false 则纯懒加载） */
