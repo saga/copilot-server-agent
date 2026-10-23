@@ -264,6 +264,8 @@ class SessionService {
     userId: string;
   }) => Promise<unknown>) | null = null;
   private lastError: string | null = null;
+  /** Invalidates a client startup that races with service shutdown. */
+  private lifecycleGeneration = 0;
 
   /** owner 参与人登记器：single 与 shared 都登记，访问判定因此不必按模式分叉 */
   bindParticipantRegistrar(
@@ -276,7 +278,8 @@ class SessionService {
     if (this.client) return this.client;
     if (this.starting) return this.starting;
 
-    this.starting = (async () => {
+    const generation = this.lifecycleGeneration;
+    const starting = (async () => {
       const provider = getActiveProvider();
       const customModels = provider.getCustomModels();
       // 多租户 server 安全基线：mode "empty" 关掉 CLI 风格 ambient tools/host filesystem，
@@ -319,17 +322,30 @@ class SessionService {
 
       const client = new CopilotClient(clientOptions);
       await client.start();
+      if (generation !== this.lifecycleGeneration) {
+        try {
+          await client.stop();
+        } catch {
+          // Shutdown already invalidated this startup; never publish its client.
+        }
+        throw new Error('Copilot service was stopped while the client was starting.');
+      }
       this.client = client;
       this.lastError = null;
-      this.starting = null;
       return client;
-    })().catch((err) => {
-      this.starting = null;
-      this.lastError = err instanceof Error ? err.message : String(err);
-      throw err;
-    });
+    })();
 
-    return this.starting;
+    this.starting = starting;
+    try {
+      return await starting;
+    } catch (err) {
+      if (generation === this.lifecycleGeneration) {
+        this.lastError = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
+    } finally {
+      if (this.starting === starting) this.starting = null;
+    }
   }
 
   /**
@@ -895,6 +911,12 @@ class SessionService {
   }
 
   async stop() {
+    // Prevent a pending getClient() from installing a fresh client after shutdown.
+    this.lifecycleGeneration += 1;
+    this.starting = null;
+    const client = this.client;
+    this.client = null;
+
     for (const [, s] of this.sessions) {
       try {
         await s.disconnect();
@@ -907,9 +929,8 @@ class SessionService {
     this.sessionLocks.clear();
     this.attachLocks.clear();
     this.activeTurns.clear();
-    if (this.client) {
-      await this.client.stop();
-      this.client = null;
+    if (client) {
+      await client.stop();
     }
   }
 }
