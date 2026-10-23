@@ -517,10 +517,8 @@ class SessionService {
       onPermissionRequest: createPermissionHandler(policyCtx),
       // No host OAuth token broker or MCP login UI is configured in this service.
       // Cancel challenges explicitly rather than leaving an auth request pending.
-      onMcpAuthRequest: async (request) => {
-        console.warn(
-          `[copilot] MCP OAuth request for "${request.serverName}" cancelled: no host token broker is configured.`,
-        );
+      onMcpAuthRequest: async () => {
+        console.warn('[copilot] MCP OAuth request cancelled: no host token broker is configured.');
         return { kind: 'cancelled' as const };
       },
       ...(resolved.systemMessage ? { systemMessage: resolved.systemMessage } : {}),
