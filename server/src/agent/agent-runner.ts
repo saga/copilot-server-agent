@@ -29,7 +29,7 @@ const ABORT_IDLE_GRACE_MS = 10_000;
 
 function isTurnTimeout(error: unknown): boolean {
   return error instanceof Error
-    && /Timeout after \\d+ms waiting for session\\.idle/i.test(error.message);
+    && /Timeout after \d+ms waiting for session\.idle/i.test(error.message);
 }
 
 function watchSessionIdle(
